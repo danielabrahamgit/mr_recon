@@ -1,0 +1,15 @@
+[build-system]
+requires = [
+   "setuptools",
+   "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mr_recon"
+version = "0.0.1"
+authors = [
+  { name="Daniel Abraham", email="abrahamd@stanford.edu" },
+]
+description = "A package for efficient MRI reconstruction in Pytorch"
+readme = "README.md"
