@@ -136,7 +136,7 @@ class recon:
                                         lamda_l2=lamda_l2,
                                         verbose=self.verbose)
 
-        return coeffs.to('cpu').numpy()
+        return coeffs.cpu().numpy()
 
     def run_mfi_recon(self,
                       A_linop: callable,

@@ -233,10 +233,6 @@ class torchkb_nufft(NUFFT):
         N = trj.shape[0]
         d = trj.shape[-1]
 
-        
-        # Rescale 
-        trj_torch = self.rescale_trajectory(trj_torch)
-
         # Reshape - NUFFT - Reshape
         img_torchkb = img_torch.reshape((N, -1, *im_size))
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
@@ -253,9 +249,6 @@ class torchkb_nufft(NUFFT):
         im_size = self.im_size
         N = trj.shape[0]
         d = trj.shape[-1]
-
-        # Rescale 
-        trj_torch = self.rescale_trajectory(trj_torch)
 
         # Reshape - NUFFT - Reshape
         ksp_torch_kb = ksp_torch.reshape((N, -1, *trj.shape[1:-1]))
@@ -299,9 +292,6 @@ class gridded_nufft(NUFFT):
         # Consts
         d = trj.shape[-1]
         N = trj.shape[0]
-        
-        # Rescale
-        trj_torch = self.rescale_trajectory(trj_torch)
 
         # Oversampled FFT
         img_os = self.grog_padder.forward(img_torch)
@@ -344,9 +334,6 @@ class gridded_nufft(NUFFT):
         # Consts
         d = trj.shape[-1]
         N = trj.shape[0]
-        
-        # Rescale
-        trj_torch = self.rescale_trajectory(trj_torch)
         grid_os_size = self.grog_padder.pad_im_size
 
         # Adjoint NUFFT

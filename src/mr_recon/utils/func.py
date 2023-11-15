@@ -14,7 +14,7 @@ def np_to_torch(*args):
         elif isinstance(arg, torch.Tensor):
             ret_args.append(arg)
         else:
-            raise ValueError('arguments must be np.ndarrays or torch.Tensors')
+            ret_args.append(None)
     return ret_args
 
 def torch_to_np(*args):
@@ -29,7 +29,7 @@ def torch_to_np(*args):
         elif isinstance(arg, np.ndarray) or isinstance(arg, cp.ndarray):
             ret_args.append(arg)
         else:
-            raise ValueError('arguments must be np.ndarrays or torch.Tensors')
+            ret_args.append(None)
     return ret_args
 
 def batch_iterator(total, batch_size):

@@ -12,7 +12,6 @@ from mr_recon.nufft import (
 from mr_recon.utils.indexing import multi_grid
 from einops import rearrange, einsum
 from typing import Optional, Union
-from torchkbnufft import KbNufft, KbNufftAdjoint
 from tqdm import tqdm
 
 """"
@@ -127,10 +126,9 @@ class subspace_linop(nn.Module):
         if grog_grid_oversamp is not None:
             self.nufft = gridded_nufft(im_size, device_idx, grog_grid_oversamp)
         else:
-            # self.nufft = torchkb_nufft(im_size, device_idx)
-            self.nufft = sigpy_nufft(im_size, device_idx)
-        
-        # trj_seg = self.nufft.rescale_trajectory(trj_seg)
+            self.nufft = torchkb_nufft(im_size, device_idx)
+            # self.nufft = sigpy_nufft(im_size, device_idx)
+        trj_seg = self.nufft.rescale_trajectory(trj_seg)
         
         # Save
         self.edge_segment_size = edge_segment_size
@@ -227,26 +225,22 @@ class subspace_linop(nn.Module):
         for t, u in batch_iterator(nseg, self.seg_batch_size):
 
             # Get trj and dcf for this segment
-            omega_og = rearrange(self.omega, 'nseg d (nro npe ntr) -> nseg d nro npe ntr', 
-                                 nro=nro, 
-                                 npe=npe, 
-                                 ntr=ntr)
-            trj = rearrange(omega_og, 'nseg d nro npe ntr -> nseg nro npe ntr d')[t:u]
-            dcf = dcf[t:u]
+            trj_seg = self.trj[t:u]
+            dcf_seg = dcf[t:u]
 
             # Do adjoint in batches
             for a1, b1 in batch_iterator(nsub, self.sub_batch_size):
                 for a2, b2 in batch_iterator(nsub, self.sub_batch_size):
-                    data_pts = phi[None, a1:b1, None, None, None, :].conj() * phi[None, None, a2:b2, None, None, :] * dcf[:, None, None, ...]
+                    data_pts = phi[None, a1:b1, None, None, None, :].conj() * phi[None, None, a2:b2, None, None, :] * dcf_seg[:, None, None, ...]
+                    # Ts_grog[:, a1:b1, a2:b2] += sp_ifft(self.nufft.adjoint(data_pts, trj_seg), dim=tuple(range(-d, 0))).cpu()
                     for i in range(t, u):
                         i_zero_start = i - t
-                        Ts_grog[i, a1:b1, a2:b2] += multi_grid(data_pts[i_zero_start], trj[i_zero_start], final_size=im_size_os).to('cpu')
+                        Ts_grog[i, a1:b1, a2:b2] += multi_grid(data_pts[i_zero_start], trj_seg[i_zero_start], final_size=im_size_os).cpu()
 
         return Ts_grog 
                          
     def _compute_toeplitz_kernels(self,
-                                  os_factor: Optional[float] = 2.0,
-                                  trj_batch_size: Optional[int] = None) -> torch.Tensor:
+                                  os_factor: Optional[float] = 2.0) -> torch.Tensor:
         """
         Computes toeplitz kernels for subspace recon.
 
@@ -254,8 +248,6 @@ class subspace_linop(nn.Module):
         -----------
         os_factor : float
             oversamp factor for toeplitz
-        trj_batch_size : int
-            optional batching over trajectory
 
         Returns:
         ---------
@@ -268,22 +260,19 @@ class subspace_linop(nn.Module):
         nseg, nro, npe, ntr, d = self.trj.shape
         data_dim = (nro, npe, ntr)
 
-        # Defualt batch
-        if trj_batch_size is None:
-            trj_batch_size = nro *  ntr * npe
-
         # Toeplitz kernels
         im_size_os = torch.round(torch.tensor(self.im_size) * os_factor).type(torch.int).tolist()
         Ts = torch.zeros((nseg, nsub, nsub, *im_size_os), dtype=torch.complex64)
 
         # Make oversampled adjoint nufft
-        kb_adj_ob_os = KbNufftAdjoint(im_size_os, device=self.torch_dev)
+        nufft_toep = sigpy_nufft(im_size_os, self.torch_dev.index)
 
-        # Calculate kernels
         # Batch over time segments
-        # for l1, l2 in batch_iterator(nseg, self.seg_batch_size):
         for l1 in tqdm(range(0, nseg, self.seg_batch_size), 'Computing Topelitz Kernels', disable=nseg == 1):
             l2 = min(l1 + self.seg_batch_size, nseg)
+
+            # Trajectory segment
+            trj_seg = self.trj[l1:l2]
 
             # Iterate through each column of toeplitz tensor
             for k in tqdm(range(nsub), 'Computing Toeplitz Kernels', disable=nseg > 1):
@@ -293,7 +282,6 @@ class subspace_linop(nn.Module):
                 alpha_ksp[:, k, ...] = 1.0
 
                 # Transform with PHI
-                # sig_ksp = torch.sum(alpha_ksp * self.phi[None, :, None, None, :], dim=1)
                 sig_ksp = einsum(alpha_ksp, self.phi, 'b_seg nsub nro npe ntr, nsub ntr -> b_seg nro npe ntr')
 
                 # Now do adjoint, batch over subspace
@@ -302,24 +290,18 @@ class subspace_linop(nn.Module):
                     # Call adjoint
                     alpha_ksp = sig_ksp[:, None, ...] * self.phi.conj()[None, a:b, None, None, :]
                     alpha_ksp = alpha_ksp * self.dcf[l1:l2, None, ...]
-                    alpha_ksp_rs = rearrange(alpha_ksp, 'nseg nsub nro npe ntr -> nseg nsub (nro npe ntr)')
+                    with torch.cuda.device(self.torch_dev):                        
+                        psf_col = nufft_toep.adjoint(alpha_ksp, trj_seg * os_factor)
 
-                    # Batch over trajectory
-                    for t1, t2 in batch_iterator(alpha_ksp_rs.shape[-1], trj_batch_size):
-                        with torch.cuda.device(self.torch_dev):
-                            psf_col = kb_adj_ob_os(alpha_ksp_rs[..., t1:t2], 
-                                                self.omega[l1:l2, ..., t1:t2], 
-                                                norm='ortho')
-
-                            # Transform to k-space
-                            T_col = sp_fft(psf_col, dim=tuple(range(-d, 0))) 
-                            T_col = T_col * (os_factor ** d) # Scaling
+                        # Transform to k-space
+                        T_col = sp_fft(psf_col, dim=tuple(range(-d, 0))) 
+                        T_col = T_col * (os_factor ** d) # Scaling
                         
                         # Update Toeplitz kernels
                         Ts[l1:l2, a:b, k, ...] += T_col.to('cpu')
 
                     # Clean up, these are massive operations
-                    del T_col, alpha_ksp, alpha_ksp_rs, psf_col
+                    del T_col, alpha_ksp, psf_col
                     gc.collect()
                     with torch.cuda.device(self.torch_dev):
                         torch.cuda.empty_cache()
@@ -383,25 +365,7 @@ class subspace_linop(nn.Module):
 
                     # NUFFT
                     FBSx = self.nufft.forward(BSx, trj_seg)
-                    # if self.grog_grid_oversamp:
-                    #     BSx = self.grog_padder.forward(BSx)
-                    #     FBSx_cart = sp_fft(BSx, dim=tuple(range(-dim, 0)))
-                    #     FBSx_rs = torch.zeros((u-t, d-c, b-a, self.omega.shape[-1]), dtype=torch.complex64, device=self.torch_dev)
-                    #     for i in range(FBSx_rs.shape[0]):
-                    #         tup = (slice(None), slice(None)) + tuple(self.omega[t+i])
-                    #         FBSx_rs[i] = FBSx_cart[i][tup]
-                    # else:
-                    #     BSx_rs = rearrange(BSx, 'nseg nc nsub ... -> nseg (nc nsub) ...')
-                    #     with torch.cuda.device(self.torch_dev):
-                    #         FBSx_rs = self.kb_ob(image=BSx_rs, omega=self.omega[t:u], norm='ortho')
-                    #     FBSx_rs = rearrange(FBSx_rs, 'nseg (nc nsub) ... -> nseg nc nsub ...',
-                    #                         nc=d-c,
-                    #                         nsub=b-a)
-                    # FBSx = rearrange(FBSx_rs, 'nseg nc nsub (nro npe ntr) -> nseg nc nsub nro npe ntr', 
-                    #                  nro=nro, 
-                    #                  npe=npe, 
-                    #                  ntr=ntr)
-
+  
                     # Combine with Phi
                     PBFSx = torch.sum(FBSx * self.phi[None, None, a:b, None, None, :], dim=2)
                     PBFSx_rs = rearrange(PBFSx, 'nseg nc nro npe ntr -> nc (nseg nro) npe ntr')
@@ -473,22 +437,7 @@ class subspace_linop(nn.Module):
                     Py = ksp_gpu[:, :, None, ...] * self.phi[None, None, a:b, None, None, :].conj()
 
                     # adjoint NUFFT
-                    # Py (nseg nc nsub nro npe ntr)
-                    # trj (nseg, nro npe ntr d)
                     FPy = self.nufft.adjoint(Py, trj_seg)
-
-                    # Py_rs = rearrange(Py, 'nseg nc nsub nro npe ntr -> nseg (nc nsub) (nro npe ntr)')
-                    # if self.grog_grid_oversamp:
-                    #     omega_rs = torch.moveaxis(self.omega[t:u], -1, -2)
-                    #     FPy = torch.zeros((*Py_rs.shape[:2], *self.grog_os_size), dtype=torch.complex64, device=self.torch_dev)
-                    #     for i in range(FPy.shape[0]):
-                    #         FPy[i] = multi_grid(Py_rs[i], omega_rs[i], self.grog_os_size)
-                    #     FPy = sp_ifft(FPy, dim=tuple(range(-dim, 0)))
-                    #     FPy = self.grog_padder.adjoint(FPy)
-                    # else:
-                    #     with torch.cuda.device(self.torch_dev):
-                    #         FPy = self.kb_adj_ob(data=Py_rs, omega=self.omega[t:u], norm='ortho')
-                    # FPy = rearrange(FPy, f'nseg (nc nsub) ... -> nseg nc nsub ...', nc=d-c, nsub=b-a)
 
                     # Combine with adjoint phase arrays
                     if nseg > 1:

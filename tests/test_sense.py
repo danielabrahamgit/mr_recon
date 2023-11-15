@@ -44,12 +44,12 @@ img_sigpy = sp.to_device(mri.app.SenseRecon(ksp, mps, weights=dcf, coord=trj, la
 rcn = recon(device_idx)
 phi = np.ones((1, 1))
 A = subspace_linop(im_size=im_size,
-                   use_toeplitz=False,
                    trj=torch.tensor(trj, dtype=torch.float32, device=torch_dev)[..., None, :],
                    mps=torch.tensor(mps, dtype=torch.complex64, device=torch_dev),
                    phi=torch.tensor(phi, dtype=torch.complex64, device=torch_dev),
                    dcf=torch.tensor(dcf, dtype=torch.float32, device=torch_dev)[..., None],
-                #    grog_grid_oversamp=1.0,
+                   use_toeplitz=True,
+                   grog_grid_oversamp=1.0,
                    coil_batch_size=ncoil)
 img_mr_recon = rcn.run_recon(A_linop=A,
                              ksp=ksp[..., None],
