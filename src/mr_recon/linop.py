@@ -4,6 +4,11 @@ import torch.nn as nn
 
 from mr_recon.utils.func import batch_iterator, sp_fft, sp_ifft
 from mr_recon.utils.pad import PadLast
+from mr_recon.nufft import (
+    gridded_nufft,
+    sigpy_nufft,
+    torchkb_nufft
+)
 from mr_recon.utils.indexing import multi_grid
 from einops import rearrange, einsum
 from typing import Optional, Union
@@ -114,18 +119,26 @@ class subspace_linop(nn.Module):
         if dcf is None:
             dcf = torch.ones(trj.shape[:-1]).to(self.torch_dev)
         
-        # Process trajectory and dcf
-        trj_proc, dcf_proc = self._process_trajectory_dcf(trj=trj,
-                                                          dcf=dcf,
-                                                          grog_grid_oversamp=grog_grid_oversamp,
-                                                          nseg=nseg)
+        # Process trajectory and dcf for time segmentation
+        trj_seg, dcf_seg, edge_segment_size = self._time_segment_reshaper(trj, dcf, nseg)
+
+        # Make self.nufft
+        device_idx = trj_seg.get_device()
+        if grog_grid_oversamp is not None:
+            self.nufft = gridded_nufft(im_size, device_idx, grog_grid_oversamp)
+        else:
+            # self.nufft = torchkb_nufft(im_size, device_idx)
+            self.nufft = sigpy_nufft(im_size, device_idx)
+        
+        # trj_seg = self.nufft.rescale_trajectory(trj_seg)
         
         # Save
-        self.omega = trj_proc
+        self.edge_segment_size = edge_segment_size
+        self.trj = trj_seg
+        self.dcf = dcf_seg
         self.phase_mps = phase_mps
         self.phi = phi
         self.mps = mps
-        self.dcf = dcf_proc
         self.coil_batch_size = coil_batch_size
         self.sub_batch_size = sub_batch_size
         self.seg_batch_size = seg_batch_size
@@ -145,47 +158,31 @@ class subspace_linop(nn.Module):
                 with torch.cuda.device(self.torch_dev):
                     torch.cuda.empty_cache()
 
-    def _process_trajectory_dcf(self,
-                                trj: torch.Tensor,
-                                dcf: torch.Tensor,
-                                grog_grid_oversamp: float,
-                                nseg: int) -> Union[torch.Tensor, torch.Tensor]:
+    def _time_segment_reshaper(self,
+                               trj: torch.Tensor,
+                               dcf: torch.Tensor,
+                               nseg: int) -> Union[torch.Tensor, torch.Tensor]:
         """
-        Helper funciton to process the trajectory and dcf to fit in a nice 
-        format for torchkbnufft, time segmentation, and grog.
+        Helper funciton to process the trajectory and dcf to be time segmented
 
-        Parameters
-        ----------
-        im_size : tuple
-            image dimensions as tuple of ints (dim1, dim2, ...)
+        Parameters:
+        -----------
         trj : torch.tensor <float>
             The k-space trajectory with shape (nro, npe, ntr, d). 
                 we assume that trj values are in [-n/2, n/2] (for nxn grid)
         dcf : torch.tensor <float> 
-            the density comp. functon with shape (nro, ...)
-        grog_grid_oversamp : float 
-            if not None, toggles the use of grog/gridding model. This assumes that
-            data points lie on a cartesian grid with some oversampling factor 'grog_grid_oversamp'
+            the density comp. functon with shape (nro, npe, ntr)
         nseg: int
             number of segments for time segmented model
 
-        Saves
-        ----------
-        grog_os_size : tuple
-            new dim of image after grog oversampling factor
-        trj_size : tuple
-            size of trajectory - (nseg, nro_new, npe, ntr, d)
-        edge_segment_size : int
-            true number of readout points for the final segment
-
         Returns
         ----------
-        omega : torch.tensor <float>
-            The k-space trajectory (called omega now to conform with torchkbnufft style)
-            with shape (nseg, d, (nro_new * npe * ntr)). Values are now between [-pi, pi]
-            If grog, then this has integer values
+        trj : torch.tensor <float32>
+            The segmented k-space trajectory with shape (nseg, nro_new, npe, ntr, d). 
         dcf_rs : torch.tensor <float>
             The dcf with shape (nseg, nro_new, npe, ntr)
+        edge_segment_size : int
+            true number of readout points for the final segment
         """
         
         # Reshape trj and dcf to support segments
@@ -201,45 +198,9 @@ class subspace_linop(nn.Module):
             split_size_i = trj_split[i].shape[0]
             trj_rs[i, :split_size_i] = trj_split[i]
             dcf_rs[i, :split_size_i] = dcf_split[i]
+        edge_segment_size = trj_split[-1].shape[0]
 
-        # Save new shape, and size of last segment
-        self.trj_size = trj_rs.shape
-        self.edge_segment_size = trj_split[-1].shape[0]
-
-        # iGROG case
-        if grog_grid_oversamp:
-            
-            # New oversampled size
-            self.grog_os_size = tuple([round(i * grog_grid_oversamp) for i in self.im_size])
-
-            # Clamp each dimension
-            trj_clamped = trj_rs * grog_grid_oversamp
-            for d in range(trj_clamped.shape[-1]):
-                n_over_2 = self.grog_os_size[d]/2
-                trj_clamped[..., d] = torch.clamp(trj_clamped[..., d] + n_over_2, 0, self.grog_os_size[d]-1)
-            
-            # Make int
-            trj_cleaned = torch.round(trj_clamped).type(torch.int)
-
-            # Padder will be useful later
-            self.grog_padder = PadLast(self.grog_os_size, self.im_size)
-
-        # Rescale between -pi and pi
-        else:
-            # Rescale trajectory
-            im_size_arr = torch.tensor(self.im_size).to(self.torch_dev)
-            tup = (None,) * len(trj_rs.shape[:-1]) + (slice(None),)
-            trj_cleaned = torch.pi * trj_rs / (im_size_arr[tup] / 2)
-
-            # Useful for nuffts
-            self.kb_ob = KbNufft(self.im_size, device=self.torch_dev).to(self.torch_dev)
-            self.kb_adj_ob = KbNufftAdjoint(self.im_size, device=self.torch_dev).to(self.torch_dev)
-
-        # Reshape trajectory to match torchkbnufft
-        omega_rs = rearrange(trj_cleaned, 'nseg nro npe ntr d -> nseg (nro npe ntr) d')
-        omega = rearrange(omega_rs, 'nseg N d -> nseg d N')
-
-        return omega, dcf_rs
+        return trj_rs, dcf_rs, edge_segment_size
 
     def _compute_grog_toeplitz_kernels(self) -> torch.Tensor:
         """
@@ -254,7 +215,7 @@ class subspace_linop(nn.Module):
 
         # Useful constants
         nsub = self.phi.shape[0]
-        nseg, nro, npe, ntr, d = self.trj_size
+        nseg, nro, npe, ntr, d = self.trj.shape
         phi = self.phi
         dcf = self.dcf
         
@@ -304,7 +265,7 @@ class subspace_linop(nn.Module):
         
         # Useful constants
         nsub = self.phi.shape[0]
-        nseg, nro, npe, ntr, d = self.trj_size
+        nseg, nro, npe, ntr, d = self.trj.shape
         data_dim = (nro, npe, ntr)
 
         # Defualt batch
@@ -384,7 +345,7 @@ class subspace_linop(nn.Module):
         # Useful constants
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
-        nseg, nro, npe, ntr, dim = self.trj_size
+        nseg, nro, npe, ntr, dim = self.trj.shape
         
         # Result array
         ksp = torch.zeros((nc, nseg * nro, npe, ntr), dtype=torch.complex64, device=self.torch_dev)
@@ -402,6 +363,9 @@ class subspace_linop(nn.Module):
                 if nseg > 1:
                     phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
 
+                # Trajectory segment
+                trj_seg = self.trj[t:u]
+
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
 
@@ -418,24 +382,25 @@ class subspace_linop(nn.Module):
                         BSx = Sx[None, ...]
 
                     # NUFFT
-                    if self.grog_grid_oversamp:
-                        BSx = self.grog_padder.forward(BSx)
-                        FBSx_cart = sp_fft(BSx, dim=tuple(range(-dim, 0)))
-                        FBSx_rs = torch.zeros((u-t, d-c, b-a, self.omega.shape[-1]), dtype=torch.complex64, device=self.torch_dev)
-                        for i in range(FBSx_rs.shape[0]):
-                            tup = (slice(None), slice(None)) + tuple(self.omega[t+i])
-                            FBSx_rs[i] = FBSx_cart[i][tup]
-                    else:
-                        BSx_rs = rearrange(BSx, 'nseg nc nsub ... -> nseg (nc nsub) ...')
-                        with torch.cuda.device(self.torch_dev):
-                            FBSx_rs = self.kb_ob(image=BSx_rs, omega=self.omega[t:u], norm='ortho')
-                        FBSx_rs = rearrange(FBSx_rs, 'nseg (nc nsub) ... -> nseg nc nsub ...',
-                                            nc=d-c,
-                                            nsub=b-a)
-                    FBSx = rearrange(FBSx_rs, 'nseg nc nsub (nro npe ntr) -> nseg nc nsub nro npe ntr', 
-                                     nro=nro, 
-                                     npe=npe, 
-                                     ntr=ntr)
+                    FBSx = self.nufft.forward(BSx, trj_seg)
+                    # if self.grog_grid_oversamp:
+                    #     BSx = self.grog_padder.forward(BSx)
+                    #     FBSx_cart = sp_fft(BSx, dim=tuple(range(-dim, 0)))
+                    #     FBSx_rs = torch.zeros((u-t, d-c, b-a, self.omega.shape[-1]), dtype=torch.complex64, device=self.torch_dev)
+                    #     for i in range(FBSx_rs.shape[0]):
+                    #         tup = (slice(None), slice(None)) + tuple(self.omega[t+i])
+                    #         FBSx_rs[i] = FBSx_cart[i][tup]
+                    # else:
+                    #     BSx_rs = rearrange(BSx, 'nseg nc nsub ... -> nseg (nc nsub) ...')
+                    #     with torch.cuda.device(self.torch_dev):
+                    #         FBSx_rs = self.kb_ob(image=BSx_rs, omega=self.omega[t:u], norm='ortho')
+                    #     FBSx_rs = rearrange(FBSx_rs, 'nseg (nc nsub) ... -> nseg nc nsub ...',
+                    #                         nc=d-c,
+                    #                         nsub=b-a)
+                    # FBSx = rearrange(FBSx_rs, 'nseg nc nsub (nro npe ntr) -> nseg nc nsub nro npe ntr', 
+                    #                  nro=nro, 
+                    #                  npe=npe, 
+                    #                  ntr=ntr)
 
                     # Combine with Phi
                     PBFSx = torch.sum(FBSx * self.phi[None, None, a:b, None, None, :], dim=2)
@@ -468,7 +433,7 @@ class subspace_linop(nn.Module):
         # Useful constants
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
-        nseg, nro_new, npe, ntr, dim = self.trj_size
+        nseg, nro_new, npe, ntr, dim = self.trj.shape
 
         # Result subspace coefficients
         alphas = torch.zeros((nsub, *self.mps.shape[1:]), dtype=torch.complex64, device=self.torch_dev)
@@ -488,6 +453,9 @@ class subspace_linop(nn.Module):
             # Move phase maps to GPU
             if nseg > 1:
                 phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
+
+            # Grab trj segment
+            trj_seg = self.trj[t:u]
             
             # Batch over coils
             for c, d in batch_iterator(nc, self.coil_batch_size):
@@ -505,18 +473,22 @@ class subspace_linop(nn.Module):
                     Py = ksp_gpu[:, :, None, ...] * self.phi[None, None, a:b, None, None, :].conj()
 
                     # adjoint NUFFT
-                    Py_rs = rearrange(Py, 'nseg nc nsub nro npe ntr -> nseg (nc nsub) (nro npe ntr)')
-                    if self.grog_grid_oversamp:
-                        omega_rs = torch.moveaxis(self.omega[t:u], -1, -2)
-                        FPy = torch.zeros((*Py_rs.shape[:2], *self.grog_os_size), dtype=torch.complex64, device=self.torch_dev)
-                        for i in range(FPy.shape[0]):
-                            FPy[i] = multi_grid(Py_rs[i], omega_rs[i], self.grog_os_size)
-                        FPy = sp_ifft(FPy, dim=tuple(range(-dim, 0)))
-                        FPy = self.grog_padder.adjoint(FPy)
-                    else:
-                        with torch.cuda.device(self.torch_dev):
-                            FPy = self.kb_adj_ob(data=Py_rs, omega=self.omega[t:u], norm='ortho')
-                    FPy = rearrange(FPy, f'nseg (nc nsub) ... -> nseg nc nsub ...', nc=d-c, nsub=b-a)
+                    # Py (nseg nc nsub nro npe ntr)
+                    # trj (nseg, nro npe ntr d)
+                    FPy = self.nufft.adjoint(Py, trj_seg)
+
+                    # Py_rs = rearrange(Py, 'nseg nc nsub nro npe ntr -> nseg (nc nsub) (nro npe ntr)')
+                    # if self.grog_grid_oversamp:
+                    #     omega_rs = torch.moveaxis(self.omega[t:u], -1, -2)
+                    #     FPy = torch.zeros((*Py_rs.shape[:2], *self.grog_os_size), dtype=torch.complex64, device=self.torch_dev)
+                    #     for i in range(FPy.shape[0]):
+                    #         FPy[i] = multi_grid(Py_rs[i], omega_rs[i], self.grog_os_size)
+                    #     FPy = sp_ifft(FPy, dim=tuple(range(-dim, 0)))
+                    #     FPy = self.grog_padder.adjoint(FPy)
+                    # else:
+                    #     with torch.cuda.device(self.torch_dev):
+                    #         FPy = self.kb_adj_ob(data=Py_rs, omega=self.omega[t:u], norm='ortho')
+                    # FPy = rearrange(FPy, f'nseg (nc nsub) ... -> nseg nc nsub ...', nc=d-c, nsub=b-a)
 
                     # Combine with adjoint phase arrays
                     if nseg > 1:
@@ -558,7 +530,7 @@ class subspace_linop(nn.Module):
             # Useful constants
             nsub = self.phi.shape[0]
             nc = self.mps.shape[0]
-            nseg, nro, npe, ntr, dim = self.trj_size
+            nseg, nro, npe, ntr, dim = self.trj.shape
 
             if nseg > 1 and self.phase_mps is not None:
                 self.phase_mps = self.phase_mps.to(alphas.device)

@@ -14,7 +14,7 @@ im_size = (220, 220)
 ninter = 16
 ncoil = 32
 R = 4
-lamda_l2 = 1e-3
+lamda_l2 = 1e-3 * 0
 device_idx = 5
 torch_dev = torch.device(device_idx)
 
@@ -29,12 +29,13 @@ trj = mri.spiral(fov=1,
                  gm=40e-3,
                  sm=100)
 trj = trj.reshape((-1, ninter, 2), order='F')[:, ::round(R), :]
+trj = np.round(trj)
 mps = mri.birdcage_maps((ncoil, *im_size), r=1.2)
 dcf = sp.to_device(mri.pipe_menon_dcf(trj, im_size, device=sp.Device(device_idx)))
 dcf /= dcf.max()
 
 # Simulate with sigpy 
-ksp = mri.linop.Sense(mps, trj) * phantom
+ksp = sp.nufft(phantom * mps, trj, oversamp=2, width=6)
 
 # Recon with sigpy
 img_sigpy = sp.to_device(mri.app.SenseRecon(ksp, mps, weights=dcf, coord=trj, lamda=lamda_l2, device=sp.Device(device_idx)).run())
@@ -43,10 +44,13 @@ img_sigpy = sp.to_device(mri.app.SenseRecon(ksp, mps, weights=dcf, coord=trj, la
 rcn = recon(device_idx)
 phi = np.ones((1, 1))
 A = subspace_linop(im_size=im_size,
+                   use_toeplitz=False,
                    trj=torch.tensor(trj, dtype=torch.float32, device=torch_dev)[..., None, :],
                    mps=torch.tensor(mps, dtype=torch.complex64, device=torch_dev),
                    phi=torch.tensor(phi, dtype=torch.complex64, device=torch_dev),
-                   dcf=torch.tensor(dcf, dtype=torch.float32, device=torch_dev)[..., None])
+                   dcf=torch.tensor(dcf, dtype=torch.float32, device=torch_dev)[..., None],
+                #    grog_grid_oversamp=1.0,
+                   coil_batch_size=ncoil)
 img_mr_recon = rcn.run_recon(A_linop=A,
                              ksp=ksp[..., None],
                              max_eigen=1.0,
