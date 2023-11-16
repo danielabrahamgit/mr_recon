@@ -35,7 +35,7 @@ def largest_eigenvalue(A: nn.Module,
     """
     
     for _ in tqdm(range(num_iters), 'Max Eigenvalue', disable=not verbose):
-
+        
         z = A(x0)
         ll = torch.norm(z)
         x0 = z / ll

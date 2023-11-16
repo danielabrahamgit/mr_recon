@@ -126,8 +126,8 @@ class subspace_linop(nn.Module):
         if grog_grid_oversamp is not None:
             self.nufft = gridded_nufft(im_size, device_idx, grog_grid_oversamp)
         else:
-            self.nufft = torchkb_nufft(im_size, device_idx)
-            # self.nufft = sigpy_nufft(im_size, device_idx)
+            # self.nufft = torchkb_nufft(im_size, device_idx)
+            self.nufft = sigpy_nufft(im_size, device_idx)
         trj_seg = self.nufft.rescale_trajectory(trj_seg)
         
         # Save
@@ -265,7 +265,12 @@ class subspace_linop(nn.Module):
         Ts = torch.zeros((nseg, nsub, nsub, *im_size_os), dtype=torch.complex64)
 
         # Make oversampled adjoint nufft
-        nufft_toep = sigpy_nufft(im_size_os, self.torch_dev.index)
+        if isinstance(self.nufft, torchkb_nufft):
+            nufft_toep = torchkb_nufft(im_size_os, self.torch_dev.index)
+            nufft_adjoint = lambda k, t : nufft_toep.adjoint(k, t)
+        else:
+            nufft_toep = sigpy_nufft(im_size_os, self.torch_dev.index)
+            nufft_adjoint = lambda k, t : nufft_toep.adjoint(k, t * os_factor)
 
         # Batch over time segments
         for l1 in tqdm(range(0, nseg, self.seg_batch_size), 'Computing Topelitz Kernels', disable=nseg == 1):
@@ -291,7 +296,7 @@ class subspace_linop(nn.Module):
                     alpha_ksp = sig_ksp[:, None, ...] * self.phi.conj()[None, a:b, None, None, :]
                     alpha_ksp = alpha_ksp * self.dcf[l1:l2, None, ...]
                     with torch.cuda.device(self.torch_dev):                        
-                        psf_col = nufft_toep.adjoint(alpha_ksp, trj_seg * os_factor)
+                        psf_col = nufft_adjoint(alpha_ksp, trj_seg)
 
                         # Transform to k-space
                         T_col = sp_fft(psf_col, dim=tuple(range(-d, 0))) 
@@ -341,20 +346,14 @@ class subspace_linop(nn.Module):
             # Batch over segments
             for t, u in batch_iterator(nseg, self.seg_batch_size):
             
-                # Move phase maps to gpu
                 if nseg > 1:
                     phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
-
-                # Trajectory segment
                 trj_seg = self.trj[t:u]
 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
 
-                    # Move coeffs to GPU
                     alphas_gpu = alphas[a:b]
-
-                    # Apply maps
                     Sx = mps_gpu[:, None, ...] * alphas_gpu[None, ...]
 
                     # Apply B0 phase
@@ -363,10 +362,8 @@ class subspace_linop(nn.Module):
                     else:
                         BSx = Sx[None, ...]
 
-                    # NUFFT
+                    # NUFFT + phi
                     FBSx = self.nufft.forward(BSx, trj_seg)
-  
-                    # Combine with Phi
                     PBFSx = torch.sum(FBSx * self.phi[None, None, a:b, None, None, :], dim=2)
                     PBFSx_rs = rearrange(PBFSx, 'nseg nc nro npe ntr -> nc (nseg nro) npe ntr')
 
@@ -414,38 +411,28 @@ class subspace_linop(nn.Module):
         # Batch over segments
         for t, u in batch_iterator(nseg, self.seg_batch_size):
             
-            # Move phase maps to GPU
             if nseg > 1:
                 phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
-
-            # Grab trj segment
             trj_seg = self.trj[t:u]
             
             # Batch over coils
             for c, d in batch_iterator(nc, self.coil_batch_size):
 
-                # Move maps to GPU
                 mps_gpu = self.mps[c:d]
                 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
 
-                    # Move ksp to GPU, mult by dcf
+                    # Adjoint phi and nufft
                     ksp_gpu = ksp_rs[t:u, c:d, ...] * self.dcf[t:u, None, ...]
-
-                    # Apply adjoint phi
                     Py = ksp_gpu[:, :, None, ...] * self.phi[None, None, a:b, None, None, :].conj()
-
-                    # adjoint NUFFT
                     FPy = self.nufft.adjoint(Py, trj_seg)
 
-                    # Combine with adjoint phase arrays
+                    # Combine with adjoint maps
                     if nseg > 1:
                         BFPy = torch.sum(FPy * phase_mps_gpu[:, None, None, ...].conj(), dim=0)
                     else:
                         BFPy = FPy[0]
-
-                    # Combine with adjoint maps
                     SBFPy = torch.sum(BFPy * mps_gpu[:, None, ...].conj(), dim=0)
 
                     # Append to image
@@ -493,60 +480,41 @@ class subspace_linop(nn.Module):
             # Batch over b0 time segments
             for t, u in batch_iterator(nseg, self.seg_batch_size):
 
-                # Move phase maps to GPU
                 if nseg > 1:
                     phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
 
-                    # Move coeffs to GPU
                     alphas_gpu = alphas[a:b]
-
                     if not save_memory:
                         toep_kerns = self.toep_kerns[t:u, :, a:b].to(self.torch_dev)
 
                     # Batch over coils
                     for c, d in batch_iterator(nc, self.coil_batch_size):
-                    
-                        # Move maps to GPU
+                        
+                        # Apply sense/phase maps
                         mps_gpu = self.mps[c:d]
-
-                        # Apply maps
                         Sx = mps_gpu[:, None, ...] * alphas_gpu[None, ...]
-
-                        # Apply b0 phase
                         if nseg > 1:
                             BSx = Sx[None, ...] * phase_mps_gpu[:, None, None, ...]
                         else:
                             BSx = Sx[None, ...]
 
-                        # Zero pad image
+                        # Toeplitz
                         BSx_os = padder.forward(BSx)
-
-                        # FFT
                         FBSx_os = sp_fft(BSx_os, dim=tuple(range(-dim, 0)))
-
-                        # Batch over subspace again
                         for a2, b2 in batch_iterator(nsub, self.sub_batch_size):
-
-                            # Apply toeplitz kernels
                             if save_memory:
                                 kerns = self.toep_kerns[t:u, None, a2:b2, a:b].to(self.torch_dev)
                             else:
                                 kerns = toep_kerns[:, None, a2:b2, :]
                             MFBSx_os = torch.sum(kerns * FBSx_os[:, :, None, ...], dim=3)
-                            
-                            # Inverse FFT
                             FMFBSx_os = sp_ifft(MFBSx_os, dim=tuple(range(-dim, 0)))
-
-                            # Crop
                             FMFBSx = padder.adjoint(FMFBSx_os)
 
-                            # Apply adjoint maps
+                            # Apply adjoint sense/phase maps
                             SFMFBSx = torch.sum(FMFBSx * mps_gpu[None, :, None, ...].conj(), dim=1)
-
-                            # Apply adjoint b0 phase
                             if nseg > 1:
                                 BSFMFBSx = torch.sum(SFMFBSx * phase_mps_gpu[:, None, ...].conj(), dim=0)
                             else:

@@ -4,7 +4,7 @@ import torch
 import time
 import numpy as np
 import sigpy as sp
-import sigpy.mri as mr
+import sigpy.mri as mri
 
 from tqdm import tqdm
 from typing import Optional
@@ -25,7 +25,7 @@ Here is a list and description of each:
     nc   - number of coil sensitivity maps
     nro  - number of points along the readout dimenstion
     npe  - number of phase encodes/groups/interleaves
-    ntr  - number of TRs (time repetition)
+    ntr  - number of TRs or time points for temporal subspace recons
     nsub - number of subspace coefficients
     d    - dimension of the problem. d = 2 for 2D, d = 3 for 3D, etc
 """
