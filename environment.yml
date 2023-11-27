@@ -1,0 +1,42 @@
+name: mr_recon
+channels:
+  - conda-forge
+  - frankong
+  - pytorch
+  - nvidia
+dependencies:
+  # Cupy stuff
+  - cupy=12.0.0
+  - cudnn>=8.8.0.121
+  - cutensor>=1.7.0.1
+  - nccl>=2.15.5.1
+  - matplotlib
+  - numpy=1.22  #fix version to ignore sigpy errors
+  - python=3.10
+  - pytest
+  - pytorch>=2.0
+  - pytorch-cuda
+  - PyWavelets
+  - scipy
+  - torchvision
+  - tqdm
+  - pyyaml
+  - pip
+  - pip:
+     - easydict
+     - einops
+     - gdown
+     - graphviz
+     - h5py
+     # Jupyterlab extensions
+     # - jupyterlab-vimrc
+     - mat73 # loading matlab v7.3 format files
+     - multipledispatch
+     - pyyaml
+     - sigpy==0.1.25 # here bc of python 3.10 I think
+     - tensorboard
+     - torchgeometry
+     - torchkbnufft
+     - torchview
+     - tyro
+     - wget
