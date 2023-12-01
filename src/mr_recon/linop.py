@@ -525,3 +525,53 @@ class subspace_linop(nn.Module):
         
         return alphas_hat
         
+class multi_subspace_linop(nn.Module):
+    
+    def __init__(self,
+                 im_size: tuple,
+                 trj: torch.Tensor,
+                 mps: torch.Tensor,
+                 phi: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 use_toeplitz: Optional[bool] = True,
+                 grog_grid_oversamp: Optional[float] = None,
+                 b0_dct: Optional[dict] = None,
+                 coil_batch_size: Optional[int] = 1,
+                 sub_batch_size: Optional[int] = 1,
+                 seg_batch_size: Optional[int] = 1):
+        """
+        Parameters
+        ----------
+        im_size : tuple 
+            image dims as tuple of ints (dim1, dim2, ...)
+        trj : torch.tensor <float> | GPU
+            The k-space trajectory with shape (nro, npe, ntr, d). 
+                we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        phi : torch.tensor <complex> | GPU
+            subspace basis with shape (nsub, ntr)
+        mps : torch.tensor <complex> | GPU
+            sensititvity maps with shape (ncoil, ndim1, ..., ndimN)
+        dcf : torch.tensor <float> | GPU
+            the density comp. functon with shape (nro, ...)
+        use_toeplitz : bool
+            toggles toeplitz normal operator
+        grog_grid_oversamp : float 
+            If given, toggles Gridded recon. Assumes trj lines on oversampled grid with 
+            oversampling factor 'grog_grid_oversamp' (usually between 1 and 2)
+        b0_dct : dict
+            dictionary with b0 info for time segmented model -
+            b0_dct = {
+                'b0_map': torch.tensor
+                    b0 map in Hz, same dims as image
+                'dt': float
+                    sampling time in seconds
+                'nseg': int
+                    number of segments for time segmented model
+            }
+        coil_batch_size : int
+            number of coils to batch on gpu
+        sub_batch_size : int
+            number of subspace coeffs to batch on gpu
+        seg_batch_size : int
+            number of time segments to batch on gpu
+        """
