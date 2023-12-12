@@ -31,7 +31,7 @@ from mr_recon.utils.general import create_exp_dir
 @dataclass
 class MRParams:
     n_coils: int = 12
-    R: int = 16
+    R: int = 8
     dt: float = 4e-6
     excitation_ty: str = "flat"
 
@@ -41,7 +41,9 @@ class ReconParams:
     n_clusters: int = 1
     n_fas_per_cluster: int = 1
 
-    n_coeffs: int = 5
+    n_coeffs: int = 7
+
+    n_iters: int = 10
 
 
 @dataclass
@@ -219,13 +221,13 @@ def run_recon(
         phis=data.phis,
         masks=data.masks,
         dcf=data.dcf,
-        grog_grid_oversamp=1.0,
+        # grog_grid_oversamp=None,
     )
     # TODO: make sure that we are compensating for DCF here
 
     rcn = recon(0)
     img_mr_recon = rcn.run_recon(
-        A_linop=A, ksp=noisy_ksp, max_eigen=1.0, max_iter=30, lamda_l2=0
+        A_linop=A, ksp=noisy_ksp, max_eigen=1.0, max_iter=args.recon_params.n_iters, lamda_l2=0
     )
     img_mr_recon = torch.from_numpy(img_mr_recon).to(noisy_ksp)
 
@@ -350,7 +352,7 @@ def get_subspaces(
         n_th = int(torch.argwhere(cmsm > sing_val_thresh * cmsm[-1]).flatten()[0])
         phis.append(vh[:n_coeffs, :].conj().type(torch.complex64))
         logger.info(
-            f"Dictionary {i}: To get {sing_val_thresh} of the signal energy we need to use: {n_th} coeffs."
+            f"Dictionary {i}: To get {sing_val_thresh} of the signal energy we need to use: {n_th} coeffs. "
             f"We compressed to {n_coeffs} coefficients"
         )
 
