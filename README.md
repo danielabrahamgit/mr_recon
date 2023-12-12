@@ -2,6 +2,7 @@
 
 # Setup
 ```bash
+git submodule update --init --recursive
 mamba env create -f env.yml
 pip install -e .
 mamba activate mr_recon
