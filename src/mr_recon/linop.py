@@ -39,7 +39,6 @@ class subspace_linop(nn.Module):
                  dcf: Optional[torch.Tensor] = None,
                  use_toeplitz: Optional[bool] = True,
                  grog_grid_oversamp: Optional[float] = None,
-                 b0_dct: Optional[dict] = None,
                  coil_batch_size: Optional[int] = 1,
                  sub_batch_size: Optional[int] = 1,
                  seg_batch_size: Optional[int] = 1):
@@ -62,16 +61,6 @@ class subspace_linop(nn.Module):
         grog_grid_oversamp : float 
             If given, toggles Gridded recon. Assumes trj lines on oversampled grid with 
             oversampling factor 'grog_grid_oversamp' (usually between 1 and 2)
-        b0_dct : dict
-            dictionary with b0 info for time segmented model -
-            b0_dct = {
-                'b0_map': torch.tensor
-                    b0 map in Hz, same dims as image
-                'dt': float
-                    sampling time in seconds
-                'nseg': int
-                    number of segments for time segmented model
-            }
         coil_batch_size : int
             number of coils to batch on gpu
         sub_batch_size : int
