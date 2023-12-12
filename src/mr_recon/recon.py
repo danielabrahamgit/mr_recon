@@ -1,10 +1,8 @@
-import gc
 import os
 import torch
 import time
 import numpy as np
 import sigpy as sp
-import sigpy.mri as mri
 
 from tqdm import tqdm
 from typing import Optional
@@ -205,7 +203,7 @@ class recon:
 
             # Least squares fit TODO GPU?
             coefs = torch.from_numpy(np.linalg.lstsq(B.H @ B, B.H @ D, rcond=None)[0])
-            # coefs = torch.linalg.lstsq(B.H @ B, B.H @ D).solution # WTF????
+            # coefs = torch.linalg.lstsq(B.H @ B, B.H @ D).solution 
 
         # Quantize b0
         tup = (None,) * b0_map.ndim + (slice(None),)

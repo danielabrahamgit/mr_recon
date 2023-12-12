@@ -265,11 +265,15 @@ class subspace_linop(nn.Module):
         Ts = torch.zeros((nseg, nsub, nsub, *im_size_os), dtype=torch.complex64)
 
         # Make oversampled adjoint nufft
+        if 'cpu' in str(self.torch_dev):
+            device_idx = -1
+        else:
+            device_idx = self.torch_dev.index
         if isinstance(self.nufft, torchkb_nufft):
-            nufft_toep = torchkb_nufft(im_size_os, self.torch_dev.index)
+            nufft_toep = torchkb_nufft(im_size_os, device_idx)
             nufft_adjoint = lambda k, t : nufft_toep.adjoint(k, t)
         else:
-            nufft_toep = sigpy_nufft(im_size_os, self.torch_dev.index)
+            nufft_toep = sigpy_nufft(im_size_os, device_idx)
             nufft_adjoint = lambda k, t : nufft_toep.adjoint(k, t * os_factor)
 
         # Batch over time segments
@@ -295,7 +299,7 @@ class subspace_linop(nn.Module):
                     # Call adjoint
                     alpha_ksp = sig_ksp[:, None, ...] * self.phi.conj()[None, a:b, None, None, :]
                     alpha_ksp = alpha_ksp * self.dcf[l1:l2, None, ...]
-                    with torch.cuda.device(self.torch_dev):                        
+                    with torch.cuda.device(device_idx):                        
                         psf_col = nufft_adjoint(alpha_ksp, trj_seg)
 
                         # Transform to k-space
@@ -308,7 +312,7 @@ class subspace_linop(nn.Module):
                     # Clean up, these are massive operations
                     del T_col, alpha_ksp, psf_col
                     gc.collect()
-                    with torch.cuda.device(self.torch_dev):
+                    with torch.cuda.device(device_idx):
                         torch.cuda.empty_cache()
                 
         return Ts                

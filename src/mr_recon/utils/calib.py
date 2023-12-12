@@ -14,7 +14,7 @@ from torchkbnufft import (
     calc_toeplitz_kernel,
 )
 
-from igrog.recon.torch_algs import conjugate_gradient
+from mr_recon.algs import conjugate_gradient
 
 __all__ = [
     'truncate_trj_ksp',

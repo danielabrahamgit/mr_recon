@@ -201,7 +201,7 @@ class sigpy_nufft(NUFFT):
             # Apodize
             _apodize(output, ndim, oversamp, width, beta)
 
-        return np_to_torch(output)[0]
+        return np_to_torch(output)
 
 class torchkb_nufft(NUFFT):
 

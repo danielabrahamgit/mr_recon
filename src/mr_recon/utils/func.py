@@ -4,6 +4,28 @@ import sigpy as sp
 import numpy as np
 import torch.fft as fft
 
+def normalize(shifted, target, ofs=True, mag=False, return_params=False):
+    if mag:
+        col1 = np.abs(shifted).flatten()
+        y = np.abs(target).flatten()
+    else:
+        col1 = shifted.flatten()
+        y = target.flatten()
+
+    if ofs:
+        col2 = col1 * 0 + 1
+        A = np.array([col1, col2]).T
+        a, b = np.linalg.lstsq(A, y, rcond=None)[0]
+    else:
+        b = 0
+        a = np.linalg.lstsq(np.array([col1]).T, y, rcond=None)[0]
+
+    if return_params:
+        return a * shifted + b, (a, b)
+    else:
+        return a * shifted + b
+
+
 def np_to_torch(*args):
     ret_args = []
     for arg in args:
@@ -15,6 +37,10 @@ def np_to_torch(*args):
             ret_args.append(arg)
         else:
             ret_args.append(None)
+
+    if len(ret_args) == 1:
+        ret_args = ret_args[0]
+
     return ret_args
 
 def torch_to_np(*args):
@@ -30,6 +56,10 @@ def torch_to_np(*args):
             ret_args.append(arg)
         else:
             ret_args.append(None)
+    
+    if len(ret_args) == 1:
+        ret_args = ret_args[0]
+
     return ret_args
 
 def batch_iterator(total, batch_size):
