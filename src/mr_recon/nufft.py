@@ -162,7 +162,7 @@ class sigpy_nufft(NUFFT):
                 ksp_ret[i] = sp.interp.interpolate(
                         ksp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
             ksp_ret /= width ** ndim
-        return np_to_torch(ksp_ret)[0]
+        return np_to_torch(ksp_ret)
 
     def adjoint(self, 
                 ksp: torch.Tensor, 

@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from mr_recon.utils.func import batch_iterator, sp_fft, sp_ifft
 from mr_recon.utils.pad import PadLast
+from mr_recon.field import field_handler
 from mr_recon.nufft import (
     gridded_nufft,
     sigpy_nufft,
@@ -37,6 +38,7 @@ class subspace_linop(nn.Module):
                  mps: torch.Tensor,
                  phi: torch.Tensor,
                  dcf: Optional[torch.Tensor] = None,
+                 field_obj: Optional[field_handler] = None,
                  use_toeplitz: Optional[bool] = True,
                  grog_grid_oversamp: Optional[float] = None,
                  coil_batch_size: Optional[int] = 1,
@@ -56,6 +58,8 @@ class subspace_linop(nn.Module):
             sensititvity maps with shape (ncoil, ndim1, ..., ndimN)
         dcf : torch.tensor <float> | GPU
             the density comp. functon with shape (nro, ...)
+        field_obj : field_handler
+            represents phase due to field imperfections
         use_toeplitz : bool
             toggles toeplitz normal operator
         grog_grid_oversamp : float 
@@ -83,47 +87,24 @@ class subspace_linop(nn.Module):
         self.torch_dev = trj.device
         assert phi.device == self.torch_dev
 
-        # Grab b0 components
-        if b0_dct is not None:
-            nseg = b0_dct['nseg']
-            dt = b0_dct['dt']
-            b0_map = b0_dct['b0_map']
-
-            # Make b0 phase maps
-            split_size = round(trj.shape[0]/nseg)
-            times = torch.arange(0, trj.shape[0]) * dt
-            times_split = torch.split(times, split_size, dim=0)
-            nseg_actual = len(times_split)
-            phase_mps = torch.zeros((nseg_actual, *self.im_size), dtype=torch.complex64)
-            for i in range(nseg_actual):
-                ti = torch.mean(times_split[i])
-                phase_mps[i] = torch.exp(-1j * 2 * torch.pi * ti * b0_map)
-            phase_mps = phase_mps.to(self.torch_dev)
-        else:
-            nseg = 1
-            phase_mps = None
-
         # Default dcf
         if dcf is None:
             dcf = torch.ones(trj.shape[:-1]).to(self.torch_dev)
-        
-        # Process trajectory and dcf for time segmentation
-        trj_seg, dcf_seg, edge_segment_size = self._time_segment_reshaper(trj, dcf, nseg)
 
         # Make self.nufft
-        device_idx = trj_seg.get_device()
+        device_idx = trj.get_device()
         if grog_grid_oversamp is not None:
             self.nufft = gridded_nufft(im_size, device_idx, grog_grid_oversamp)
         else:
             # self.nufft = torchkb_nufft(im_size, device_idx)
             self.nufft = sigpy_nufft(im_size, device_idx)
-        trj_seg = self.nufft.rescale_trajectory(trj_seg)
+        trj = self.nufft.rescale_trajectory(trj)
         
         # Save
-        self.edge_segment_size = edge_segment_size
-        self.trj = trj_seg
-        self.dcf = dcf_seg
-        self.phase_mps = phase_mps
+        self.trj = trj
+        self.dcf = dcf
+        self.field_obj = field_obj
+        self.nseg = 1 if field_obj is None else field_obj.nseg
         self.phi = phi
         self.mps = mps
         self.coil_batch_size = coil_batch_size
@@ -134,6 +115,7 @@ class subspace_linop(nn.Module):
 
         # Toeplitz kernels
         if use_toeplitz:
+            raise NotImplementedError
             if grog_grid_oversamp:
                 self.toep_kerns = self._compute_grog_toeplitz_kernels()
             else:
@@ -144,50 +126,6 @@ class subspace_linop(nn.Module):
             if 'cpu' not in str(self.torch_dev):
                 with torch.cuda.device(self.torch_dev):
                     torch.cuda.empty_cache()
-
-    def _time_segment_reshaper(self,
-                               trj: torch.Tensor,
-                               dcf: torch.Tensor,
-                               nseg: int) -> Union[torch.Tensor, torch.Tensor]:
-        """
-        Helper funciton to process the trajectory and dcf to be time segmented
-
-        Parameters:
-        -----------
-        trj : torch.tensor <float>
-            The k-space trajectory with shape (nro, npe, ntr, d). 
-                we assume that trj values are in [-n/2, n/2] (for nxn grid)
-        dcf : torch.tensor <float> 
-            the density comp. functon with shape (nro, npe, ntr)
-        nseg: int
-            number of segments for time segmented model
-
-        Returns
-        ----------
-        trj : torch.tensor <float32>
-            The segmented k-space trajectory with shape (nseg, nro_new, npe, ntr, d). 
-        dcf_rs : torch.tensor <float>
-            The dcf with shape (nseg, nro_new, npe, ntr)
-        edge_segment_size : int
-            true number of readout points for the final segment
-        """
-        
-        # Reshape trj and dcf to support segments
-        split_size = round(trj.shape[0]/nseg)
-        trj_split = torch.split(trj, split_size, dim=0)
-        dcf_split = torch.split(dcf, split_size, dim=0)
-        nseg = len(trj_split)
-
-        # Move split components into zero-padded tensors
-        trj_rs = torch.zeros((nseg, split_size, *trj.shape[1:]), dtype=torch.float32).to(self.torch_dev)
-        dcf_rs = torch.zeros((nseg, split_size, *dcf.shape[1:]), dtype=torch.float32).to(self.torch_dev)
-        for i in range(nseg):
-            split_size_i = trj_split[i].shape[0]
-            trj_rs[i, :split_size_i] = trj_split[i]
-            dcf_rs[i, :split_size_i] = dcf_split[i]
-        edge_segment_size = trj_split[-1].shape[0]
-
-        return trj_rs, dcf_rs, edge_segment_size
 
     def _compute_grog_toeplitz_kernels(self) -> torch.Tensor:
         """
@@ -325,10 +263,10 @@ class subspace_linop(nn.Module):
         # Useful constants
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
-        nseg, nro, npe, ntr, dim = self.trj.shape
+        nseg = self.nseg
         
         # Result array
-        ksp = torch.zeros((nc, nseg * nro, npe, ntr), dtype=torch.complex64, device=self.torch_dev)
+        ksp = torch.zeros((nc, *self.trj.shape[:-1]), dtype=torch.complex64, device=self.torch_dev)
 
         # Batch over coils
         for c, d in batch_iterator(nc, self.coil_batch_size):
@@ -338,10 +276,10 @@ class subspace_linop(nn.Module):
 
             # Batch over segments
             for t, u in batch_iterator(nseg, self.seg_batch_size):
-            
+
                 if nseg > 1:
-                    phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
-                trj_seg = self.trj[t:u]
+                    segs = torch.arange(t, u, device=self.torch_dev)
+                    phase_mps_gpu = self.field_obj.get_phase_maps(segs)
 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
@@ -356,17 +294,21 @@ class subspace_linop(nn.Module):
                         BSx = Sx[None, ...]
 
                     # NUFFT + phi
-                    FBSx = self.nufft.forward(BSx, trj_seg)
-                    PBFSx = torch.sum(FBSx * self.phi[None, None, a:b, None, None, :], dim=2)
-                    PBFSx_rs = rearrange(PBFSx, 'nseg nc nro npe ntr -> nc (nseg nro) npe ntr')
+                    FBSx = self.nufft.forward(BSx[None,], self.trj[None, ...])[0]
+                    PBFSx = einsum(FBSx, self.phi, 'nseg nc nsub nro npe ntr, nsub ntr -> nseg nc nro npe ntr')
+    
+                    # Apply temporal interpolators
+                    if nseg > 1:
+                        interp_coeffs = self.field_obj.get_interp_ceoffs(segs) # nro npe ntr nseg
+                        interp_coeffs = interp_coeffs.type(torch.complex64)
+                        ksp_batch = einsum(interp_coeffs, PBFSx, 'nro npe ntr nseg, nseg nc nro npe ntr -> nc nro npe ntr')
+                    else:
+                        ksp_batch = PBFSx[0]
 
                     # Append to k-space
-                    ksp[c:d, nro*t:nro*u, ...] += PBFSx_rs
+                    ksp[c:d, ...] += ksp_batch
 
-        # Correction term
-        nro_actual = nro * (nseg-1) + self.edge_segment_size
-
-        return ksp[:, :nro_actual, ...]
+        return ksp
     
     def adjoint(self,
                 ksp: torch.Tensor) -> torch.Tensor:
@@ -387,26 +329,17 @@ class subspace_linop(nn.Module):
         # Useful constants
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
-        nseg, nro_new, npe, ntr, dim = self.trj.shape
+        nseg = self.nseg
 
         # Result subspace coefficients
         alphas = torch.zeros((nsub, *self.mps.shape[1:]), dtype=torch.complex64, device=self.torch_dev)
-
-        # Zero pad and reshape k-space 
-        num_zeros = nro_new * nseg - ksp.shape[1]
-        zeros = torch.zeros((nc, num_zeros, npe, ntr), dtype=torch.complex64, device=self.torch_dev)
-        ksp_zp = torch.cat((ksp, zeros), dim=1)
-        ksp_rs = rearrange(ksp_zp, 
-                           pattern='nc (nseg nro_new) npe ntr -> nseg nc nro_new npe ntr', 
-                           nseg=nseg, 
-                           nro_new=nro_new)
-
+        
         # Batch over segments
         for t, u in batch_iterator(nseg, self.seg_batch_size):
             
             if nseg > 1:
-                phase_mps_gpu = self.phase_mps[t:u]#.to(self.torch_dev)
-            trj_seg = self.trj[t:u]
+                segs = torch.arange(t, u, device=self.torch_dev)
+                phase_mps_gpu = self.field_obj.get_phase_maps(segs)
             
             # Batch over coils
             for c, d in batch_iterator(nc, self.coil_batch_size):
@@ -417,19 +350,26 @@ class subspace_linop(nn.Module):
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
 
                     # Adjoint phi and nufft
-                    ksp_gpu = ksp_rs[t:u, c:d, ...] * self.dcf[t:u, None, ...]
-                    Py = ksp_gpu[:, :, None, ...] * self.phi[None, None, a:b, None, None, :].conj()
-                    FPy = self.nufft.adjoint(Py, trj_seg)
+                    Wy = ksp[c:d, ...] * self.dcf[None, ...] # nc nro npe ntr
+
+                    if nseg > 1:
+                        interp_coeffs = self.field_obj.get_interp_ceoffs(segs) # nro npe ntr nseg
+                        interp_coeffs = interp_coeffs.type(torch.complex64)
+                        Wy = einsum(Wy, interp_coeffs, 'nc nro npe ntr, nro npe ntr nseg -> nseg nc nro npe ntr')
+                        PWy = einsum(Wy, self.phi.conj(), 'nseg nc nro npe ntr, nsub ntr -> nseg nsub nc nro npe ntr')
+                    else:
+                        PWy = einsum(Wy, self.phi.conj(), 'nc nro npe ntr, nsub ntr -> nsub nc nro npe ntr')
+                    FPWy = self.nufft.adjoint(PWy[None, ...], self.trj[None, ...])[0] # (nseg) nsub nc *im_size
 
                     # Combine with adjoint maps
                     if nseg > 1:
-                        BFPy = torch.sum(FPy * phase_mps_gpu[:, None, None, ...].conj(), dim=0)
+                        BFPWy = einsum(FPWy, phase_mps_gpu.conj(), 'nseg nsub nc ..., nseg ... -> nsub nc ...')
                     else:
-                        BFPy = FPy[0]
-                    SBFPy = torch.sum(BFPy * mps_gpu[:, None, ...].conj(), dim=0)
+                        BFPWy = FPWy
+                    SBFPWy = einsum(BFPWy, mps_gpu.conj(), 'nsub nc ..., nc ... -> nsub ...')
 
                     # Append to image
-                    alphas[a:b, ...] += SBFPy
+                    alphas[a:b, ...] += SBFPWy
 
         return alphas
     
