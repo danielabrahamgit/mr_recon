@@ -3,6 +3,7 @@ import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
+import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -42,8 +43,14 @@ class ReconParams:
     n_fas_per_cluster: int = 1
 
     n_coeffs: int = 5
+    n_iters: int = 10
+    use_toeplitz: bool = True
+    grog_grid_oversamp: Optional[int] = None
+    coil_batch_size: int = 1
+    sub_batch_size: int = 1
+    seg_batch_size: int = 1
 
-    n_iters: int = 20
+    lambda_l2: float = 0.0
 
 
 @dataclass
@@ -60,19 +67,20 @@ class GeneratedData:
     voxel_labels: torch.Tensor
     masks: torch.Tensor
     brain_mask: torch.Tensor
+    avg_pd: Optional[float] = None
 
 
 @dataclass
 class Config:
     exp_name: str = "debug"
     log_dir: Path = Path("logs")
-    saved_data_dir: Optional[Path] = Path("./test_data")
+    saved_data_dir: Optional[Path] = Path("logs/debug/2023-12-13_11-00")
 
     generate_data: bool = True
-    generate_fa_map: bool = True
+    save_generated_data: bool = True
 
     run_recon: bool = True
-    noise_std: float = 0.0
+    noise_std: float = 1e-3
 
     device_idx = 0
     im_size = (220, 220)
@@ -95,69 +103,10 @@ def main():
         assert (
             args.saved_data_dir is not None
         ), "Wanted to load saved data, but no path was given"
+
         logger.info(f"Loading data from: {args.saved_data_dir}")
-
-        ksp = torch.from_numpy(np.load(args.saved_data_dir / "ksp.npy")).to(
-            args.device_idx
-        )
-        trj = torch.from_numpy(np.load(args.saved_data_dir / "trj.npy")).to(
-            args.device_idx
-        )
-        mps = torch.from_numpy(np.load(args.saved_data_dir / "mps.npy")).to(
-            args.device_idx
-        )
-        phis = torch.from_numpy(np.load(args.saved_data_dir / "phi.npy")).to(
-            args.device_idx
-        )
-        phis = [phis[i].to(torch.complex64) for i in range(len(phis))]
-        dcts = torch.from_numpy(np.load(args.saved_data_dir / "dcts.npy")).to(
-            args.device_idx
-        )
-        dcts = [dcts[i].to(torch.complex64) for i in range(len(dcts))]
-        tissues = torch.from_numpy(np.load(args.saved_data_dir / "tissues.npy")).to(
-            args.device_idx
-        )
-        dcf = torch.from_numpy(np.load(args.saved_data_dir / "dcf.npy")).to(
-            args.device_idx
-        )
-        voxel_labels = torch.from_numpy(
-            np.load(args.saved_data_dir / "voxel_labels.npy")
-        ).to(args.device_idx)
-
-        data = quant_phantom()
-        t1 = torch.from_numpy(sp.resize(data["t1"][100], args.im_size)).to(
-            args.device_idx
-        )
-        t2 = torch.from_numpy(sp.resize(data["t2"][100], args.im_size)).to(
-            args.device_idx
-        )
-        pd = torch.from_numpy(sp.resize(data["pd"][100], args.im_size)).to(
-            args.device_idx
-        )
-        gt = torch.stack([pd, t1, t2], axis=-1).to(args.device_idx)
-        brain_mask = pd > 0.1
-
-        masks = torch.stack(
-            [voxel_labels == i for i in range(args.recon_params.n_clusters)]
-        ).to(args.device_idx)
-
-        # compress the dictionary
-        cmprsd_dcts = [dcts[i] @ phis[i].T for i in range(len(dcts))]
-
-        data = GeneratedData(
-            gt=gt,
-            ksp=ksp,
-            trj=trj,
-            mps=mps,
-            phis=phis,
-            dcts=dcts,
-            cmprsd_dcts=cmprsd_dcts,
-            tissues=tissues,
-            dcf=dcf,
-            voxel_labels=voxel_labels,
-            masks=masks,
-            brain_mask=brain_mask,
-        )
+        with open(args.saved_data_dir / "data", "rb") as file:
+            data = pickle.load(file)
 
     if args.run_recon:
         recon_coeffs, est_tissues = run_recon(args, data)
@@ -180,42 +129,43 @@ def generate_data(args: Config) -> GeneratedData:
     pd = torch.from_numpy(sp.resize(data["pd"][100], args.im_size)).to(device)
     gt = torch.stack([pd, t1, t2], axis=-1).to(device)
     brain_mask = pd > 0.1
+    avg_pd = torch.mean(pd[brain_mask])
     logger.info(f"Image size: {pd.shape}")
 
     # Load default sequence
     seq_data = mrf_sequence()
+    seq_data["TR_init"][0][-1] = 15.0
     trs = torch.from_numpy(seq_data["TR_init"][0].astype(np.float32)).to(device)
     fas = torch.deg2rad(
         torch.from_numpy(seq_data["FA_init"][0].astype(np.float32)).to(device)
     )
     logger.info(f"Sequence length: {len(fas)}")
 
-    if args.generate_fa_map:
-        logger.info("Generating FA map")
-        modes = get_modes(args.im_size, args.mr_params.excitation_ty).to(device)
-        logger.info(f"Modes shape: {modes.shape}")
+    logger.info("Generating FA map")
+    modes = get_modes(args.im_size, args.mr_params.excitation_ty).to(device)
+    logger.info(f"Modes shape: {modes.shape}")
 
-        # get the flip angle maps and cluster them
-        fa_map, clusters, voxel_labels = generate_fa_map(
-            fas, modes, args.recon_params.n_clusters
-        )
+    # get the flip angle maps and cluster them
+    fa_map, clusters, voxel_labels = generate_fa_map(
+        fas, modes, args.recon_params.n_clusters
+    )
 
-        # calculate the subspace per cluster
-        phis, dcts, tissues = get_subspaces(
-            voxel_labels,
-            fa_map,
-            clusters,
-            args.recon_params.n_fas_per_cluster,
-            sing_val_thresh=0.95,
-            n_coeffs=args.recon_params.n_coeffs,
-        )
+    # calculate the subspace per cluster
+    phis, dcts, tissues = get_subspaces(
+        voxel_labels,
+        fa_map,
+        clusters,
+        args.recon_params.n_fas_per_cluster,
+        sing_val_thresh=0.95,
+        n_coeffs=args.recon_params.n_coeffs,
+    )
 
-        # compress the dictionary
-        cmprsd_dcts = [dcts[i] @ phis[i].T for i in range(len(dcts))]
+    # compress the dictionary
+    cmprsd_dcts = [dcts[i] @ phis[i].T for i in range(len(dcts))]
 
-        masks = torch.stack(
-            [voxel_labels == i for i in range(args.recon_params.n_clusters)]
-        ).to(fa_map)
+    masks = torch.stack(
+        [voxel_labels == i for i in range(args.recon_params.n_clusters)]
+    ).to(fa_map)
 
     ds = data_sim(
         im_size=args.im_size, rfs=fas, trs=trs, te=1.75, device_idx=args.device_idx
@@ -243,14 +193,6 @@ def generate_data(args: Config) -> GeneratedData:
     ksp = ksp.to(device)
     dcf = ds.est_dcf(trj).to(device)
 
-    # TODO: Save data
-    # np.save(args.exp_dir / "trj.npy", trj.numpy())
-    # np.save(args.exp_dir / "dcf.npy", dcf.numpy())
-    # np.save(args.exp_dir / "ksp.npy", ksp.numpy())
-    # np.save(args.exp_dir / "mps.npy", mps.numpy())
-    # np.save(args.exp_dir / "imgs.npy", imgs.detach().cpu().numpy())
-    # ds.seq.save(args.exp_dir / "seq")
-
     data = GeneratedData(
         gt=gt,
         ksp=ksp,
@@ -264,7 +206,13 @@ def generate_data(args: Config) -> GeneratedData:
         voxel_labels=voxel_labels,
         masks=masks,
         brain_mask=brain_mask,
+        avg_pd=avg_pd,
     )
+
+    if args.save_generated_data:
+        logger.info(f'Saving generated data to: {args.exp_dir / "data"}')
+        with open(args.exp_dir / "data", "wb") as file:
+            pickle.dump(data, file)
 
     return data
 
@@ -277,7 +225,6 @@ def run_recon(
     noise = torch.randn_like(data.ksp) * args.noise_std
     noisy_ksp = data.ksp + noise
 
-    # TODO: there are other parameters that we can tune
     A = multi_subspace_linop(
         im_size=args.im_size,
         trj=data.trj,
@@ -285,17 +232,21 @@ def run_recon(
         phis=data.phis,
         masks=data.masks,
         dcf=data.dcf,
-        # use_toeplitz=True,
-        # grog_grid_oversamp=None,
+        use_toeplitz=args.recon_params.use_toeplitz,
+        grog_grid_oversamp=args.recon_params.grog_grid_oversamp,
+        coil_batch_size=args.recon_params.coil_batch_size,
+        sub_batch_size=args.recon_params.sub_batch_size,
+        seg_batch_size=args.recon_params.seg_batch_size,
     )
 
-    rcn = recon(0)
+    rcn = recon(args.device_idx)
+
     img_mr_recon = rcn.run_recon(
         A_linop=A,
         ksp=noisy_ksp,
         max_eigen=1.0,
         max_iter=args.recon_params.n_iters,
-        lamda_l2=0,
+        lamda_l2=args.recon_params.lambda_l2,
     )
     img_mr_recon = torch.from_numpy(img_mr_recon).to(noisy_ksp)
 
@@ -305,6 +256,7 @@ def run_recon(
         data.tissues,
         data.masks,
         brain_mask=data.brain_mask,
+        avg_pd=data.avg_pd,
     )
 
     return img_mr_recon, est_tissues_recon
@@ -313,10 +265,6 @@ def run_recon(
 def post_process(est_tissues, subspace_coeffs, gt_tissues, brain_mask, save_path):
     plot_recons([est_tissues], gt_tissues, ["MRFRF"], brain_mask, save_path)
     plot_coeffs([subspace_coeffs], ["MRFRF"], save_path)
-
-
-def load_clusters():
-    pass
 
 
 def get_modes(im_size, ty="flat"):
@@ -504,11 +452,18 @@ def dict_matching(signal, dcts, tissues, masks=None, brain_mask=None, avg_pd=Non
         ).to(est_tissues)
 
     if brain_mask is not None:
-        # Normalize PD
+        # Normalize PD so that the same average PD is maintained, otherwise, just scale so that the max is 1
         est_tissues[brain_mask == False, ...] = 0
         if avg_pd is not None:
-            scale = avg_pd / np.mean(est_tissues[brain_mask, 0])
-            est_tissues[brain_mask, 0] *= scale
+            scale = avg_pd / torch.mean(est_tissues[brain_mask][..., 0])
+            est_tissues[..., 0] = torch.where(
+                brain_mask, est_tissues[..., 0] * scale, est_tissues[..., 0]
+            )
+        else:
+            scale = est_tissues[brain_mask][..., 0].max()
+            est_tissues[..., 0] = torch.where(
+                brain_mask, est_tissues[..., 0] / scale, est_tissues[..., 0]
+            )
 
     return est_tissues
 
