@@ -671,7 +671,7 @@ class multi_subspace_linop(nn.Module):
             if i == 0:
                 alpha = linop.adjoint(ksp)
             else:
-                alpha += linop.forward(ksp)
+                alpha += linop.adjoint(ksp)
 
         return alpha
 

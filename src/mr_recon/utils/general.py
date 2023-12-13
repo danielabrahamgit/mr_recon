@@ -1,5 +1,10 @@
-from datetime import datetime, timedelta
+import random
+from datetime import datetime
 from pathlib import Path
+
+import numpy as np
+import torch
+
 
 def create_exp_dir(logs_dir: Path, exp_name: str):
     current_datetime = datetime.now()
@@ -8,3 +13,10 @@ def create_exp_dir(logs_dir: Path, exp_name: str):
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     return exp_dir
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)

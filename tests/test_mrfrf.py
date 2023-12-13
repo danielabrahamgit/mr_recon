@@ -1,9 +1,10 @@
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import pickle
+import pprint
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -26,25 +27,25 @@ from sklearn.cluster import KMeans
 
 from mr_recon.linop import multi_subspace_linop
 from mr_recon.recon import recon
-from mr_recon.utils.general import create_exp_dir
+from mr_recon.utils.general import create_exp_dir, seed_everything
 
 
 @dataclass
 class MRParams:
-    n_coils: int = 12
+    n_coils: int = 1
     R: int = 16
     dt: float = 4e-6
-    excitation_ty: str = "flat"
+    excitation_ty: str = "ring"
 
 
 @dataclass
 class ReconParams:
-    n_clusters: int = 1
-    n_fas_per_cluster: int = 1
+    n_clusters: int = 30
+    n_fas_per_cluster: int = 10
 
-    n_coeffs: int = 5
+    n_coeffs: int = 10
     n_iters: int = 10
-    use_toeplitz: bool = True
+    use_toeplitz: bool = False
     grog_grid_oversamp: Optional[int] = None
     coil_batch_size: int = 1
     sub_batch_size: int = 1
@@ -91,11 +92,16 @@ class Config:
 
 
 def main():
+    seed_everything(42)
+
     args = tyro.cli(Config)
     args.exp_dir = create_exp_dir(args.log_dir, args.exp_name)
     logger.add(args.exp_dir / "log-{time}.log")
 
+    cfg_str = pprint.pformat(args)
+
     logger.info(f"Experiment directory: {args.exp_dir}")
+    logger.info(f"Config:\n{cfg_str}")
 
     if args.generate_data:
         data = generate_data(args)
@@ -143,6 +149,7 @@ def generate_data(args: Config) -> GeneratedData:
 
     logger.info("Generating FA map")
     modes = get_modes(args.im_size, args.mr_params.excitation_ty).to(device)
+    plot_excitation_modes(modes, save_path=args.exp_dir / "excitation_modes.png")
     logger.info(f"Modes shape: {modes.shape}")
 
     # get the flip angle maps and cluster them
@@ -591,6 +598,41 @@ def plot_coeffs(image_list, titles, save_path):
                 plt.colorbar(im, cax=cax)
     plt.savefig(save_path / f"recon_coeffs", bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
+
+
+def plot_excitation_modes(modes, save_path=None):
+    """
+    Plots a list of 2D arrays in a single column with the title "Mode {i}" for each.
+    Optionally saves the figure to a specified path.
+
+    :param modes: list of 2D arrays to plot
+    :param save_path: (optional) path to save the figure
+    """
+    num_modes = len(modes)
+
+    modes = [mode.detach().cpu().numpy() for mode in modes]
+
+    fig, axs = plt.subplots(num_modes, 1, figsize=(6, num_modes * 3))
+
+    if num_modes == 1:
+        axs = [axs]
+
+    for i, mode in enumerate(modes):
+        ax = axs[i]
+        im = ax.imshow(mode, aspect="equal")
+        ax.title.set_text(f"Mode {i+1}")
+        fig.colorbar(im, ax=ax)
+        ax.axis("off")
+
+    plt.tight_layout()
+
+    # Save the figure if a save path is provided
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    else:
+        plt.show()
+
+    plt.close()
 
 
 if __name__ == "__main__":
