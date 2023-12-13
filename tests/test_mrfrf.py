@@ -5,7 +5,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
@@ -19,7 +19,7 @@ from loguru import logger
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mr_sim.data_sim import data_sim, mrf_sequence, quant_phantom
 from mr_sim.trj_lib import trj_lib
-from optimized_mrf.sequences import BareFISP
+from optimized_mrf.sequences import FISP, BareFISP
 from scipy.special import j1
 from sklearn.cluster import KMeans
 
@@ -31,7 +31,7 @@ from mr_recon.utils.general import create_exp_dir
 @dataclass
 class MRParams:
     n_coils: int = 12
-    R: int = 8
+    R: int = 16
     dt: float = 4e-6
     excitation_ty: str = "flat"
 
@@ -41,9 +41,9 @@ class ReconParams:
     n_clusters: int = 1
     n_fas_per_cluster: int = 1
 
-    n_coeffs: int = 7
+    n_coeffs: int = 5
 
-    n_iters: int = 10
+    n_iters: int = 20
 
 
 @dataclass
@@ -66,6 +66,7 @@ class GeneratedData:
 class Config:
     exp_name: str = "debug"
     log_dir: Path = Path("logs")
+    saved_data_dir: Optional[Path] = Path("./test_data")
 
     generate_data: bool = True
     generate_fa_map: bool = True
@@ -91,8 +92,72 @@ def main():
     if args.generate_data:
         data = generate_data(args)
     else:
-        # load saved data
-        pass
+        assert (
+            args.saved_data_dir is not None
+        ), "Wanted to load saved data, but no path was given"
+        logger.info(f"Loading data from: {args.saved_data_dir}")
+
+        ksp = torch.from_numpy(np.load(args.saved_data_dir / "ksp.npy")).to(
+            args.device_idx
+        )
+        trj = torch.from_numpy(np.load(args.saved_data_dir / "trj.npy")).to(
+            args.device_idx
+        )
+        mps = torch.from_numpy(np.load(args.saved_data_dir / "mps.npy")).to(
+            args.device_idx
+        )
+        phis = torch.from_numpy(np.load(args.saved_data_dir / "phi.npy")).to(
+            args.device_idx
+        )
+        phis = [phis[i].to(torch.complex64) for i in range(len(phis))]
+        dcts = torch.from_numpy(np.load(args.saved_data_dir / "dcts.npy")).to(
+            args.device_idx
+        )
+        dcts = [dcts[i].to(torch.complex64) for i in range(len(dcts))]
+        tissues = torch.from_numpy(np.load(args.saved_data_dir / "tissues.npy")).to(
+            args.device_idx
+        )
+        dcf = torch.from_numpy(np.load(args.saved_data_dir / "dcf.npy")).to(
+            args.device_idx
+        )
+        voxel_labels = torch.from_numpy(
+            np.load(args.saved_data_dir / "voxel_labels.npy")
+        ).to(args.device_idx)
+
+        data = quant_phantom()
+        t1 = torch.from_numpy(sp.resize(data["t1"][100], args.im_size)).to(
+            args.device_idx
+        )
+        t2 = torch.from_numpy(sp.resize(data["t2"][100], args.im_size)).to(
+            args.device_idx
+        )
+        pd = torch.from_numpy(sp.resize(data["pd"][100], args.im_size)).to(
+            args.device_idx
+        )
+        gt = torch.stack([pd, t1, t2], axis=-1).to(args.device_idx)
+        brain_mask = pd > 0.1
+
+        masks = torch.stack(
+            [voxel_labels == i for i in range(args.recon_params.n_clusters)]
+        ).to(args.device_idx)
+
+        # compress the dictionary
+        cmprsd_dcts = [dcts[i] @ phis[i].T for i in range(len(dcts))]
+
+        data = GeneratedData(
+            gt=gt,
+            ksp=ksp,
+            trj=trj,
+            mps=mps,
+            phis=phis,
+            dcts=dcts,
+            cmprsd_dcts=cmprsd_dcts,
+            tissues=tissues,
+            dcf=dcf,
+            voxel_labels=voxel_labels,
+            masks=masks,
+            brain_mask=brain_mask,
+        )
 
     if args.run_recon:
         recon_coeffs, est_tissues = run_recon(args, data)
@@ -119,11 +184,10 @@ def generate_data(args: Config) -> GeneratedData:
 
     # Load default sequence
     seq_data = mrf_sequence()
-    seq_data["TR_init"][0][-1] = 15.0
     trs = torch.from_numpy(seq_data["TR_init"][0].astype(np.float32)).to(device)
-    fas = torch.from_numpy(seq_data["FA_init"][0].astype(np.float32)).to(device)
-    # trs = trs[:100]
-    # fas = fas[:100]
+    fas = torch.deg2rad(
+        torch.from_numpy(seq_data["FA_init"][0].astype(np.float32)).to(device)
+    )
     logger.info(f"Sequence length: {len(fas)}")
 
     if args.generate_fa_map:
@@ -221,13 +285,17 @@ def run_recon(
         phis=data.phis,
         masks=data.masks,
         dcf=data.dcf,
+        # use_toeplitz=True,
         # grog_grid_oversamp=None,
     )
-    # TODO: make sure that we are compensating for DCF here
 
     rcn = recon(0)
     img_mr_recon = rcn.run_recon(
-        A_linop=A, ksp=noisy_ksp, max_eigen=1.0, max_iter=args.recon_params.n_iters, lamda_l2=0
+        A_linop=A,
+        ksp=noisy_ksp,
+        max_eigen=1.0,
+        max_iter=args.recon_params.n_iters,
+        lamda_l2=0,
     )
     img_mr_recon = torch.from_numpy(img_mr_recon).to(noisy_ksp)
 
