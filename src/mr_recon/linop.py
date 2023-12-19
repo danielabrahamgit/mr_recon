@@ -87,10 +87,6 @@ class subspace_linop(nn.Module):
         self.torch_dev = trj.device
         assert phi.device == self.torch_dev
 
-        # Default dcf
-        if dcf is None:
-            dcf = torch.ones(trj.shape[:-1]).to(self.torch_dev)
-
         # Make self.nufft
         device_idx = trj.get_device()
         if grog_grid_oversamp is not None:
@@ -99,6 +95,10 @@ class subspace_linop(nn.Module):
             # self.nufft = torchkb_nufft(im_size, device_idx)
             self.nufft = sigpy_nufft(im_size, device_idx)
         trj = self.nufft.rescale_trajectory(trj)
+
+        # Default dcf
+        if dcf is None:
+            dcf = torch.ones(trj.shape[:-1], dtype=torch.complex64).to(self.torch_dev)
         
         # Save
         self.trj = trj
@@ -115,7 +115,7 @@ class subspace_linop(nn.Module):
 
         # Toeplitz kernels
         if use_toeplitz:
-            raise NotImplementedError
+            
             if grog_grid_oversamp:
                 self.toep_kerns = self._compute_grog_toeplitz_kernels()
             else:
@@ -127,6 +127,49 @@ class subspace_linop(nn.Module):
                 with torch.cuda.device(self.torch_dev):
                     torch.cuda.empty_cache()
 
+    def update_trj(self, 
+                   trj: torch.Tensor,
+                   dcf: Optional[torch.Tensor] = None):
+        """
+        Updates trajectory.
+
+        Parameters:
+        -----------
+        trj : torch.tensor <float> | GPU
+            The k-space trajectory with shape (nro, npe, ntr, d). 
+                we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        dcf : torch.tensor <float> | GPU
+            the density comp. functon with shape (nro, ...)
+        
+        Saves/Updates:
+        --------------
+        self.trj, self.dcf
+        """
+
+        assert trj.device == self.trj.device
+        if dcf is not None:
+            assert trj.shape[:-1] == dcf.shape
+            assert trj.device == dcf.device
+        self.trj = self.nufft.rescale_trajectory(trj)
+
+        if dcf is None:
+            dcf = torch.ones(trj.shape[:-1], dtype=torch.complex64).to(self.torch_dev)
+        self.dcf = dcf
+
+        if self.use_toeplitz:
+            if self.grog_grid_oversamp:
+                self.toep_kerns = self._compute_grog_toeplitz_kernels()
+            else:
+                self.toep_kerns = self._compute_toeplitz_kernels()
+            
+            # Cleanup
+            gc.collect()
+            if 'cpu' not in str(self.torch_dev):
+                with torch.cuda.device(self.torch_dev):
+                    torch.cuda.empty_cache()
+
+
+
     def _compute_grog_toeplitz_kernels(self) -> torch.Tensor:
         """
         Computes toeplitz kernels for grog/cartesian subspace recon.
@@ -137,6 +180,9 @@ class subspace_linop(nn.Module):
             The subspace toeplitz kernels with shape (nsub, nsub, nx, ny, ...)
             No oversampling necessary!
         """
+
+        if self.field_obj is not None:
+            raise NotImplementedError
 
         # Useful constants
         nsub = self.phi.shape[0]
@@ -181,6 +227,9 @@ class subspace_linop(nn.Module):
         Ts : torch.tensor <complex>
             The subspace toeplitz kernels with shape (nsub, nsub, os_factor * nx, os_factor * ny, ...)
         """
+
+        if self.field_obj is not None:
+            raise NotImplementedError
         
         # Useful constants
         nsub = self.phi.shape[0]
@@ -264,7 +313,7 @@ class subspace_linop(nn.Module):
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
         nseg = self.nseg
-        
+
         # Result array
         ksp = torch.zeros((nc, *self.trj.shape[:-1]), dtype=torch.complex64, device=self.torch_dev)
 

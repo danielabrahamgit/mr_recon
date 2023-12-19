@@ -4,6 +4,9 @@ import sigpy as sp
 import numpy as np
 import torch.fft as fft
 
+from typing import Optional
+from scipy.signal import get_window
+
 def normalize(shifted, target, ofs=True, mag=False, return_params=False):
     if mag:
         col1 = np.abs(shifted).flatten()
@@ -80,3 +83,32 @@ def sp_ifft(x, dim=None, oshape=None):
     x = fft.ifftn(x, s=oshape, dim=dim, norm='ortho')
     x = fft.fftshift(x, dim=dim)
     return x
+
+def apply_window(ksp_rect: np.ndarray, 
+                 window_func: Optional[str] = 'hamming') -> np.ndarray:
+    """
+    Applies windowing function to a rect-linear k-space signal
+
+    Parameters:
+    -----------
+    ksp_rect : np.ndarray <complex64>
+        k-space rect region with shape (B, N_{ndim-1}, ..., N_1, N_0)
+        B is batch dim
+    window_func : str
+        windowing function from scipy.signal.windows
+    
+    Returns:
+    --------
+    ksp_rect_win : np.ndarray <complex64>
+        windowed k-space with same shape as ksp_cal
+    
+    """
+    dev = sp.get_device(ksp_rect)
+    with dev:
+        win = sp.to_device(np.ones(ksp_rect.shape[1:]), dev)
+        ksp_rect_win = ksp_rect.copy()
+        for i in range(win.ndim):
+            tup = i * (None,) + (slice(None),) + (None,) * (win.ndim - 1 - i)
+            win *= sp.to_device(get_window(window_func, ksp_rect.shape[1]), dev)[tup]
+        ksp_rect_win *= win[None,]
+    return ksp_rect_win

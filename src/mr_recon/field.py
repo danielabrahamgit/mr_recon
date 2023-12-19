@@ -4,8 +4,14 @@ import sigpy as sp
 from typing import Optional, Union
 from einops import rearrange, einsum
 from fast_pytorch_kmeans import KMeans
-from mr_recon.algs import conjugate_gradient
-from mr_recon.utils.func import batch_iterator, torch_to_np, np_to_torch
+from mr_recon.utils.func import (
+    batch_iterator, 
+    torch_to_np, 
+    np_to_torch,
+    sp_fft,
+    sp_ifft,
+    apply_window
+)
         
 def alpha_phi_from_b0(b0_map: torch.Tensor,
                       trj_shape: tuple,
@@ -85,8 +91,50 @@ class field_handler:
         self.betas = self._time_segments(nseg)
         self.interp_coeffs = self._calc_temporal_interpolators(self.betas, mode)
 
+    def update_phis_size(self,
+                         new_size: tuple):
+        """
+        Updates the spatial size of phis using fourier method
+
+        Parameters:
+        -----------
+        new_size : tuple
+            new size to resample to, has shape (M_{ndim-1}, ..., M_0)
+        
+        Saves/updates:
+        --------------
+        self.phis
+        """
+
+        # Rescale between -pi and pi
+        ndim = self.phis.ndim - 1
+        nbasis = self.phis.shape[0]
+        mxs = torch.max(torch.abs(self.phis).reshape((nbasis, -1)), dim=-1)[0]
+        tup = (slice(None),) + (None,) * ndim
+        phis_rs = torch.pi * self.phis / mxs[tup]
+
+        # FFT
+        PHI = sp_fft(torch.exp(1j * phis_rs), dim=tuple(range(-ndim, 0)))
+
+        # Zero pad/chop
+        PHI_sp = torch_to_np(PHI)
+        dev = sp.get_device(PHI_sp)
+        with dev:
+            oshape = (phis_rs.shape[0], *new_size)
+            PHI_rs = sp.resize(PHI_sp, oshape)
+
+        # Windowing
+        PHI_rs = apply_window(PHI_rs, 'hamming')
+        PHI_rs = np_to_torch(PHI_rs)
+
+        # Recover phis
+        phis_rs = sp_ifft(PHI_rs, dim=tuple(range(-ndim, 0)))
+        phis_new = mxs[tup] * torch.angle(phis_rs) / torch.pi
+
+        self.phis = phis_new
+
     def get_phase_maps(self,
-                       segs: Optional[torch.Tensor] = None):
+                       segs: Optional[torch.Tensor] = slice(None)):
         """
         Gets phase maps for given segments
 
@@ -101,11 +149,10 @@ class field_handler:
         phase_maps : torch.tensor <complex64>
             phase maps with shape (len(segs), N_{ndim-1}, ..., N_0)
         """
-        assert segs.device == self.torch_dev, 'segs must be on same device as phis'
         phase = einsum(self.phis, self.betas[segs], 'nbasis ..., nseg nbasis -> nseg ...')
         phase_maps = torch.exp(-2j * torch.pi * phase)
 
-        return phase_maps
+        return phase_maps.type(torch.complex64)
 
     def get_interp_ceoffs(self,
                           segs: Optional[torch.Tensor] = None):
@@ -120,14 +167,15 @@ class field_handler:
         
         Returns:
         --------
-        phase_maps : torch.tensor <complex64>
-            phase maps with shape (*trj_shape, len(segs))
+        interp_coeffs : torch.tensor <float32>
+            interpolation coefficients 'h_l(t)' with shape (*trj_shape, nseg)
         """
         assert segs.device == self.torch_dev, 'segs must be on same device as phis'
         return self.interp_coeffs[..., segs]
 
     def _time_segments(self,
-                       nseg: int) -> torch.Tensor:
+                       nseg: int,
+                       method: Optional['str'] = 'cluster') -> torch.Tensor:
         """
         Time segmentation takes the form
 
@@ -143,22 +191,46 @@ class field_handler:
         -----------
         nseg : int
             number of segments
+        method : str
+            selects the time segmentation method from:
+            'cluster' - uses k-means to optimally find time-segments
+            'uniform' - uniformly spaced time segments
         
         Returns:
         --------
-        betas : torch.Tensor
+        betas : torch.Tensor <float32>
             basis coefficients with shape (nseg, nbasis)
         """
 
-        # Cluster the alpha coefficients
+        # Flatten alpha coeffs
         alphas_flt = rearrange(self.alphas, '... nbasis -> (...) nbasis')
-        alphas_flt = alphas_flt.to(self.torch_dev)
-        kmeans = KMeans(n_clusters=nseg,
-                        mode='euclidean')
-        idxs = kmeans.fit_predict(alphas_flt)
-        betas = kmeans.centroids
-        
-        return betas
+
+        # Cluster the alpha coefficients
+        if method == 'cluster':
+            if (self.torch_dev.index == -1) or (self.torch_dev.index is None):
+                kmeans = KMeans(n_clusters=nseg,
+                                    mode='euclidean')
+                idxs = kmeans.fit_predict(alphas_flt)
+            else:
+                with torch.cuda.device(self.torch_dev):
+                    kmeans = KMeans(n_clusters=nseg,
+                                    mode='euclidean')
+                    idxs = kmeans.fit_predict(alphas_flt)
+            self.idxs = idxs.reshape(self.alphas.shape[:-1])
+            betas = kmeans.centroids
+
+        # Uniformly spaced time segments
+        else:
+            # TODO FIXME For higher dims, only works for nbasis = 1
+            nbasis = alphas_flt.shape[-1]
+            betas = torch.zeros((nseg, nbasis), dtype=torch.float32, device=alphas_flt.device)
+            for i in range(nbasis):
+                lin = torch.linspace(start=alphas_flt[:, i].min(), 
+                                     end=alphas_flt[:, i].max(), 
+                                     steps=nseg + 1, 
+                                     device=alphas_flt.device)
+                betas[:, i] = (lin[:-1] + lin[1:]) / 2
+        return betas.type(torch.float32)
     
     def _calc_temporal_interpolators(self,
                                      betas: torch.Tensor,
@@ -207,17 +279,18 @@ class field_handler:
             # TODO OptimizeME with quantization/histograms
 
             # Prep A, B matrices
-            alphas_flt = rearrange(self.alphas, '... nbasis -> (...) nbasis')
-            phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis')
+            alphas_flt = rearrange(self.alphas, '... nbasis -> (...) nbasis').type(torch.float32)
+            phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis').type(torch.float32)
+            betas = self.betas.type(torch.float32)
             AHA = torch.zeros((nseg, nseg), 
                               dtype=torch.complex64, device=self.torch_dev)
             AHb = torch.zeros((nseg, alphas_flt.shape[0]), 
                               dtype=torch.complex64, device=self.torch_dev)
-            batch_size = 2 ** 12
+            batch_size = 2 ** 8
             for n1, n2 in batch_iterator(phis_flt.shape[0], batch_size):
 
                 # Accumulate AHA
-                A_batch = einsum(phis_flt[n1:n2, :], self.betas, 
+                A_batch = einsum(phis_flt[n1:n2, :], betas, 
                                  'B nbasis, nseg nbasis -> B nseg')
                 A_batch = torch.exp(-2j * torch.pi * A_batch)
                 AHA += A_batch.H @ A_batch
@@ -258,5 +331,5 @@ class field_handler:
             for i in range(nseg):
                 interp_coeffs[..., i] = 1.0 * (inds == i)
 
-        return interp_coeffs
+        return interp_coeffs.type(torch.complex64)
   
