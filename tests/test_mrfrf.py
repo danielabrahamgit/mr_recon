@@ -1,7 +1,7 @@
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 import pickle
 import pprint
@@ -17,41 +17,55 @@ import sigpy.mri as mr
 import torch
 import tyro
 from einops import rearrange
+from fast_pytorch_kmeans import KMeans
 from loguru import logger
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mr_sim.data_sim import data_sim, mrf_sequence, quant_phantom
 from mr_sim.trj_lib import trj_lib
 from optimized_mrf.sequences import FISP, BareFISP
+from optimized_mrf.sequences.defaults import fisp_fa, fisp_tr
+from optimized_mrf.tissues import get_typical_tissues
 from scipy.special import j1
-from sklearn.cluster import KMeans
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torchkbnufft import KbNufft
+from tqdm import tqdm
 
 from mr_recon.linop import multi_subspace_linop
+from mr_recon.nufft import gridded_nufft, sigpy_nufft, torchkb_nufft
 from mr_recon.recon import recon
 from mr_recon.utils.general import create_exp_dir, seed_everything
 
 
 @dataclass
 class MRParams:
-    n_coils: int = 1
-    R: int = 16
+    n_coils: int = 12
+    n_interleaves: int = 48
+    R: int = 48
     dt: float = 4e-6
-    excitation_ty: str = "ring"
+    excitation_ty: str = "shim-ring"
+    smooth_factor: Optional[int] = 20
 
 
 @dataclass
 class ReconParams:
-    n_clusters: int = 30
+    n_clusters: int = 10
     n_fas_per_cluster: int = 10
 
-    n_coeffs: int = 10
-    n_iters: int = 10
+    n_coeffs: int = 6
+    n_iters: int = 30
     use_toeplitz: bool = False
-    grog_grid_oversamp: Optional[int] = None
+    grog_grid_oversamp: Optional[float] = 1.0
     coil_batch_size: int = 1
     sub_batch_size: int = 1
     seg_batch_size: int = 1
 
     lambda_l2: float = 0.0
+
+
+@dataclass
+class ReconData:
+    tissues: torch.Tensor
+    coeffs: torch.Tensor
 
 
 @dataclass
@@ -61,13 +75,14 @@ class GeneratedData:
     trj: torch.Tensor
     mps: torch.Tensor
     phis: List[torch.Tensor]
-    dcts: List[torch.Tensor]
+    # dcts: List[torch.Tensor]
     cmprsd_dcts: List[torch.Tensor]
     tissues: torch.Tensor
     dcf: torch.Tensor
     voxel_labels: torch.Tensor
     masks: torch.Tensor
     brain_mask: torch.Tensor
+    fa_map: torch.Tensor
     avg_pd: Optional[float] = None
 
 
@@ -75,13 +90,17 @@ class GeneratedData:
 class Config:
     exp_name: str = "debug"
     log_dir: Path = Path("logs")
-    saved_data_dir: Optional[Path] = Path("logs/debug/2023-12-13_11-00")
+    saved_data_dir: Optional[Path] = Path("logs/debug/2023-12-15_14-22")
 
     generate_data: bool = True
     save_generated_data: bool = True
 
-    run_recon: bool = True
-    noise_std: float = 1e-3
+    run_classic_recon: bool = True
+    save_classic_recon: bool = False
+    run_stochastic_recon: bool = False
+    init_stochastic_w_classic: bool = False
+
+    noise_std: float = 1e-2
 
     device_idx = 0
     im_size = (220, 220)
@@ -95,7 +114,8 @@ def main():
     seed_everything(42)
 
     args = tyro.cli(Config)
-    args.exp_dir = create_exp_dir(args.log_dir, args.exp_name)
+    exp_name = f"{args.exp_name}-excitation_type={args.mr_params.excitation_ty}-n_interleaves={args.mr_params.n_interleaves}-R={args.mr_params.R}-n_coils={args.mr_params.n_coils}"
+    args.exp_dir = create_exp_dir(args.log_dir, exp_name)
     logger.add(args.exp_dir / "log-{time}.log")
 
     cfg_str = pprint.pformat(args)
@@ -114,9 +134,27 @@ def main():
         with open(args.saved_data_dir / "data", "rb") as file:
             data = pickle.load(file)
 
-    if args.run_recon:
+    recon_data = None
+    if args.run_classic_recon:
         recon_coeffs, est_tissues = run_recon(args, data)
         post_process(est_tissues, recon_coeffs, data.gt, data.brain_mask, args.exp_dir)
+        recon_data = ReconData(est_tissues, recon_coeffs)
+        if args.save_classic_recon:
+            logger.info(f"Saving classic recon to: {args.exp_dir / 'classic_recon'}")
+            with open(args.exp_dir / "classic_recon", "wb") as file:
+                pickle.dump(recon_data, file)
+
+    if args.run_stochastic_recon:
+        if args.init_stochastic_w_classic and recon_data is None:
+            assert (
+                args.saved_data_dir is not None
+            ), "Wanted to load saved data, but no path was given"
+
+            logger.info(f"Loading data from: {args.saved_data_dir}")
+            with open(args.saved_data_dir / "classic_recon", "rb") as file:
+                recon_data = pickle.load(file)
+
+        stochastic_recon(data, args, recon_data)
 
     logger.info(
         f"Finished running experiments. See results and logs in: {args.exp_dir}"
@@ -138,13 +176,8 @@ def generate_data(args: Config) -> GeneratedData:
     avg_pd = torch.mean(pd[brain_mask])
     logger.info(f"Image size: {pd.shape}")
 
-    # Load default sequence
-    seq_data = mrf_sequence()
-    seq_data["TR_init"][0][-1] = 15.0
-    trs = torch.from_numpy(seq_data["TR_init"][0].astype(np.float32)).to(device)
-    fas = torch.deg2rad(
-        torch.from_numpy(seq_data["FA_init"][0].astype(np.float32)).to(device)
-    )
+    trs = fisp_tr.clone().to(device)
+    fas = fisp_fa.clone().to(device)
     logger.info(f"Sequence length: {len(fas)}")
 
     logger.info("Generating FA map")
@@ -154,21 +187,20 @@ def generate_data(args: Config) -> GeneratedData:
 
     # get the flip angle maps and cluster them
     fa_map, clusters, voxel_labels = generate_fa_map(
-        fas, modes, args.recon_params.n_clusters
+        fas, modes, args.recon_params.n_clusters, args.mr_params.smooth_factor
     )
+    plot_clusters(voxel_labels, args.exp_dir)
 
     # calculate the subspace per cluster
-    phis, dcts, tissues = get_subspaces(
+    phis, cmprsd_dcts, tissues = get_subspaces(
         voxel_labels,
         fa_map,
         clusters,
         args.recon_params.n_fas_per_cluster,
         sing_val_thresh=0.95,
         n_coeffs=args.recon_params.n_coeffs,
+        args=args,
     )
-
-    # compress the dictionary
-    cmprsd_dcts = [dcts[i] @ phis[i].T for i in range(len(dcts))]
 
     masks = torch.stack(
         [voxel_labels == i for i in range(args.recon_params.n_clusters)]
@@ -183,7 +215,14 @@ def generate_data(args: Config) -> GeneratedData:
     mps = torch.from_numpy(mps).to(device)
 
     trj_obj = trj_lib(args.im_size)
-    trj = trj_obj.gen_MRF_trj(ntr=len(fas), n_shots=16, R=args.mr_params.R)
+    trj = trj_obj.gen_MRF_trj(
+        ntr=len(fas), n_shots=args.mr_params.n_interleaves, R=args.mr_params.R
+    )
+    if args.recon_params.grog_grid_oversamp is not None:
+        trj = (
+            np.round(trj * args.recon_params.grog_grid_oversamp)
+            / args.recon_params.grog_grid_oversamp
+        )
     trj = torch.from_numpy(trj).to(device)
 
     ksp, _, _, _ = ds.sim_ksp(
@@ -195,6 +234,7 @@ def generate_data(args: Config) -> GeneratedData:
         coil_batch_size=args.mr_params.n_coils,
         seg_batch_size=1,
         fa_map=fa_map,
+        grog_grid_oversamp=args.recon_params.grog_grid_oversamp,
     )
 
     ksp = ksp.to(device)
@@ -206,7 +246,7 @@ def generate_data(args: Config) -> GeneratedData:
         trj=trj,
         mps=mps,
         phis=phis,
-        dcts=dcts,
+        # dcts=dcts,
         cmprsd_dcts=cmprsd_dcts,
         tissues=tissues,
         dcf=dcf,
@@ -214,6 +254,7 @@ def generate_data(args: Config) -> GeneratedData:
         masks=masks,
         brain_mask=brain_mask,
         avg_pd=avg_pd,
+        fa_map=fa_map,
     )
 
     if args.save_generated_data:
@@ -277,6 +318,9 @@ def post_process(est_tissues, subspace_coeffs, gt_tissues, brain_mask, save_path
 def get_modes(im_size, ty="flat"):
     if ty == "ring":
         return get_ring_modes(im_size)
+    if ty == "shim-ring":
+        assert im_size == (220, 220)
+        return get_shim_modes()
     elif ty == "flat":
         return torch.ones(1, *im_size).type(torch.float32)
     else:
@@ -289,6 +333,17 @@ def jinc(x):
         result = j1(np.pi * x) / (np.pi * x)
         result[x == 0] = 0.5  # handle the singularity
     return result
+
+
+def get_shim_modes():
+    mode_1 = np.load("./download/shim_map/mode_0.npy")
+    mode_2 = np.load("./download/shim_map/mode_1.npy")
+    mode_3 = np.load("./download/shim_map/mode_2.npy")
+    modes = np.concatenate(
+        (mode_1[None, ...], mode_2[None, ...], mode_3[None, ...]), axis=0
+    )
+
+    return torch.from_numpy(modes).type(torch.float32)
 
 
 def get_ring_modes(im_size, scale: float = 1.3):
@@ -313,7 +368,13 @@ def get_ring_modes(im_size, scale: float = 1.3):
 
 
 def get_subspaces(
-    labeled_voxels, fa_map, clusters, n_fas=1, sing_val_thresh=0.95, n_coeffs=10
+    labeled_voxels,
+    fa_map,
+    clusters,
+    n_fas=1,
+    sing_val_thresh=0.95,
+    n_coeffs=10,
+    args=None,
 ):
     logger.info(
         f"Finding subspaces for each cluster. Number of coefficients per cluster: {n_coeffs}, "
@@ -321,41 +382,28 @@ def get_subspaces(
     )
 
     # Estimate subspace from range of t1/t2 from xiaozhi's paper
-    t1_vals = np.arange(20, 3000, 20)
-    t1_vals = np.append(t1_vals, np.arange(3200, 5000, 200))
-    t2_vals = np.arange(10, 200, 2)
-    t2_vals = np.append(t2_vals, np.arange(220, 1000, 20))
-    t2_vals = np.append(t2_vals, np.arange(1050, 2000, 50))
-    t2_vals = np.append(t2_vals, np.arange(2100, 4000, 100))
-    t1_vals, t2_vals = np.meshgrid(t1_vals, t2_vals, indexing="ij")
-    t1_vals, t2_vals = t1_vals.flatten(), t2_vals.flatten()
-    pd_vals = np.ones_like(t1_vals)
-    nom_tissues = (
-        torch.tensor(np.array([pd_vals, t1_vals, t2_vals]), dtype=torch.float32)
-        .T.unsqueeze(-2)
-        .to(fa_map)
-    )
+    nom_tissues = get_typical_tissues().to(fa_map.device)
 
     seq = BareFISP().to("cuda")
 
     phis = []
-    dcts = []
+    cmprsd_dcts = []
+
+    # per fa train we take from the cluster, we build a full dictionary
+    tissues = nom_tissues.unsqueeze(1).expand(-1, n_fas, -1, -1)
+
+    if args is not None:
+        clusters_dir = args.exp_dir / f"clusters"
+        os.makedirs(clusters_dir, exist_ok=True)
 
     # construct a subspaces for each cluster
     for i, cluster in enumerate(clusters):
         # get the voxels in the cluster
         voxels = labeled_voxels == i
         clustered_fa = fa_map[voxels]
-        # per fa train we take from the cluster, we build a full dictionary
-        tissues = nom_tissues.unsqueeze(1).expand(-1, n_fas, -1, -1)
 
         if n_fas > 1:
-            # TODO: make that pick smarter
-            idx = np.random.choice(len(clustered_fa), n_fas - 1, replace=False)
-            fas = clustered_fa[idx]
-            # those are the fa trains we will use for computing the dictionary and subspace
-            fas = torch.concatenate((fas, cluster[None, ...]), axis=0)
-            # assign each tissues with a fa (each tissue will have n_fas different fas)
+            fas = pick_fas(clustered_fa, cluster, n_fas)
             fas = fas[None, ...] * torch.ones((tissues.shape[0], 1, 1)).to(fas)
         else:
             fas = cluster[None, ...]
@@ -364,8 +412,17 @@ def get_subspaces(
         # This simulates the different tissues with the different fas and generates a big dictionary
         dct_torch = seq(tissues, fa_map=fas, batch_size=None)
         dct_torch = dct_torch.squeeze(-2)
+
+        if args is not None:
+            cluster_dir = clusters_dir / f"cluster_{i}"
+            os.makedirs(cluster_dir, exist_ok=True)
+            wm_sigs = dct_torch[3720, :, ...]
+            gm_sigs = dct_torch[7234, :, ...]
+            plot_signals(wm_sigs, cluster_dir, f"cluster_{i}-wm")
+            plot_signals(gm_sigs, cluster_dir, f"cluster_{i}-gm")
+            plot_region(voxels, fas[0], cluster_dir, f"cluster_{i}")
+
         dct_torch = rearrange(dct_torch, "n c j -> (n c) j")
-        dcts.append(dct_torch.type(torch.complex64))
 
         # normalize the dictionary before SVD
         norms = torch.linalg.norm(dct_torch, ord=2, axis=-1, keepdims=True)
@@ -374,18 +431,31 @@ def get_subspaces(
         cmsm = torch.cumsum(s, dim=0)
         n_th = int(torch.argwhere(cmsm > sing_val_thresh * cmsm[-1]).flatten()[0])
         phis.append(vh[:n_coeffs, :].conj().type(torch.complex64))
+        cmprsd_dcts.append(dct_torch.type(torch.complex64) @ phis[-1].T)
         logger.info(
             f"Dictionary {i}: To get {sing_val_thresh} of the signal energy we need to use: {n_th} coeffs. "
             f"We compressed to {n_coeffs} coefficients"
         )
 
-    # keep the same number of subspaces for all clusters
-    # phis = [p[:n_coeffs, ...] for p in phis]
-
-    return phis, dcts, rearrange(tissues, "n c ... -> (n c) ...")
+    return phis, cmprsd_dcts, rearrange(tissues, "n c ... -> (n c) ...")
 
 
-def generate_fa_map(fa, modes, n_clusters):
+def pick_fas(fas, cluster, n_fas):
+    cluster_fa = torch.mean(fas, dim=0)
+    # make sure fas correspond to the cluster
+    torch.testing.assert_close(cluster_fa, cluster)
+
+    if fas.max() == 0:
+        picked_fas = torch.zeros(n_fas, fas.shape[-1], device=fas.device)
+    else:
+        kmeans = KMeans(n_clusters=n_fas, init_method="kmeans++")
+        _ = kmeans.fit_predict(fas)
+        picked_fas = kmeans.centroids.to(fas)
+
+    return picked_fas
+
+
+def generate_fa_map(fa, modes, n_clusters, smooth_factor: Optional[int] = None):
     """
     Generate FA map, clusters, and voxel labels.
 
@@ -393,6 +463,7 @@ def generate_fa_map(fa, modes, n_clusters):
         fa (list or numpy.ndarray): List or array of FA values.
         modes (torch.Tensor): Tensor of shape (n_modes, h, w) representing the modes.
         n_clusters (int): Number of clusters for FA clustering.
+        smooth_factor (int, optional): Interpolate modes for this number of TRs for smoother signal evolution.
 
     Returns:
         tuple: A tuple containing the following:
@@ -401,26 +472,42 @@ def generate_fa_map(fa, modes, n_clusters):
             - voxels_labels (torch.Tensor): Tensor of shape (h, w) representing the voxel labels.
     """
 
-    assert modes.min() > 0
+    assert modes.min() >= 0
+    # assert len(modes.shape) == 4, "Modes must be a 4D tensor (n_modes, c, h, w)"
 
     n_modes, h, w = modes.shape
 
     logger.info(f"Creating alternating excitation pattern with {n_modes} modes")
 
+    if smooth_factor is not None:
+        smoothed_modes = torch.zeros(n_modes * smooth_factor, h, w).to(modes)
+        interpolation_coeff = torch.linspace(1, 0, smooth_factor)[:, None, None].to(
+            modes
+        )
+        for i in range(n_modes):
+            smoothed_modes[i * smooth_factor : (i + 1) * smooth_factor, ...] = (
+                interpolation_coeff * modes[i, ...]
+                + (1 - interpolation_coeff) * modes[(i + 1) % n_modes, ...]
+            )
+
+            torch.testing.assert_close(modes[i], smoothed_modes[i * smooth_factor])
+
+    else:
+        smoothed_modes = modes
+
     # explicit FA map -- FA per voxel
-    fa_map = torch.zeros(modes.shape[1:] + (len(fa),))
-    modes = torch.tile(modes, [int(np.ceil(len(fa) / n_modes)), 1, 1])
+    smoothed_n_modes, _, _ = smoothed_modes.shape
+    fa_map = torch.zeros(smoothed_modes.shape[1:] + (len(fa),))
+    modes = torch.tile(smoothed_modes, [int(np.ceil(len(fa) / smoothed_n_modes)), 1, 1])
     modes = rearrange(modes, "n h w -> h w n")
     fa_map = modes[..., : len(fa)] * fa
 
     logger.info(f"Clustering the different FAs into {n_clusters} clusters")
-    kmeans = KMeans(n_clusters=n_clusters)
-    kmeans.fit(rearrange(fa_map, "h w n -> (h w) n").cpu().numpy())
-
-    voxels_labels = torch.from_numpy(
-        rearrange(kmeans.labels_, "(h w) -> h w", h=h, w=w)
-    ).to(fa)
-    clusters = torch.from_numpy(kmeans.cluster_centers_).to(fa)
+    # Pytorch version
+    kmeans = KMeans(n_clusters=n_clusters, init_method="kmeans++")
+    voxels_labels = kmeans.fit_predict(rearrange(fa_map, "h w n -> (h w) n"))
+    voxels_labels = rearrange(voxels_labels, "(h w) -> h w", h=h, w=w).to(fa)
+    clusters = kmeans.centroids.to(fa)
 
     return fa_map, clusters, voxels_labels
 
@@ -600,6 +687,40 @@ def plot_coeffs(image_list, titles, save_path):
     plt.close(fig)
 
 
+def plot_clusters(voxel_labels, save_path):
+    voxel_labels = voxel_labels.detach().cpu().numpy()
+    plt.imshow(voxel_labels)
+    plt.colorbar()
+    plt.axis("off")
+    plt.savefig(save_path / "voxel_labels.png")
+    plt.close()
+
+
+def plot_signals(signals, save_path, name):
+    signals = signals.detach().cpu().numpy()
+    plt.figure()
+    for i, signal in enumerate(signals):
+        plt.plot(signal)
+    plt.savefig(save_path / f"{name}-signals.png")
+    plt.close()
+
+
+def plot_region(region, fas, save_path, name):
+    region = region.detach().cpu().numpy()
+    plt.figure()
+    plt.imshow(1 * region)
+    plt.axis("off")
+    plt.savefig(save_path / f"{name}-region.png")
+    plt.close()
+
+    fas = fas.detach().cpu().numpy()
+    plt.figure()
+    for fa in fas:
+        plt.plot(np.rad2deg(fa))
+    plt.savefig(save_path / f"{name}-fas.png")
+    plt.close()
+
+
 def plot_excitation_modes(modes, save_path=None):
     """
     Plots a list of 2D arrays in a single column with the title "Mode {i}" for each.
@@ -633,6 +754,134 @@ def plot_excitation_modes(modes, save_path=None):
         plt.show()
 
     plt.close()
+
+
+def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
+    device = args.device_idx
+
+    seq = BareFISP().to(device)
+    mps_torch = data.mps.to(device)
+
+    if args.recon_params.grog_grid_oversamp is not None:
+        nufft = gridded_nufft(
+            args.im_size, device, grid_oversamp=args.recon_params.grog_grid_oversamp
+        )
+    else:
+        nufft = torchkb_nufft(args.im_size, device)
+
+    trj = nufft.rescale_trajectory(data.trj.to(device))
+
+    sqrt_dcf = torch.sqrt(data.dcf.to(device))
+    data.ksp = data.ksp * sqrt_dcf[None, ...]
+
+    def A(x):
+        img_coil = x[:, None, ...] * mps_torch[None, ...]  # T nc 220 220
+        trj_rs = rearrange(trj, "nro npe ntr d -> ntr nro npe d")
+        ksp = nufft(img_coil, trj_rs)
+        ksp_rs = rearrange(ksp, "ntr nc nro npe -> nc nro npe ntr")
+        return ksp_rs * sqrt_dcf[None, ...]
+
+    def AH(y):
+        # y - nc nro npe ntr
+        y_dcf = y * sqrt_dcf[None, ...]
+        y_rs = rearrange(y_dcf, "nc nro npe ntr -> ntr nc nro npe")
+        trj_rs = rearrange(trj, "nro npe ntr d -> ntr nro npe d")
+        img_coil = nufft.adjoint(y_rs, trj_rs)  # T nc 220 220
+        img = torch.sum(img_coil * mps_torch[None, ...].conj(), dim=1)
+        return img
+
+    if True:
+        # Make sure A is correct
+        seq = BareFISP().to(device)
+        ims_gt = rearrange(
+            seq(
+                data.gt[..., None, :].type(torch.float32), fa_map=data.fa_map
+            ).squeeze(),
+            "h w ntr -> ntr h w",
+        )
+        ksp_gt = A(ims_gt)
+        err = torch.sum(torch.abs(ksp_gt - data.ksp))
+        logger.debug(f"Error in A: {err}")
+
+    # Randomly intialize param maps
+    im_size = data.mps.shape[1:]
+    mask = (data.gt[..., 0] > 0) * 1
+    if recon_data is None:
+        init_params = torch.ones((*im_size, 1, 3)).type(torch.float32).to(data.gt)
+        init_params[..., 0, 0] = torch.maximum(
+            data.gt[..., 0]
+            + 0.1 * torch.randn_like(init_params[..., 0, 0]).to(data.gt),
+            torch.tensor(0),
+        )
+        init_params[..., 0, 1] = torch.maximum(
+            data.gt[..., 1]
+            + 100 * torch.randn_like(init_params[..., 0, 1]).to(data.gt),
+            torch.tensor(0),
+        )
+        init_params[..., 0, 2] = torch.maximum(
+            data.gt[..., 2] + 30 * torch.randn_like(init_params[..., 0, 2]).to(data.gt),
+            torch.tensor(0),
+        )
+
+        params = init_params.to(device).type(torch.float32).clone()
+    else:
+        params = recon_data.tissues.to(device).clone()
+    params.requires_grad = True
+
+    def calc_mape(params, gt):
+        mape = torch.abs(params.squeeze() - gt) / (gt + 1e-8)
+        mape = 100 * torch.mean(mape[mask == 1], dim=0)
+        return mape
+
+    initial_mape = calc_mape(params.detach(), data.gt)
+    logger.info(f"initial MAPE: {initial_mape}")
+
+    # Gradient descent
+    nsteps = 10000
+    optim = torch.optim.Adam([params], lr=1e-2)
+    scheduler = ReduceLROnPlateau(
+        optim, mode="min", patience=50, factor=0.2, verbose=True, min_lr=1e-4
+    )
+    loss_func = torch.nn.MSELoss(reduction="sum")
+    losses = []
+
+    for i in tqdm(range(nsteps)):
+        ims = rearrange(seq(params, data.fa_map).squeeze(), "h w t -> t h w")
+        ksp_est = A(ims)
+
+        loss = loss_func(data.ksp.real, ksp_est.real) + loss_func(
+            data.ksp.imag, ksp_est.imag
+        )
+        # loss += 1e-6 * torch.sum(torch.abs(params) ** 2)
+        loss += 1e-7 * torch.sum(torch.abs(ims) ** 2)
+
+        loss.backward()
+        optim.step()
+        optim.zero_grad()
+        losses.append(loss.detach().cpu())
+        scheduler.step(loss)
+
+        if i % 10 == 0:
+            logger.info(loss)
+            mape = calc_mape(params.detach(), data.gt)
+            print(f"MPAE at {i}: {mape}")
+
+    plt.imshow(params[:, :, 0, 0].detach().cpu())
+    plt.colorbar()
+    plt.savefig(args.exp_dir / "amps.png")
+    plt.close()
+    plt.imshow(params[:, :, 0, 1].detach().cpu())
+    plt.colorbar()
+    plt.savefig(args.exp_dir / "t1.png")
+    plt.close()
+    plt.imshow(params[:, :, 0, 2].detach().cpu())
+    plt.colorbar()
+    plt.savefig(args.exp_dir / "t2.png")
+    plt.close()
+    plt.plot(losses)
+    plt.savefig(args.exp_dir / "loss.png")
+    plt.close()
+    quit()
 
 
 if __name__ == "__main__":

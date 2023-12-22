@@ -1,9 +1,9 @@
 [submodule "submodules/mr_sim"]
 	path = submodules/mr_sim
-	url = https://github.com/danielabrahamgit/mr_sim.git
+	url = git@github.com:danielabrahamgit/mr_sim.git
 [submodule "submodules/optimized_mrf_dict"]
 	path = submodules/optimized_mrf_dict
-	url = https://github.com/yonatanu/optimized-mrf-dict.git
+	url = git@github.com:yonatanu/optimized-mrf-dict.git
 [submodule "submodules/igrog"]
 	path = submodules/igrog
-	url = https://github.com/danielabrahamgit/igrog.git
+	url = git@github.com:danielabrahamgit/igrog.git

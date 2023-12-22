@@ -161,3 +161,4 @@ cython_debug/
 
 logs
 test_data
+*.npy
