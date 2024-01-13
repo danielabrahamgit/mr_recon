@@ -328,7 +328,7 @@ class subspace_linop(nn.Module):
 
                 if nseg > 1:
                     segs = torch.arange(t, u, device=self.torch_dev)
-                    phase_mps_gpu = self.field_obj.get_phase_maps(segs)
+                    spatial_funcs = self.field_obj.get_spatial_funcs(segs)
 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, self.sub_batch_size):
@@ -338,7 +338,7 @@ class subspace_linop(nn.Module):
 
                     # Apply B0 phase
                     if nseg > 1:
-                        BSx = Sx[None, ...] * phase_mps_gpu[:, None, None, ...]
+                        BSx = Sx[None, ...] * spatial_funcs[:, None, None, ...]
                     else:
                         BSx = Sx[None, ...]
 
@@ -348,9 +348,8 @@ class subspace_linop(nn.Module):
     
                     # Apply temporal interpolators
                     if nseg > 1:
-                        interp_coeffs = self.field_obj.get_interp_ceoffs(segs) # nro npe ntr nseg
-                        interp_coeffs = interp_coeffs.type(torch.complex64)
-                        ksp_batch = einsum(interp_coeffs, PBFSx, 'nro npe ntr nseg, nseg nc nro npe ntr -> nc nro npe ntr')
+                        temporal_funcs = self.field_obj.get_temporal_funcs(segs) # nro npe ntr nseg
+                        ksp_batch = einsum(temporal_funcs, PBFSx, 'nro npe ntr nseg, nseg nc nro npe ntr -> nc nro npe ntr')
                     else:
                         ksp_batch = PBFSx[0]
 
@@ -388,7 +387,7 @@ class subspace_linop(nn.Module):
             
             if nseg > 1:
                 segs = torch.arange(t, u, device=self.torch_dev)
-                phase_mps_gpu = self.field_obj.get_phase_maps(segs)
+                spatial_funcs = self.field_obj.get_spatial_funcs(segs)
             
             # Batch over coils
             for c, d in batch_iterator(nc, self.coil_batch_size):
@@ -402,9 +401,8 @@ class subspace_linop(nn.Module):
                     Wy = ksp[c:d, ...] * self.dcf[None, ...] # nc nro npe ntr
 
                     if nseg > 1:
-                        interp_coeffs = self.field_obj.get_interp_ceoffs(segs) # nro npe ntr nseg
-                        interp_coeffs = interp_coeffs.type(torch.complex64)
-                        Wy = einsum(Wy, interp_coeffs, 'nc nro npe ntr, nro npe ntr nseg -> nseg nc nro npe ntr')
+                        temporal_funcs = self.field_obj.get_temporal_funcs(segs) # nro npe ntr nseg
+                        Wy = einsum(Wy, temporal_funcs.conj(), 'nc nro npe ntr, nro npe ntr nseg -> nseg nc nro npe ntr')
                         PWy = einsum(Wy, self.phi.conj(), 'nseg nc nro npe ntr, nsub ntr -> nseg nsub nc nro npe ntr')
                     else:
                         PWy = einsum(Wy, self.phi.conj(), 'nc nro npe ntr, nsub ntr -> nsub nc nro npe ntr')
@@ -412,7 +410,7 @@ class subspace_linop(nn.Module):
 
                     # Combine with adjoint maps
                     if nseg > 1:
-                        BFPWy = einsum(FPWy, phase_mps_gpu.conj(), 'nseg nsub nc ..., nseg ... -> nsub nc ...')
+                        BFPWy = einsum(FPWy, spatial_funcs.conj(), 'nseg nsub nc ..., nseg ... -> nsub nc ...')
                     else:
                         BFPWy = FPWy
                     SBFPWy = einsum(BFPWy, mps_gpu.conj(), 'nsub nc ..., nc ... -> nsub ...')

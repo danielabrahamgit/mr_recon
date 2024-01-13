@@ -10,11 +10,12 @@ from mr_recon.utils.func import (
     np_to_torch,
     sp_fft,
     sp_ifft,
-    apply_window
+    apply_window,
+    lin_solve
 )
         
 def alpha_phi_from_b0(b0_map: torch.Tensor,
-                      trj_shape: tuple,
+                      trj_size: tuple,
                       dt: float) -> Union[torch.Tensor, torch.Tensor]:
     """
     Creates field_handler from b0 map
@@ -23,7 +24,7 @@ def alpha_phi_from_b0(b0_map: torch.Tensor,
     -----------
     b0_map : torch.Tensor <float32>
         field map in Hz with shape (N_{ndim-1}, ..., N_0)
-    trj_shape : tuple <int>
+    trj_size : tuple <int>
         k-space trajectory shape, first dim is readout, ex: (nro, ..., d)
     dt : float
         dwell time in seconds
@@ -31,18 +32,19 @@ def alpha_phi_from_b0(b0_map: torch.Tensor,
     Returns:
     --------
     alphas : torch.Tensor <float32>
-        basis coefficients with shape (*trj_shape, 1)
+        basis coefficients with shape (*trj_size, 1)
     phis : torch.Tensor <float32>
         spatial basis phase functions with shape (1, N_{ndim-1}, ..., N_0)
     """
 
     # Consts
-    nro = trj_shape[0]
+    nro = trj_size[0]
 
     # Make alphas
-    ro_lin = torch.arange(nro) / nro
-    alphas = torch.zeros((*trj_shape[:-1], 1))
-    tup = (slice(None),) + (None,) * (len(trj_shape) - 1)
+    dev = b0_map.device
+    ro_lin = torch.arange(nro, device=dev) / nro
+    alphas = torch.zeros((*trj_size[:-1], 1), device=dev)
+    tup = (slice(None),) + (None,) * (len(trj_size) - 1)
     alphas[:, ...] = ro_lin[tup]
 
     # Make phi
@@ -56,7 +58,8 @@ class field_handler:
                  alphas: torch.Tensor,
                  phis: torch.Tensor,
                  nseg: int,
-                 mode: Optional[str] = 'zero'):
+                 method: Optional[str] = 'ts',
+                 interp_type: Optional[str] = 'zero'):
         """
         Represents field imperfections of the form 
 
@@ -69,27 +72,45 @@ class field_handler:
         Parameters:
         -----------
         alphas : torch.Tensor <float32>
-            basis coefficients with shape (*trj_shape, nbasis)
+            basis coefficients with shape (*trj_size, nbasis)
         phis : torch.Tensor <float32>
-            spatial basis phase functions with shape (nbasis, N_{ndim-1}, ..., N_0)
+            spatial basis phase functions with shape (nbasis, *im_size)
         nseg : int
             number of segments
-        mode : str
-            see _calc_temporal_interpolators
+        method : str
+            'ts' - time segmentation
+            'fs' - frequency segmentatoin/mfi
+            'svd' - SVD based splitting
+        interp_type : str
+            'zero' - zero order interpolator
+            'linear' - linear interpolator 
+            'lstsq' - least squares interpolator
         """
 
         msg = 'alphas and phis must be on the same device'
         assert alphas.device == phis.device, msg
+        assert alphas.shape[-1] == phis.shape[0]
 
         # Store
         self.alphas = alphas
         self.phis = phis
         self.nseg = nseg
         self.torch_dev = alphas.device
+        self.method = method.lower()
+        self.interp_type = interp_type.lower()
+        self.trj_size = alphas.shape[:-1]
+        self.im_size = phis.shape[1:]
+        self.nbasis = phis.shape[0]
 
-        # Compute time segmentation
-        self.betas = self._time_segments(nseg)
-        self.interp_coeffs = self._calc_temporal_interpolators(self.betas, mode)
+        if 'ts' in method.lower():
+            # Compute time segmentation
+            self.betas = self._quantize_data(alphas.reshape((-1, self.nbasis)), nseg)
+            self.interp_coeffs = self._calc_temporal_interpolators(self.betas, interp_type)
+        elif 'fs' in method.lower():
+            self.thetas = self._quantize_data(phis.reshape((self.nbasis, -1)).T, nseg)
+            self.interp_coeffs = self._calc_spatial_interpolators(self.thetas, interp_type)
+        else:
+            raise NotImplementedError
 
     def update_phis_size(self,
                          new_size: tuple):
@@ -107,8 +128,8 @@ class field_handler:
         """
 
         # Rescale between -pi and pi
-        ndim = self.phis.ndim - 1
-        nbasis = self.phis.shape[0]
+        ndim = len(self.im_size)
+        nbasis = self.nbasis
         mxs = torch.max(torch.abs(self.phis).reshape((nbasis, -1)), dim=-1)[0]
         tup = (slice(None),) + (None,) * ndim
         phis_rs = torch.pi * self.phis / mxs[tup]
@@ -133,10 +154,10 @@ class field_handler:
 
         self.phis = phis_new
 
-    def get_phase_maps(self,
-                       segs: Optional[torch.Tensor] = slice(None)):
+    def get_spatial_funcs(self,
+                          segs: Optional[torch.Tensor] = slice(None)):
         """
-        Gets phase maps for given segments
+        Gets spatial basis functons at given segments
 
         Parameters:
         -----------
@@ -146,18 +167,25 @@ class field_handler:
         
         Returns:
         --------
-        phase_maps : torch.tensor <complex64>
-            phase maps with shape (len(segs), N_{ndim-1}, ..., N_0)
+        spatial_funcs : torch.tensor <complex64>
+            spatial basis functions with shape (len(segs), N_{ndim-1}, ..., N_0)
         """
-        phase = einsum(self.phis, self.betas[segs], 'nbasis ..., nseg nbasis -> nseg ...')
-        phase_maps = torch.exp(-2j * torch.pi * phase)
 
-        return phase_maps.type(torch.complex64)
+        if 'ts' in self.method:
+            phase = einsum(self.phis, self.betas[segs], 'nbasis ..., nseg nbasis -> nseg ...')
+            phase_maps = torch.exp(-2j * torch.pi * phase)
+            spatial_funcs = phase_maps.type(torch.complex64)
+        elif 'fs' in self.method:
+            spatial_funcs = self.interp_coeffs[segs]
+        else:
+            raise NotImplementedError
 
-    def get_interp_ceoffs(self,
-                          segs: Optional[torch.Tensor] = None):
+        return spatial_funcs
+
+    def get_temporal_funcs(self,
+                           segs: Optional[torch.Tensor] = slice(None)):
         """
-        Gets phase maps for given segments
+        Gets temporal functions at given segments
 
         Parameters:
         -----------
@@ -167,74 +195,149 @@ class field_handler:
         
         Returns:
         --------
-        interp_coeffs : torch.tensor <float32>
-            interpolation coefficients 'h_l(t)' with shape (*trj_shape, nseg)
+        temporal_funcs : torch.tensor <float32>
+            temporal functions 'h_l(t)' with shape (*trj_size, len(segs))
         """
-        assert segs.device == self.torch_dev, 'segs must be on same device as phis'
-        return self.interp_coeffs[..., segs]
 
-    def _time_segments(self,
-                       nseg: int,
-                       method: Optional['str'] = 'cluster') -> torch.Tensor:
+        if 'ts' in self.method:
+            temporal_funcs = self.interp_coeffs[..., segs]
+        elif 'fs' in self.method:
+            phase = einsum(self.alphas, self.thetas[segs], 
+                           '... nbasis, nseg nbasis -> ... nseg')
+            phase = torch.exp(-2j * torch.pi * phase)
+            temporal_funcs = phase.type(torch.complex64)
+        else:
+            raise NotImplementedError
+
+        return temporal_funcs
+
+    # def get_implicit_mlp_features(self):
+
+    def phase_est(self,
+                  r_slice: tuple, 
+                  t_slice: tuple,
+                  lowrank: Optional[bool] = False) -> torch.Tensor:
         """
-        Time segmentation takes the form
+        Estimates phase at given spatial/temporal points.
+         
+        If lowrank:
 
-        e^{-j 2pi phi(r, t)} = sum_l e^{-j 2pi phi(r)_l } h_l(t)
-
-        where 
-
-        phi(r)_l = sum_i phis_i(r) * betas_i[l],
+            e^{-j 2pi phi(r, t)} = sum_l b_l(r) * h_l(t)
         
-        and this function returns the betas
+        Otherwise
+
+            e^{-j 2pi phi(r, t)} = e^{-j 2pi sum_k phis_k(r) * alphas_k(t)}
 
         Parameters:
         -----------
-        nseg : int
-            number of segments
+        r_slice : tuple
+            spatial indices with length len(im_size)
+        t_slice : tuple
+            temporal indices with length len(trj_size)
+        
+        Returns:
+        --------
+        phase_est : torch.Tensor
+            estimated phase with shape (*im_size[r_slice], *trj_shape[t_slice])
+        """
+
+        if lowrank:
+            segs = torch.ones(1, dtype=torch.long, device=self.torch_dev)
+            phase_est = None
+            for i in range(self.nseg):
+                
+                # Get spatial temporal basis funcs 
+                b = self.get_spatial_funcs(segs * i)[0][r_slice] # (*im_size)
+                h = self.get_temporal_funcs(segs * i)[..., 0][t_slice] # (*trj_size)
+                tup_b = (slice(None),) * b.ndim + (None,) * h.ndim
+                tup_h = (None,) * b.ndim + (slice(None),) * h.ndim
+
+                # accumulate
+                if phase_est is None:
+                    phase_est = b[tup_b] * h[tup_h]
+                else:
+                    phase_est += b[tup_b] * h[tup_h]
+        else:
+            phase_est = None
+            for i in range(self.nbasis):
+
+                # Get spatial temporal basis funcs 
+                phi = self.phis[i][r_slice] # (*im_size)
+                alpha = self.alphas[..., i][t_slice] # (*trj_size)
+                tup_p = (slice(None),) * phi.ndim + (None,) * alpha.ndim
+                tup_a = (None,) * phi.ndim + (slice(None),) * alpha.ndim
+
+                # accumulate
+                if phase_est is None:
+                    phase_est = phi[tup_p] * alpha[tup_a]
+                else:
+                    phase_est += phi[tup_p] * alpha[tup_a]
+            
+            phase_est = torch.exp(-2j * torch.pi * phase_est)
+
+        return phase_est
+
+    def _quantize_data(self,
+                       data: torch.Tensor,  
+                       K: int,
+                       method: Optional['str'] = 'uniform') -> torch.Tensor:
+        """
+        Given data of shape (..., d), finds K 'clusters' with shape (K, d)
+
+        Parameters:
+        -----------
+        data : torch.Tensor
+            data to quantize with shape (..., d)
+        K : int
+            number of clusters/quantization centers
         method : str
-            selects the time segmentation method from:
-            'cluster' - uses k-means to optimally find time-segments
-            'uniform' - uniformly spaced time segments
+            selects the quantization method
+            'cluster' - uses k-means to optimally find centers
+            'uniform' - uniformly spaced bins
         
         Returns:
         --------
-        betas : torch.Tensor <float32>
-            basis coefficients with shape (nseg, nbasis)
+        centers : torch.Tensor
+            cluster/quantization centers with shape (K, d)
         """
 
-        # Flatten alpha coeffs
-        alphas_flt = rearrange(self.alphas, '... nbasis -> (...) nbasis')
+        # Consts
+        torch_dev = data.device
+        d = data.shape[-1]
+        data_flt = data.reshape((-1, d))
 
-        # Cluster the alpha coefficients
+        # Cluster
         if method == 'cluster':
-            if (self.torch_dev.index == -1) or (self.torch_dev.index is None):
-                kmeans = KMeans(n_clusters=nseg,
-                                    mode='euclidean')
-                idxs = kmeans.fit_predict(alphas_flt)
+            max_iter = 100
+            if (torch_dev.index == -1) or (torch_dev.index is None):
+                kmeans = KMeans(n_clusters=K,
+                                max_iter=max_iter,
+                                mode='euclidean')
+                idxs = kmeans.fit_predict(data_flt)
             else:
-                with torch.cuda.device(self.torch_dev):
-                    kmeans = KMeans(n_clusters=nseg,
+                with torch.cuda.device(torch_dev):
+                    kmeans = KMeans(n_clusters=K,
+                                    max_iter=max_iter,
                                     mode='euclidean')
-                    idxs = kmeans.fit_predict(alphas_flt)
-            self.idxs = idxs.reshape(self.alphas.shape[:-1])
-            betas = kmeans.centroids
+                    idxs = kmeans.fit_predict(data_flt)
+            centers = kmeans.centroids
 
         # Uniformly spaced time segments
         else:
-            # TODO FIXME For higher dims, only works for nbasis = 1
-            nbasis = alphas_flt.shape[-1]
-            betas = torch.zeros((nseg, nbasis), dtype=torch.float32, device=alphas_flt.device)
-            for i in range(nbasis):
-                lin = torch.linspace(start=alphas_flt[:, i].min(), 
-                                     end=alphas_flt[:, i].max(), 
-                                     steps=nseg + 1, 
-                                     device=alphas_flt.device)
-                betas[:, i] = (lin[:-1] + lin[1:]) / 2
-        return betas.type(torch.float32)
-    
+            # TODO FIXME For higher dims, only works for d = 1
+            centers = torch.zeros((K, d), dtype=data.dtype, device=data.device)
+            for i in range(d):
+                lin = torch.linspace(start=data_flt[:, i].min(), 
+                                     end=data_flt[:, i].max(), 
+                                     steps=K + 1, 
+                                     device=torch_dev)
+                centers[:, i] = (lin[:-1] + lin[1:]) / 2
+
+        return centers
+   
     def _calc_temporal_interpolators(self,
                                      betas: torch.Tensor,
-                                     mode: Optional[str] = 'zero') -> torch.Tensor:
+                                     interp_type: Optional[str] = 'zero') -> torch.Tensor:
         """
         Calculates temporal interpolation coefficients h_l(t) 
         from the following model:
@@ -249,7 +352,7 @@ class field_handler:
         -----------
         betas : torch.tensor <float32>
             time segmentation coeffs with shape (nseg, nbasis)
-        mode : str
+        interp_type : str
             interpolator type from the list
                 'zero' - zero order interpolator
                 'linear' - linear interpolator 
@@ -257,35 +360,33 @@ class field_handler:
         
         Returns:
         --------
-        interp_coeffs : torch.tensor <float32>
-            interpolation coefficients 'h_l(t)' with shape (*trj_shape, nseg)
+        interp_coeffs : torch.tensor <complex64>
+            interpolation coefficients 'h_l(t)' with shape (*trj_size, nseg)
         """
 
-        # alphas -> (*trj_shape, nbasis)
+        # alphas -> (*trj_size, nbasis)
         # betas  -> (nseg,       nbasis)
-        # hl(t)  -> (*trj_shape, nseg)
+        # hl(t)  -> (*trj_size, nseg)
 
         # Consts
         assert self.torch_dev == betas.device
         nseg = betas.shape[0]
-        trj_shape = self.alphas.shape[:-1]
-        
-        # Empty return coefficients
-        interp_coeffs = torch.zeros((*trj_shape, nseg), dtype=torch.float32, device=self.torch_dev)
+        trj_size = self.alphas.shape[:-1]
 
         # Least squares interpolator
-        if 'lstsq' in mode:
+        if 'lstsq' in interp_type:
 
             # TODO OptimizeME with quantization/histograms
 
-            # Prep A, B matrices
+            # Prep AHA, AHB matrices
             alphas_flt = rearrange(self.alphas, '... nbasis -> (...) nbasis').type(torch.float32)
             phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis').type(torch.float32)
-            betas = self.betas.type(torch.float32)
             AHA = torch.zeros((nseg, nseg), 
                               dtype=torch.complex64, device=self.torch_dev)
             AHb = torch.zeros((nseg, alphas_flt.shape[0]), 
                               dtype=torch.complex64, device=self.torch_dev)
+            
+            # Compute AHA and AHB in batches
             batch_size = 2 ** 8
             for n1, n2 in batch_iterator(phis_flt.shape[0], batch_size):
 
@@ -301,31 +402,29 @@ class field_handler:
                 B_batch = torch.exp(-2j * torch.pi * B_batch)
                 AHb += A_batch.H @ B_batch
 
-            # Solve for x = (AHA)^{-1} AHb, sigpy least squares is OP
-            AHA_cp = torch_to_np(AHA)
-            AHb_cp = torch_to_np(AHb)
-            dev = sp.get_device(AHA_cp)
-            with dev:
-                x = dev.xp.linalg.lstsq(AHA_cp, AHb_cp, rcond=None)[0]
-            x = np_to_torch(x)
+            # Solve for x = (AHA)^{-1} AHb
+            x = lin_solve(AHA, AHb)
             
             # Reshape (nseg, T)
-            interp_coeffs = x.T.reshape((*trj_shape, nseg))
+            interp_coeffs = x.T.reshape((*trj_size, nseg))
             interp_coeffs = rearrange(x, 'nseg (nro npe ntr) -> nro npe ntr nseg',
-                                      nro=trj_shape[0], npe=trj_shape[1], ntr=trj_shape[2])
-        
+                                      nro=trj_size[0], npe=trj_size[1], ntr=trj_size[2])
+            
         # Linear interpolator
-        elif 'lin' in mode:
+        elif 'lin' in interp_type:
             raise NotImplementedError
         
         # Zero order hold/nearest interpolator
         else:
+        
+            # Empty return coefficients
+            interp_coeffs = torch.zeros((*trj_size, nseg), dtype=torch.float32, device=self.torch_dev)
 
             # Find closest points
             tup = (slice(None),) + (None,) * (self.alphas.ndim - 1) + (slice(None),)
             inds = torch.argmin(
                 torch.linalg.norm(self.alphas[None, ...] - betas[tup], dim=-1),
-                dim=0) # *trj_shape -> values in [0, ..., nseg-1]
+                dim=0) # *trj_size -> values in [0, ..., nseg-1]
             
             # Indicator function
             for i in range(nseg):
@@ -333,3 +432,129 @@ class field_handler:
 
         return interp_coeffs.type(torch.complex64)
   
+    def _calc_spatial_interpolators(self,
+                                    thetas: torch.Tensor,
+                                    interp_type: Optional[str] = 'zero') -> torch.Tensor:
+        """
+        Calculates spatial interpolation coefficients b_l(r) 
+        from the following model:
+        
+        e^{-j 2pi phi(r, t)} = sum_l b_l(r) e^{-j 2pi phi_l(t) }
+
+        where 
+
+        phi_l(t) = sum_i thetas_l * alphas_i(t),
+
+        Parameters:
+        -----------
+        thetas : torch.Tensor <float32>
+            what most refer to as frequency bins in MFI, shape is (nseg, nbasis)
+        interp_type : str
+            interpolator type from the list
+                'zero' - zero order interpolator
+                'linear' - linear interpolator 
+                'lstsq' - least squares interpolator
+        
+        Returns:
+        --------
+        interp_coeffs : torch.tensor <float32>
+            spatial interpolation coefficients 'b_l(r)' with shape (nseg, *im_size)
+        """
+
+        # alphas -> (*trj_size, nbasis)
+        # thetas -> (nseg,       nbasis)
+        # bl(r)  -> (nseg,     *im_size)
+
+        # Consts
+        assert self.torch_dev == thetas.device
+        nseg = thetas.shape[0]
+        im_size = self.im_size
+    
+        # Least squares interpolator
+        if 'lstsq' in interp_type:
+
+            # Reshape
+            alphas_flt = rearrange(self.alphas, '... nbasis -> (...) nbasis').type(torch.float32)
+            phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis').type(torch.float32)
+            x = torch.zeros((nseg, phis_flt.shape[0]), dtype=torch.complex64, device=self.torch_dev)
+            
+            # Compute AHA matrix
+            A = einsum(thetas, alphas_flt, 
+                                'nseg nbasis, T nbasis -> T nseg')
+            A = torch.exp(-2j * torch.pi * A)
+            AHA = A.H @ A # (nseg, nseg)
+
+            # Spatial batching
+            batch_size = 2 ** 8
+            for n1, n2 in batch_iterator(phis_flt.shape[0], batch_size):
+
+                # Compute B matrix
+                B_batch = einsum(phis_flt[n1:n2, :], alphas_flt,
+                                 'B nbasis, T nbasis -> T B')
+                B_batch = torch.exp(-2j * torch.pi * B_batch)
+
+                # Solve for x = (AHA)^{-1} AHb
+                x[:, n1:n2] = lin_solve(AHA, A.H @ B_batch)
+
+            # reshape
+            interp_coeffs = x.T.reshape((*im_size, nseg)).moveaxis(-1, 0)
+
+        # Linear interpolator
+        elif 'lin' in interp_type:
+            raise NotImplementedError
+        
+        # Zero order hold/nearest interpolator
+        else:
+            
+            # Soln with zeros, fill in later
+            interp_coeffs = torch.zeros((nseg, *self.im_size), dtype=torch.complex64, device=self.torch_dev)
+
+            # Find closest points
+            tup =  (None,) * (len(im_size)) + (slice(None), slice(None))
+            inds = torch.argmin(
+                torch.linalg.norm(self.phis[..., None] - thetas.T[tup], dim=0),
+                dim=-1) # *im_size -> values in [0, ..., nseg-1]
+            
+            # Indicator function
+            for i in range(nseg):
+                interp_coeffs[i, ...] = 1.0 * (inds == i)
+
+        return interp_coeffs
+
+    # -------- Plotting Functions --------
+
+    def _plot_approx_err(self,
+                         t_slice):
+        
+        import matplotlib.pyplot as plt
+
+        assert len(self.im_size) == 2
+
+        r_slice = (slice(None),) * 2
+        phase_est = self.phase_est(r_slice, t_slice, lowrank=True)
+        phase = self.phase_est(r_slice, t_slice, lowrank=False)
+        vmin = torch.angle(phase).min() * 180 / torch.pi
+        vmax = torch.angle(phase).max() * 180 / torch.pi
+        plt.figure(figsize=(14,7))
+        plt.suptitle(f'{self.method.upper()} Model, {self.interp_type.upper()} Interpolator, {self.nseg} Segments')
+        plt.subplot(221)
+        plt.title('True Phase')
+        plt.imshow(torch.rad2deg(torch.angle(phase).cpu()), vmin=vmin, vmax=vmax, cmap='jet')
+        plt.colorbar()
+        plt.axis('off')
+        plt.subplot(222)
+        plt.title('Low Rank Phase Model')
+        plt.imshow(torch.rad2deg(torch.angle(phase_est)).cpu(), vmin=vmin, vmax=vmax, cmap='jet')
+        plt.colorbar()
+        plt.axis('off')
+        plt.subplot(223)
+        plt.title('Residual Phase')
+        plt.imshow(torch.rad2deg(torch.angle(phase.conj() * phase_est)).cpu(), cmap='jet')
+        plt.colorbar()
+        plt.axis('off')
+        plt.subplot(224)
+        plt.title('Residual Magnitude')
+        plt.imshow(torch.abs(phase_est / phase).cpu(), cmap='gray')
+        plt.colorbar()
+        plt.axis('off')
+        plt.tight_layout()
