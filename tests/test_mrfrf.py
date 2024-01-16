@@ -12,6 +12,7 @@ from typing import List, Optional
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.ndimage
 import sigpy as sp
 import sigpy.mri as mr
 import torch
@@ -34,16 +35,18 @@ from mr_recon.linop import multi_subspace_linop
 from mr_recon.nufft import gridded_nufft, sigpy_nufft, torchkb_nufft
 from mr_recon.recon import recon
 from mr_recon.utils.general import create_exp_dir, seed_everything
+from mr_recon.utils.indexing import ravel
 
 
 @dataclass
 class MRParams:
     n_coils: int = 12
-    n_interleaves: int = 48
-    R: int = 48
+    n_interleaves: int = 100
+    R: int = 100
     dt: float = 4e-6
     excitation_ty: str = "shim-ring"
-    smooth_factor: Optional[int] = 20
+    smooth_factor: Optional[int] = 50
+    trj_type: str = "radial"
 
 
 @dataclass
@@ -52,7 +55,7 @@ class ReconParams:
     n_fas_per_cluster: int = 10
 
     n_coeffs: int = 6
-    n_iters: int = 30
+    n_iters: int = 100
     use_toeplitz: bool = False
     grog_grid_oversamp: Optional[float] = 1.0
     coil_batch_size: int = 1
@@ -75,7 +78,6 @@ class GeneratedData:
     trj: torch.Tensor
     mps: torch.Tensor
     phis: List[torch.Tensor]
-    # dcts: List[torch.Tensor]
     cmprsd_dcts: List[torch.Tensor]
     tissues: torch.Tensor
     dcf: torch.Tensor
@@ -85,6 +87,18 @@ class GeneratedData:
     fa_map: torch.Tensor
     avg_pd: Optional[float] = None
 
+    # Store this for debugging
+    gt_coeffs: Optional[torch.Tensor] = None
+    gt_ims: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DebugConfig:
+    guassian_lpf_sigma: float = 1
+    num_avgs: int = 1
+    # This overrides the sampling rate and runs a fully sampled experiment
+    fully_sampled: bool = False
+
 
 @dataclass
 class Config:
@@ -93,14 +107,14 @@ class Config:
     saved_data_dir: Optional[Path] = Path("logs/debug/2023-12-15_14-22")
 
     generate_data: bool = True
-    save_generated_data: bool = True
+    save_generated_data: bool = False
 
     run_classic_recon: bool = True
     save_classic_recon: bool = False
     run_stochastic_recon: bool = False
     init_stochastic_w_classic: bool = False
 
-    noise_std: float = 1e-2
+    noise_std: float = 0  # 3e-3
 
     device_idx = 0
     im_size = (220, 220)
@@ -109,14 +123,25 @@ class Config:
 
     recon_params: ReconParams = field(default_factory=lambda: ReconParams())
 
+    debug: bool = False
+    debug_cfg: DebugConfig = field(default_factory=lambda: DebugConfig())
+
 
 def main():
     seed_everything(42)
 
     args = tyro.cli(Config)
-    exp_name = f"{args.exp_name}-excitation_type={args.mr_params.excitation_ty}-n_interleaves={args.mr_params.n_interleaves}-R={args.mr_params.R}-n_coils={args.mr_params.n_coils}"
+    exp_name = (
+        f"{args.exp_name}-excitation_type={args.mr_params.excitation_ty}-"
+        f"n_interleaves={args.mr_params.n_interleaves}-R={args.mr_params.R}-n_coils={args.mr_params.n_coils}"
+    )
     args.exp_dir = create_exp_dir(args.log_dir, exp_name)
     logger.add(args.exp_dir / "log-{time}.log")
+
+    if args.debug:
+        import matplotlib
+
+        matplotlib.use("webagg")
 
     cfg_str = pprint.pformat(args)
 
@@ -168,11 +193,22 @@ def generate_data(args: Config) -> GeneratedData:
 
     # Load phantom data
     data = quant_phantom()
-    t1 = torch.from_numpy(sp.resize(data["t1"][100], args.im_size)).to(device)
-    t2 = torch.from_numpy(sp.resize(data["t2"][100], args.im_size)).to(device)
-    pd = torch.from_numpy(sp.resize(data["pd"][100], args.im_size)).to(device)
-    gt = torch.stack([pd, t1, t2], axis=-1).to(device)
+    t1 = sp.resize(data["t1"][100], args.im_size)
+    t2 = sp.resize(data["t2"][100], args.im_size)
+    pd = sp.resize(data["pd"][100], args.im_size)
+
+    if args.debug:
+        sigma = args.debug_cfg.guassian_lpf_sigma
+        t1 = scipy.ndimage.gaussian_filter(t1, sigma=sigma)
+        t2 = scipy.ndimage.gaussian_filter(t2, sigma=sigma)
+        pd = scipy.ndimage.gaussian_filter(pd, sigma=sigma)
+
+    t1 = torch.from_numpy(t1).to(device)
+    t2 = torch.from_numpy(t2).to(device)
+    pd = torch.from_numpy(pd).to(device)
     brain_mask = pd > 0.1
+
+    gt = torch.stack([pd, t1, t2], axis=-1).to(device)
     avg_pd = torch.mean(pd[brain_mask])
     logger.info(f"Image size: {pd.shape}")
 
@@ -214,18 +250,40 @@ def generate_data(args: Config) -> GeneratedData:
     )
     mps = torch.from_numpy(mps).to(device)
 
-    trj_obj = trj_lib(args.im_size)
-    trj = trj_obj.gen_MRF_trj(
-        ntr=len(fas), n_shots=args.mr_params.n_interleaves, R=args.mr_params.R
-    )
-    if args.recon_params.grog_grid_oversamp is not None:
-        trj = (
-            np.round(trj * args.recon_params.grog_grid_oversamp)
-            / args.recon_params.grog_grid_oversamp
-        )
+    if args.debug and args.debug_cfg.fully_sampled:
+        K_x, K_y = np.meshgrid(np.arange(args.im_size[0]), np.arange(args.im_size[1]))
+        K_x, K_y = K_x - args.im_size[0] // 2, K_y - args.im_size[1] // 2
+        valid = np.sqrt(K_x**2 + K_y**2) < 110
+        K_x = K_x[valid].flatten()
+        K_y = K_y[valid].flatten()
+        trj = np.zeros((len(K_x), 1, len(fas), 2), dtype=np.float32)
+        trj[..., 0] = np.broadcast_to(K_x[:, None, None], trj.shape[:-1])
+        trj[..., 1] = np.broadcast_to(K_y[:, None, None], trj.shape[:-1])
+    else:
+        trj_obj = trj_lib(args.im_size)
+        if args.mr_params.trj_type == "spiral":
+            trj = trj_obj.gen_MRF_trj(
+                ntr=len(fas), n_shots=args.mr_params.n_interleaves, R=args.mr_params.R
+            )
+        elif args.mr_params.trj_type == "radial":
+            trj = trj_obj.gen_radial_MRF_trj(
+                ntr=len(fas), n_shots=args.mr_params.n_interleaves, R=args.mr_params.R
+            )
+        else:
+            raise ValueError(f"Unknown trajectory type: {args.mr_params.trj_type}")
+
+        if args.recon_params.grog_grid_oversamp is not None:
+            trj = (
+                np.round(trj * args.recon_params.grog_grid_oversamp)
+                / args.recon_params.grog_grid_oversamp
+            )
+
     trj = torch.from_numpy(trj).to(device)
 
-    ksp, _, _, _ = ds.sim_ksp(
+    # Plots all groups for the first TR
+    plot_trj(trj, args.exp_dir)
+
+    ksp, _, _, imgs = ds.sim_ksp(
         t1_map=t1,
         t2_map=t2,
         pd_map=pd,
@@ -236,9 +294,14 @@ def generate_data(args: Config) -> GeneratedData:
         fa_map=fa_map,
         grog_grid_oversamp=args.recon_params.grog_grid_oversamp,
     )
+    gt_coeffs = rearrange(imgs.type(torch.complex64) @ phis[0].T, "h w c -> c h w")
 
     ksp = ksp.to(device)
-    dcf = ds.est_dcf(trj).to(device)
+    # FIXME: there's a bug in the regular DCF calculation when using more than one group. The DCF is suppose to be
+    # calculated on the combined TR image, and rn it is per group per tr so when summing in the subspace recon it's not
+    # correct. For now, we use the cartesian DCF
+    # dcf = ds.est_dcf(trj).to(device)
+    dcf = cartesian_dcf(trj, args.im_size).to(device)
 
     data = GeneratedData(
         gt=gt,
@@ -246,7 +309,6 @@ def generate_data(args: Config) -> GeneratedData:
         trj=trj,
         mps=mps,
         phis=phis,
-        # dcts=dcts,
         cmprsd_dcts=cmprsd_dcts,
         tissues=tissues,
         dcf=dcf,
@@ -255,6 +317,8 @@ def generate_data(args: Config) -> GeneratedData:
         brain_mask=brain_mask,
         avg_pd=avg_pd,
         fa_map=fa_map,
+        gt_coeffs=gt_coeffs,
+        ims=imgs,
     )
 
     if args.save_generated_data:
@@ -270,8 +334,6 @@ def run_recon(
     data: GeneratedData,
 ):
     logger.info(f"Running reconstruction, adding noise with std: {args.noise_std}")
-    noise = torch.randn_like(data.ksp) * args.noise_std
-    noisy_ksp = data.ksp + noise
 
     A = multi_subspace_linop(
         im_size=args.im_size,
@@ -289,25 +351,69 @@ def run_recon(
 
     rcn = recon(args.device_idx)
 
-    img_mr_recon = rcn.run_recon(
-        A_linop=A,
-        ksp=noisy_ksp,
-        max_eigen=1.0,
-        max_iter=args.recon_params.n_iters,
-        lamda_l2=args.recon_params.lambda_l2,
-    )
-    img_mr_recon = torch.from_numpy(img_mr_recon).to(noisy_ksp)
+    # Running to recon with multiple noise instances
+    estimations = []
+    num_avgs = args.debug_cfg.num_avgs if args.debug else 1
+    for i in range(num_avgs):
+        logger.info(f"Running recon {i + 1}/{num_avgs}")
 
-    est_tissues_recon = dict_matching(
-        rearrange(img_mr_recon, "a b c -> b c a"),
-        data.cmprsd_dcts,
-        data.tissues,
-        data.masks,
-        brain_mask=data.brain_mask,
-        avg_pd=data.avg_pd,
-    )
+        noise = torch.randn_like(data.ksp) * (
+            args.noise_std / np.sqrt(args.mr_params.R)
+        )
+        noisy_ksp = data.ksp + noise
+
+        img_mr_recon = rcn.run_recon(
+            A_linop=A,
+            ksp=noisy_ksp,
+            max_eigen=1.0,
+            max_iter=args.recon_params.n_iters,
+            lamda_l2=args.recon_params.lambda_l2,
+        )
+        img_mr_recon = torch.from_numpy(img_mr_recon).to(noisy_ksp)
+
+        est_tissues_recon = dict_matching(
+            rearrange(img_mr_recon, "a b c -> b c a"),
+            data.cmprsd_dcts,
+            data.tissues,
+            data.masks,
+            brain_mask=data.brain_mask,
+            avg_pd=data.avg_pd,
+        )
+        estimations.append(est_tissues_recon)
+
+    estimations = torch.stack(estimations, dim=0)
+    bias = torch.mean(estimations, dim=0) - data.gt
+    var = torch.var(estimations, dim=0)
+    plot_bias_variance(bias, var, args.exp_dir)
 
     return img_mr_recon, est_tissues_recon
+
+
+def cartesian_dcf(trj, im_size):
+    nro, npe, ntr, d = trj.shape
+    rescaled_trj = trj.clone()
+    rescaled_trj[..., 0] = torch.clamp(
+        rescaled_trj[..., 0] + im_size[0] // 2, 0, im_size[0] - 1
+    )
+    rescaled_trj[..., 1] = torch.clamp(
+        rescaled_trj[..., 1] + im_size[1] // 2, 0, im_size[1] - 1
+    )
+    idx = ravel(rescaled_trj, im_size, dim=-1).to(rescaled_trj.device).type(torch.int64)
+    idx = rearrange(idx, "nro npe ntr -> npe ntr nro")
+    dcf = (
+        torch.zeros((npe, ntr, *im_size))
+        .to(rescaled_trj.device)
+        .flatten(start_dim=-2, end_dim=-1)
+    )
+    val = torch.ones_like(idx).to(rescaled_trj.device).type(torch.float32)
+    dcf = dcf.scatter_add_(-1, idx, val)
+    # Sum over groups
+    dcf = torch.sum(dcf, dim=0, keepdim=True)
+    dcf = dcf.expand((npe,) + dcf.shape[1:])
+    dcf = torch.gather(dcf, -1, idx)
+    dcf = rearrange(dcf, "npe ntr ... -> ... npe ntr")
+
+    return 1 / dcf
 
 
 def post_process(est_tissues, subspace_coeffs, gt_tissues, brain_mask, save_path):
@@ -595,9 +701,14 @@ def plot_recons(
             original_image = img[:, :, index]
             gt_image = ground_truth[:, :, index]
 
-            normalized_loss = np.abs(original_image - gt_image) / (gt_image + 1e-8)
+            err = original_image - gt_image
+            err[~mask] = 0
+            normalized_loss = np.abs(err) / (gt_image + 1e-8)
             avg_err = np.mean(normalized_loss[mask])
-
+            nrmse = np.linalg.norm(err[mask]) / np.linalg.norm(gt_image[mask])
+            logger.info(
+                f"NRMSE for {modality}: {nrmse * 100:.1f}%. Avg Err: {avg_err * 100:.1f}%"
+            )
             ax_orig = fig.add_subplot(gs[0, col])
             ax_loss = fig.add_subplot(gs[1, col])
 
@@ -646,6 +757,7 @@ def plot_recons(
         plt.imshow(
             ground_truth[:, :, index], cmap="hot", vmin=vmin_orig, vmax=vmax_orig
         )
+        plt.colorbar()
         plt.axis("off")
         plt.title(f"Ground Truth {modality}", fontsize=22)
         plt.savefig(
@@ -693,6 +805,16 @@ def plot_clusters(voxel_labels, save_path):
     plt.colorbar()
     plt.axis("off")
     plt.savefig(save_path / "voxel_labels.png")
+    plt.close()
+
+
+def plot_trj(trj, save_path):
+    trj = rearrange(trj, "nro npe ntr d -> npe nro ntr d")
+    trj = trj.detach().cpu().numpy()
+    plt.figure()
+    for t in trj:
+        plt.plot(t[:, 0, 0], t[:, 0, 1])
+    plt.savefig(save_path / "trj.png")
     plt.close()
 
 
@@ -753,6 +875,36 @@ def plot_excitation_modes(modes, save_path=None):
     else:
         plt.show()
 
+    plt.close()
+
+
+def plot_bias_variance(bias, var, save_path_prefix):
+    plt.figure(figsize=(12, 8))
+    bias = bias.cpu().numpy()
+    var = var.cpu().numpy()
+    titles = ["PD", "T1", "T2"]
+
+    for i in range(3):
+        ax = plt.subplot(2, 3, i + 1)
+        im = ax.imshow(bias[..., i], cmap="viridis")
+        plt.title(f"Bias {titles[i]}")
+        plt.axis("off")
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        plt.colorbar(im, cax=cax)
+
+    # Plotting variances with colorbars
+    for i in range(3):
+        ax = plt.subplot(2, 3, i + 4)
+        im = ax.imshow(var[..., i], cmap="viridis")
+        plt.title(f"Variance {titles[i]}")
+        plt.axis("off")
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        plt.colorbar(im, cax=cax)
+
+    plt.tight_layout()
+    plt.savefig(save_path_prefix / "bias_var", bbox_inches="tight", pad_inches=0.1)
     plt.close()
 
 
