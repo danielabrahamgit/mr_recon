@@ -1,5 +1,6 @@
 import torch
 import sigpy as sp
+import numpy as np
 
 from typing import Optional, Union
 from einops import rearrange, einsum
@@ -13,6 +14,38 @@ from mr_recon.utils.func import (
     apply_window,
     lin_solve
 )
+
+def bases(x, y, z):
+        assert x.shape == y.shape
+        assert z.shape == x.shape
+        tup = (None,) + (slice(None),) * x.ndim
+        x = x[tup]
+        y = y[tup]
+        z = z[tup]
+        x2 = x ** 2
+        y2 = y ** 2
+        z2 = z ** 2
+        x3 = x ** 3
+        y3 = y ** 3
+        z3 = z ** 3
+        return torch.cat([
+            torch.ones_like(x),
+            x,
+            y,
+            z,
+            x * y,
+            z * y,
+            3 * z2 - (x2 + y2 + z2),
+            x * z,
+            x2 - y2,
+            3 * y * x2 - y3, 
+            x * y * z,
+            (5 * z2 - (x2 + y2 + z2)) * y,
+            5 * z3 - 3 * z * (x2 + y2 + z2),
+            (5 * z2 - (x2 + y2 + z2)) * x,
+            z * x2 - z * y2,
+            x3 - 3 * x * y2
+        ], dim=0)
         
 def alpha_phi_from_b0(b0_map: torch.Tensor,
                       trj_size: tuple,
@@ -52,6 +85,144 @@ def alpha_phi_from_b0(b0_map: torch.Tensor,
 
     return alphas, phis
 
+def alpha_phi_from_skope(skope_data: torch.Tensor,
+                         im_size: tuple,
+                         fov: tuple,
+                         skope_inds: Optional[torch.Tensor] = None) -> Union[torch.Tensor, torch.Tensor]:
+    """
+    Constructs alphas and phis from raw skope data
+
+    Parameters:
+    -----------
+    skope_data : torch.Tensor <float32>
+        this is technically alphas, has shape (*trj_size, nbasis)
+    im_size : tuple
+        num voxels in each dim
+    fov : tuple
+        FOV in meters in each dim
+    skope_inds : torch.Tensor <int>
+        specifies which skope terms are in the nbasis dimension.
+        For example, skope_terms = [0, 2, 3] with nbasis = 3 will 
+        incorporate 0 order, Y, and Z skope terms.
+        defaults to range(nbasis)
+    
+    Returns:
+    --------
+    alphas : torch.Tensor <float32>
+        temoral coefficients with shape (*trj_size, nbasis)
+    phis : torch.Tensor <float32>
+        spatial basis phase functions with shape (nbasis, *im_size)
+    """
+
+    # Consts
+    d = len(im_size)
+    nbasis = skope_data.shape[-1]
+    alphas = skope_data / (2 * torch.pi)
+
+    # Gen X Y Z grids
+    assert d == 2 or d == 3
+    assert d == len(fov)
+    for i in range(d):
+        assert im_size[i] % 2 == 0
+    x = fov[0] * torch.arange(-(im_size[0]//2), im_size[0]//2) / im_size[0]
+    y = fov[1] * torch.arange(-(im_size[1]//2), im_size[1]//2) / im_size[1]
+    if d == 2:
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        Z = X * 0
+    else:
+        z = fov[2] * torch.arange(-(im_size[2]//2), im_size[2]//2) / im_size[2]
+        X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
+
+    # Phi basis functions
+    if skope_inds is None:
+        skope_inds = torch.arange(nbasis)
+    skope_inds = skope_inds.to(alphas.device)
+    all_bases = bases(X, Y, Z).to(alphas.device)
+    phis = all_bases[skope_inds]
+
+    # Scale
+    for i in range(nbasis):
+        mx = phis[i].abs().max()
+        phis[i, ...] /= (mx + 1e-8)
+        alphas[..., i] *= mx
+
+    return alphas, phis
+
+def alpha_phi_from_maxwell(trj: torch.Tensor,
+                           im_size: tuple,
+                           fov: tuple,
+                           dt: float,
+                           B0: float,
+                           z_ofs: Optional[float],
+                           normal_vec: Optional[torch.Tensor]) -> Union[torch.Tensor, torch.Tensor]:
+    """
+    Constructs alphas and phis from analytic maxwell field model.
+    Function of gradient waveform only
+    
+    Parameters:
+    -----------
+    trj : torch.tensor <float>
+        The k-space trajectory with shape (*trj_size, d). 
+        we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        trj[0] is readout dimension
+    im_size : tuple
+        num voxels in each dim
+    fov : tuple
+        FOV in meters in each dim
+    dt : float
+        dwell time in seconds
+    B0 : float
+        field strength in Tesla
+            
+    Returns:
+    --------
+    alphas : torch.Tensor <float32>
+        temoral coefficients with shape (*trj_size, nbasis)
+    phis : torch.Tensor <float32>
+        spatial basis phase functions with shape (nbasis, *im_size)
+    """
+
+    # Consts
+    d = trj.shape[-1]
+    trj_size = trj.shape[:-1]
+    gamma_bar = 42.5774e6 # Hz / T
+    assert d == 2 or d == 3
+    assert d == len(fov)
+
+    # Get gradient from trj
+    tup = (None,) * len(trj_size) + (slice(None),)
+    fov = torch.tensor(fov).to(trj.device).type(trj.dtype)
+    g = torch.diff(trj, dim=0) / (dt * gamma_bar * fov[tup])
+    if d == 2:
+        g = torch.cat((g, g[..., 0:1] * 0), dim=-1)
+
+    # Gen X Y Z grids
+    for i in range(d):
+        assert im_size[i] % 2 == 0
+    x = fov[0] * torch.arange(-(im_size[0]//2), im_size[0]//2) / im_size[0]
+    y = fov[1] * torch.arange(-(im_size[1]//2), im_size[1]//2) / im_size[1]
+    if d == 2:
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        Z = X * 0
+    else:
+        z = fov[2] * torch.arange(-(im_size[2]//2), im_size[2]//2) / im_size[2]
+        X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
+    
+    # Build phis and alphas
+    phis = torch.zeros((4, *im_size), dtype=trj.dtype, device=trj.device)
+    alphas = torch.zeros((*trj_size, 4), dtype=trj.dtype, device=trj.device)
+    phis[0] = X ** 2 + Y ** 2
+    alphas[..., 0] = (g[..., -1] ** 2) / 4
+    phis[1] = Z ** 2
+    alphas[..., 1] = g[..., 0] ** 2 + g[..., 1] ** 2
+    phis[2] = X * Z
+    alphas[..., 2] = g[..., 0] * g[..., 2]
+    phis[3] = Y * Z
+    alphas[..., 3] = g[..., 1] * g[..., 2]
+    alphas /= 2 * B0
+
+    return alphas, phis
+
 class field_handler: 
 
     def __init__(self,
@@ -59,7 +230,8 @@ class field_handler:
                  phis: torch.Tensor,
                  nseg: int,
                  method: Optional[str] = 'ts',
-                 interp_type: Optional[str] = 'zero'):
+                 interp_type: Optional[str] = 'zero',
+                 quant_type: Optional[str] = 'uniform'):
         """
         Represents field imperfections of the form 
 
@@ -85,6 +257,9 @@ class field_handler:
             'zero' - zero order interpolator
             'linear' - linear interpolator 
             'lstsq' - least squares interpolator
+        quant_type : str
+            'cluster' - uses k-means to optimally find centers
+            'uniform' - uniformly spaced bins
         """
 
         msg = 'alphas and phis must be on the same device'
@@ -104,10 +279,12 @@ class field_handler:
 
         if 'ts' in method.lower():
             # Compute time segmentation
-            self.betas = self._quantize_data(alphas.reshape((-1, self.nbasis)), nseg)
+            self.betas = self._quantize_data(alphas.reshape((-1, self.nbasis)), 
+                                             nseg, method=quant_type)
             self.interp_coeffs = self._calc_temporal_interpolators(self.betas, interp_type)
         elif 'fs' in method.lower():
-            self.thetas = self._quantize_data(phis.reshape((self.nbasis, -1)).T, nseg)
+            self.thetas = self._quantize_data(phis.reshape((self.nbasis, -1)).T, 
+                                              nseg, method=quant_type)
             self.interp_coeffs = self._calc_spatial_interpolators(self.thetas, interp_type)
         else:
             raise NotImplementedError
@@ -145,7 +322,7 @@ class field_handler:
             PHI_rs = sp.resize(PHI_sp, oshape)
 
         # Windowing
-        PHI_rs = apply_window(PHI_rs, 'hamming')
+        PHI_rs = apply_window(PHI_rs, PHI_rs.ndim - 1, 'hamming')
         PHI_rs = np_to_torch(PHI_rs)
 
         # Recover phis
@@ -210,8 +387,6 @@ class field_handler:
             raise NotImplementedError
 
         return temporal_funcs
-
-    # def get_implicit_mlp_features(self):
 
     def phase_est(self,
                   r_slice: tuple, 
@@ -308,17 +483,19 @@ class field_handler:
 
         # Cluster
         if method == 'cluster':
-            max_iter = 100
+            max_iter = 1000
+            mode = 'euclidean'
+            # mode = 'cosine'
             if (torch_dev.index == -1) or (torch_dev.index is None):
                 kmeans = KMeans(n_clusters=K,
                                 max_iter=max_iter,
-                                mode='euclidean')
+                                mode=mode)
                 idxs = kmeans.fit_predict(data_flt)
             else:
                 with torch.cuda.device(torch_dev):
                     kmeans = KMeans(n_clusters=K,
                                     max_iter=max_iter,
-                                    mode='euclidean')
+                                    mode=mode)
                     idxs = kmeans.fit_predict(data_flt)
             centers = kmeans.centroids
 
@@ -394,16 +571,16 @@ class field_handler:
                 A_batch = einsum(phis_flt[n1:n2, :], betas, 
                                  'B nbasis, nseg nbasis -> B nseg')
                 A_batch = torch.exp(-2j * torch.pi * A_batch)
-                AHA += A_batch.H @ A_batch
+                AHA += A_batch.H @ A_batch / (n2 - n1)
 
                 # Accumulate AHb
                 B_batch = einsum(phis_flt[n1:n2, :], alphas_flt,
                                  'B nbasis, T nbasis -> B T')
                 B_batch = torch.exp(-2j * torch.pi * B_batch)
-                AHb += A_batch.H @ B_batch
+                AHb += A_batch.H @ B_batch / (n2 - n1)
 
             # Solve for x = (AHA)^{-1} AHb
-            x = lin_solve(AHA, AHb)
+            x = lin_solve(AHA, AHb, solver='pinv')
             
             # Reshape (nseg, T)
             interp_coeffs = x.T.reshape((*trj_size, nseg))
@@ -510,7 +687,7 @@ class field_handler:
             interp_coeffs = torch.zeros((nseg, *self.im_size), dtype=torch.complex64, device=self.torch_dev)
 
             # Find closest points
-            tup =  (None,) * (len(im_size)) + (slice(None), slice(None))
+            tup =  (slice(None),) + (None,) * (len(im_size)) + (slice(None),)
             inds = torch.argmin(
                 torch.linalg.norm(self.phis[..., None] - thetas.T[tup], dim=0),
                 dim=-1) # *im_size -> values in [0, ..., nseg-1]

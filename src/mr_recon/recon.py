@@ -6,6 +6,7 @@ import sigpy as sp
 
 from tqdm import tqdm
 from typing import Optional
+from mr_recon.utils.func import np_to_torch, torch_to_np
 from mr_recon.algs import (
     density_compensation, 
     conjugate_gradient, 
@@ -109,7 +110,7 @@ class recon:
 
         # Starting point
         start = time.perf_counter()
-        y = torch.tensor(ksp, dtype=torch.complex64, device=self.torch_dev)
+        y = np_to_torch(ksp).type(torch.complex64).to(self.torch_dev)
         y = y / torch.norm(y)
         AHb = A_linop.adjoint(y) / (max_eigen ** 0.5)
         end = time.perf_counter()

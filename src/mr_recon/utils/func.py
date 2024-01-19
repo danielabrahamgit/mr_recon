@@ -8,6 +8,34 @@ from typing import Optional, Union
 from scipy.signal import get_window
 from einops import einsum
 
+def fourier_resize(x, new_shape):
+
+    # Get GPU dev
+    x_np = torch_to_np(x)
+    dev = sp.get_device(x_np)
+    
+    with dev:
+
+        # FFT
+        ndim = len(new_shape)
+        X = sp.fft(x_np, axes=tuple(range(-ndim, 0)))
+
+        # Zero pad/chop
+        oshape = X.shape[:-ndim] + new_shape
+        X_rs = sp.resize(X, oshape)
+
+        # Windowing
+        X_rs = apply_window(X_rs, ndim, 'hamming')
+
+        # IFFT
+        x_rs = sp.ifft(X_rs, axes=tuple(range(-ndim, 0)))
+
+    # Convert to original
+    if torch.is_tensor(x):
+        return np_to_torch(x_rs)
+    else:
+        return x_rs
+
 def calc_coil_subspace(ksp_mat: np.array,
                        new_coil_size: Union[int, float],
                        *args):
@@ -59,8 +87,9 @@ def lin_solve(AHA: torch.Tensor,
     x : torch.Tensor
         solution with shape (..., n, m)
     """
-    I = torch.eye(AHA.shape[0], dtype=AHA.dtype, device=AHA.device)
-    AHA += lamda * I
+    I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
+    tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
+    AHA += lamda * I[tup]
     if solver == 'lstsq':
         n, m = AHb.shape[-2:]
         AHA_cp = torch_to_np(AHA).reshape(-1, n, n)
@@ -155,31 +184,35 @@ def sp_ifft(x, dim=None, oshape=None):
     x = fft.fftshift(x, dim=dim)
     return x
 
-def apply_window(ksp_rect: np.ndarray, 
+def apply_window(sig: np.ndarray, 
+                 ndim: int,
                  window_func: Optional[str] = 'hamming') -> np.ndarray:
     """
     Applies windowing function to a rect-linear k-space signal
 
     Parameters:
     -----------
-    ksp_rect : np.ndarray <complex64>
-        k-space rect region with shape (B, N_{ndim-1}, ..., N_1, N_0)
-        B is batch dim
+    sig : np.ndarray <complex64>
+        signal with shape (..., N_{ndim-1}, ..., N_1, N_0)
+    ndim : int
+        apply windowing on last ndim dimensions
     window_func : str
         windowing function from scipy.signal.windows
     
     Returns:
     --------
-    ksp_rect_win : np.ndarray <complex64>
-        windowed k-space with same shape as ksp_cal
+    sig_win : np.ndarray <complex64>
+        windowed signal with same shape as sig
     
     """
-    dev = sp.get_device(ksp_rect)
+    dev = sp.get_device(sig)
     with dev:
-        win = sp.to_device(np.ones(ksp_rect.shape[1:]), dev)
-        ksp_rect_win = ksp_rect.copy()
+        win = sp.to_device(np.ones(sig.shape[-ndim:]), dev)
+        sig_win = sig.copy()
+        dim_ofs = sig.ndim - ndim
         for i in range(win.ndim):
             tup = i * (None,) + (slice(None),) + (None,) * (win.ndim - 1 - i)
-            win *= sp.to_device(get_window(window_func, ksp_rect.shape[1]), dev)[tup]
-        ksp_rect_win *= win[None,]
-    return ksp_rect_win
+            win *= sp.to_device(get_window(window_func, sig.shape[dim_ofs + i]), dev)[tup]
+        tup = (None,) * (dim_ofs) + (slice(None),) * ndim
+        sig_win *= win[tup]
+    return sig_win
