@@ -165,6 +165,9 @@ def conjugate_gradient(AHA: nn.Module,
     z = P(r)
     p = z.clone()
 
+    best_sol = x0.clone()
+    best_res = torch.norm(r)
+
     # Main loop
     for i in tqdm(range(num_iters), 'CG Iterations', disable=not verbose):
 
@@ -180,6 +183,10 @@ def conjugate_gradient(AHA: nn.Module,
 
         # Update r
         r = r - alpha * Ap
+        if torch.norm(r) < best_res:
+            best_sol = x0.clone()
+            best_res = torch.norm(r)
+
         if torch.norm(r) < tolerance:
             break
 
@@ -190,4 +197,4 @@ def conjugate_gradient(AHA: nn.Module,
         beta = torch.real(torch.sum(r.conj() * z)) / rz
         p = z + beta * p
 
-    return x0
+    return best_sol
