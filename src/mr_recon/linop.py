@@ -168,8 +168,6 @@ class subspace_linop(nn.Module):
                 with torch.cuda.device(self.torch_dev):
                     torch.cuda.empty_cache()
 
-
-
     def _compute_grog_toeplitz_kernels(self) -> torch.Tensor:
         """
         Computes toeplitz kernels for grog/cartesian subspace recon.
@@ -327,7 +325,7 @@ class subspace_linop(nn.Module):
             for t, u in batch_iterator(nseg, self.seg_batch_size):
 
                 if nseg > 1:
-                    segs = torch.arange(t, u, device=self.torch_dev)
+                    segs = slice(t, u)
                     spatial_funcs = self.field_obj.get_spatial_funcs(segs)
 
                 # Batch over subspace
@@ -344,7 +342,7 @@ class subspace_linop(nn.Module):
 
                     # NUFFT + phi
                     FBSx = self.nufft.forward(BSx[None,], self.trj[None, ...])[0]
-                    PBFSx = einsum(FBSx, self.phi, 'nseg nc nsub nro npe ntr, nsub ntr -> nseg nc nro npe ntr')
+                    PBFSx = einsum(FBSx, self.phi[a:b], 'nseg nc nsub nro npe ntr, nsub ntr -> nseg nc nro npe ntr')
     
                     # Apply temporal interpolators
                     if nseg > 1:
@@ -386,7 +384,7 @@ class subspace_linop(nn.Module):
         for t, u in batch_iterator(nseg, self.seg_batch_size):
             
             if nseg > 1:
-                segs = torch.arange(t, u, device=self.torch_dev)
+                segs = slice(t, u)
                 spatial_funcs = self.field_obj.get_spatial_funcs(segs)
             
             # Batch over coils
@@ -403,9 +401,9 @@ class subspace_linop(nn.Module):
                     if nseg > 1:
                         temporal_funcs = self.field_obj.get_temporal_funcs(segs) # nro npe ntr nseg
                         Wy = einsum(Wy, temporal_funcs.conj(), 'nc nro npe ntr, nro npe ntr nseg -> nseg nc nro npe ntr')
-                        PWy = einsum(Wy, self.phi.conj(), 'nseg nc nro npe ntr, nsub ntr -> nseg nsub nc nro npe ntr')
+                        PWy = einsum(Wy, self.phi.conj()[a:b], 'nseg nc nro npe ntr, nsub ntr -> nseg nsub nc nro npe ntr')
                     else:
-                        PWy = einsum(Wy, self.phi.conj(), 'nc nro npe ntr, nsub ntr -> nsub nc nro npe ntr')
+                        PWy = einsum(Wy, self.phi.conj()[a:b], 'nc nro npe ntr, nsub ntr -> nsub nc nro npe ntr')
                     FPWy = self.nufft.adjoint(PWy[None, ...], self.trj[None, ...])[0] # (nseg) nsub nc *im_size
 
                     # Combine with adjoint maps

@@ -1,7 +1,7 @@
 import torch
 import sigpy as sp
-import numpy as np
 
+from tqdm import tqdm
 from typing import Optional, Union
 from einops import rearrange, einsum
 from fast_pytorch_kmeans import KMeans
@@ -75,13 +75,13 @@ def alpha_phi_from_b0(b0_map: torch.Tensor,
 
     # Make alphas
     dev = b0_map.device
-    ro_lin = torch.arange(nro, device=dev) / nro
+    ro_lin = torch.arange(nro, device=dev) * dt
     alphas = torch.zeros((*trj_size[:-1], 1), device=dev)
     tup = (slice(None),) + (None,) * (len(trj_size) - 1)
     alphas[:, ...] = ro_lin[tup]
 
     # Make phi
-    phis = b0_map[None, ...] * dt * nro 
+    phis = b0_map[None, ...]
 
     return alphas, phis
 
@@ -119,7 +119,11 @@ def alpha_phi_from_skope(skope_data: torch.Tensor,
     nbasis = skope_data.shape[-1]
     alphas = skope_data / (2 * torch.pi)
 
+    if skope_inds is None:
+        skope_inds = torch.arange(nbasis)
+
     # Gen X Y Z grids
+    assert nbasis == len(skope_inds)
     assert d == 2 or d == 3
     assert d == len(fov)
     for i in range(d):
@@ -134,17 +138,15 @@ def alpha_phi_from_skope(skope_data: torch.Tensor,
         X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
 
     # Phi basis functions
-    if skope_inds is None:
-        skope_inds = torch.arange(nbasis)
     skope_inds = skope_inds.to(alphas.device)
     all_bases = bases(X, Y, Z).to(alphas.device)
     phis = all_bases[skope_inds]
 
-    # Scale
-    for i in range(nbasis):
-        mx = phis[i].abs().max()
-        phis[i, ...] /= (mx + 1e-8)
-        alphas[..., i] *= mx
+    # # Scale
+    # for i in range(nbasis):
+    #     mx = phis[i].abs().max()
+    #     phis[i, ...] /= (mx + 1e-8)
+    #     alphas[..., i] *= mx
 
     return alphas, phis
 
@@ -154,7 +156,7 @@ def alpha_phi_from_maxwell(trj: torch.Tensor,
                            dt: float,
                            B0: float,
                            z_ofs: Optional[float],
-                           normal_vec: Optional[torch.Tensor]) -> Union[torch.Tensor, torch.Tensor]:
+                           rotations: Optional[tuple]) -> Union[torch.Tensor, torch.Tensor]:
     """
     Constructs alphas and phis from analytic maxwell field model.
     Function of gradient waveform only
@@ -173,6 +175,12 @@ def alpha_phi_from_maxwell(trj: torch.Tensor,
         dwell time in seconds
     B0 : float
         field strength in Tesla
+    z_ofs : float
+        z offset in meters
+        only makes sense for 2D
+    rotations : tuple
+        rotation of imaging slice along x and y axis in degrees
+        only makes sense for 2D
             
     Returns:
     --------
@@ -188,31 +196,59 @@ def alpha_phi_from_maxwell(trj: torch.Tensor,
     gamma_bar = 42.5774e6 # Hz / T
     assert d == 2 or d == 3
     assert d == len(fov)
+    assert d == len(im_size)
 
     # Get gradient from trj
+    trj = trj.type(torch.float32)
+    if d == 2:
+        trj = torch.cat((trj, trj[..., 0:1] * 0), dim=-1)
+        fov += (1,)
     tup = (None,) * len(trj_size) + (slice(None),)
     fov = torch.tensor(fov).to(trj.device).type(trj.dtype)
     g = torch.diff(trj, dim=0) / (dt * gamma_bar * fov[tup])
-    if d == 2:
-        g = torch.cat((g, g[..., 0:1] * 0), dim=-1)
+    g = torch.cat((g, g[-1:]), dim=0)
 
     # Gen X Y Z grids
     for i in range(d):
         assert im_size[i] % 2 == 0
-    x = fov[0] * torch.arange(-(im_size[0]//2), im_size[0]//2) / im_size[0]
-    y = fov[1] * torch.arange(-(im_size[1]//2), im_size[1]//2) / im_size[1]
+    lins = [
+        torch.arange(-(im_size[i]//2), im_size[i]//2, 
+                     device=trj.device, dtype=torch.float32) / (im_size[i]) * fov[i]
+        for i in range(d)
+        ]
+    grds = torch.meshgrid(*lins, indexing='ij')
+    grd = torch.concatenate(
+        [g[..., None] for g in grds], axis=-1)
     if d == 2:
-        X, Y = torch.meshgrid(x, y, indexing='ij')
-        Z = X * 0
-    else:
-        z = fov[2] * torch.arange(-(im_size[2]//2), im_size[2]//2) / im_size[2]
-        X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
+        grd = torch.concatenate((grd, grd[..., :1] * 0), dim=-1)
+        
+        if rotations is not None:
+            rotations = torch.tensor(rotations, dtype=torch.float32, device=trj.device)
+            thetas = torch.deg2rad(rotations)
+            Rx = torch.tensor([
+                [1, 0, 0],
+                [0, torch.cos(thetas[0]), -torch.sin(thetas[0])],
+                [0, torch.sin(thetas[0]), torch.cos(thetas[0])]], 
+                device=trj.device)
+            Ry = torch.tensor([
+                [torch.cos(thetas[1]), 0, torch.sin(thetas[1])],
+                [0, 1, 0],
+                [-torch.sin(thetas[1]), 0, torch.cos(thetas[1])]], 
+                device=trj.device)
+            grd = (Ry @ Rx @ grd[..., None])[..., 0]
+            g = (Ry @ Rx @ g[..., None])[..., 0]
+
+        if z_ofs is not None:
+            grd[..., 2] += z_ofs
     
     # Build phis and alphas
     phis = torch.zeros((4, *im_size), dtype=trj.dtype, device=trj.device)
     alphas = torch.zeros((*trj_size, 4), dtype=trj.dtype, device=trj.device)
+    X = grd[..., 0]
+    Y = grd[..., 1]
+    Z = grd[..., 2]
     phis[0] = X ** 2 + Y ** 2
-    alphas[..., 0] = (g[..., -1] ** 2) / 4
+    alphas[..., 0] = (g[..., 2] ** 2) / 4
     phis[1] = Z ** 2
     alphas[..., 1] = g[..., 0] ** 2 + g[..., 1] ** 2
     phis[2] = X * Z
@@ -220,6 +256,9 @@ def alpha_phi_from_maxwell(trj: torch.Tensor,
     phis[3] = Y * Z
     alphas[..., 3] = g[..., 1] * g[..., 2]
     alphas /= 2 * B0
+
+    # Integral on alphas, gamma_bar to map T to phase
+    alphas = torch.cumsum(alphas, dim=0) * dt * gamma_bar
 
     return alphas, phis
 
@@ -231,7 +270,8 @@ class field_handler:
                  nseg: int,
                  method: Optional[str] = 'ts',
                  interp_type: Optional[str] = 'zero',
-                 quant_type: Optional[str] = 'uniform'):
+                 quant_type: Optional[str] = 'uniform',
+                 verbose: Optional[bool] = True):
         """
         Represents field imperfections of the form 
 
@@ -260,6 +300,8 @@ class field_handler:
         quant_type : str
             'cluster' - uses k-means to optimally find centers
             'uniform' - uniformly spaced bins
+        verbose : bool
+            toggles print statements
         """
 
         msg = 'alphas and phis must be on the same device'
@@ -276,6 +318,8 @@ class field_handler:
         self.trj_size = alphas.shape[:-1]
         self.im_size = phis.shape[1:]
         self.nbasis = phis.shape[0]
+        self.verbose = verbose
+        self.spatial_batch_size = 2 ** 8
 
         if 'ts' in method.lower():
             # Compute time segmentation
@@ -485,16 +529,19 @@ class field_handler:
         if method == 'cluster':
             max_iter = 1000
             mode = 'euclidean'
+            verbose = 1
             # mode = 'cosine'
             if (torch_dev.index == -1) or (torch_dev.index is None):
                 kmeans = KMeans(n_clusters=K,
                                 max_iter=max_iter,
+                                verbose=verbose,
                                 mode=mode)
                 idxs = kmeans.fit_predict(data_flt)
             else:
                 with torch.cuda.device(torch_dev):
                     kmeans = KMeans(n_clusters=K,
                                     max_iter=max_iter,
+                                    verbose=verbose,
                                     mode=mode)
                     idxs = kmeans.fit_predict(data_flt)
             centers = kmeans.centroids
@@ -564,8 +611,9 @@ class field_handler:
                               dtype=torch.complex64, device=self.torch_dev)
             
             # Compute AHA and AHB in batches
-            batch_size = 2 ** 8
-            for n1, n2 in batch_iterator(phis_flt.shape[0], batch_size):
+            batch_size = self.spatial_batch_size
+            for n1 in tqdm(range(0, phis_flt.shape[0], batch_size), 'Least Squares Interpolators'):
+                n2 = min(n1 + batch_size, phis_flt.shape[0])
 
                 # Accumulate AHA
                 A_batch = einsum(phis_flt[n1:n2, :], betas, 
@@ -606,6 +654,8 @@ class field_handler:
             # Indicator function
             for i in range(nseg):
                 interp_coeffs[..., i] = 1.0 * (inds == i)
+            
+            del inds
 
         return interp_coeffs.type(torch.complex64)
   
@@ -662,8 +712,9 @@ class field_handler:
             AHA = A.H @ A # (nseg, nseg)
 
             # Spatial batching
-            batch_size = 2 ** 8
-            for n1, n2 in batch_iterator(phis_flt.shape[0], batch_size):
+            batch_size = self.spatial_batch_size
+            for n1 in tqdm(range(0, phis_flt.shape[0], batch_size), 'Least Squares Interpolators', diable=not self.verbose):
+                n2 = min(n1 + batch_size, phis_flt.shape[0])
 
                 # Compute B matrix
                 B_batch = einsum(phis_flt[n1:n2, :], alphas_flt,
@@ -735,3 +786,44 @@ class field_handler:
         plt.colorbar()
         plt.axis('off')
         plt.tight_layout()
+
+    def _phase_movie(self, t_slice, r_slice=None, name='test.gif'):
+
+        
+        import matplotlib.animation as animation
+        import matplotlib.pyplot as plt
+        fig, (ax1, ax2) = plt.subplots(1,2)
+
+        ims = []
+
+        ndim = len(self.im_size)
+        if r_slice is None:
+            if ndim == 3:            
+                slc = self.im_size[-1]//2
+                r_slice = (slice(None),) * (ndim - 1) + (slc,)
+            else:
+                r_slice = (slice(None),) * ndim
+        phase = self.phase_est(r_slice, t_slice, lowrank=False).cpu()
+        phase_LR = self.phase_est(r_slice, t_slice, lowrank=True).cpu()
+        vmin = torch.angle(phase).min()
+        vmax = torch.angle(phase).max()
+
+        ax1.set_title('True Phase')
+        ax2.set_title('Time-Segmented Phase Model')
+        ax1.axis('off')
+        ax2.axis('off')
+        for i in tqdm(range(phase.shape[-1]), 'Making Movie'):
+            im1 = ax1.imshow(torch.angle(phase[..., i]), vmin=vmin, vmax=vmax, animated=True, cmap='jet')
+            im2 = ax2.imshow(torch.angle(phase_LR[..., i]), vmin=vmin, vmax=vmax, cmap='jet')
+            ims.append([im1,im2])
+        width = 0.75
+        cb_ax = fig.add_axes([(1-width)/2,.13,width,.04])
+        fig.colorbar(im2,orientation='horizontal',cax=cb_ax)
+        fig.tight_layout()
+        ani = animation.ArtistAnimation(fig, ims, interval=20, blit=True,
+                                repeat_delay=500)
+        writer = animation.PillowWriter(fps=15,
+                                metadata=dict(artist='Me'),
+                                bitrate=1800)
+        ani.save(name, writer=writer)
+        quit()
