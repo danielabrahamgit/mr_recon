@@ -157,16 +157,20 @@ def conjugate_gradient(AHA: nn.Module,
 
     # Start at AHb
     x0 = AHb.clone()
-    if num_iters == 0:
-        return x0
 
     # Define iterative vars
     r = AHb - AHA_wrapper(x0)
+
     z = P(r)
     p = z.clone()
 
     best_sol = x0.clone()
     best_res = torch.norm(r)
+    best_iter = -1
+
+    if torch.norm(r) < tolerance or num_iters == 0:
+        print(f'Best Residual = {best_res}, Best Iteration = {best_iter}')
+        return x0
 
     # Main loop
     for i in tqdm(range(num_iters), 'CG Iterations', disable=not verbose):
@@ -184,6 +188,7 @@ def conjugate_gradient(AHA: nn.Module,
         # Update r
         r = r - alpha * Ap
         if torch.norm(r) < best_res:
+            best_iter = i
             best_sol = x0.clone()
             best_res = torch.norm(r)
 
@@ -197,4 +202,5 @@ def conjugate_gradient(AHA: nn.Module,
         beta = torch.real(torch.sum(r.conj() * z)) / rz
         p = z + beta * p
 
+    print(f'Best Residual = {best_res}, Best Iteration = {best_iter}')
     return best_sol

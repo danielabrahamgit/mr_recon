@@ -1,7 +1,7 @@
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 import pickle
 import pprint
@@ -45,7 +45,7 @@ class MRParams:
     R: int = 100
     dt: float = 4e-6
     excitation_ty: str = "random"
-    smooth_factor: Optional[int] = 30
+    smooth_factor: Optional[int] = 10
     trj_type: str = "radial"
 
 
@@ -55,14 +55,14 @@ class ReconParams:
     n_fas_per_cluster: int = 1
 
     n_coeffs: int = 5
-    n_iters: int = 40
+    n_iters: int = 100
     use_toeplitz: bool = False
     grog_grid_oversamp: Optional[float] = 1.0
     coil_batch_size: int = 1
     sub_batch_size: int = 1
     seg_batch_size: int = 1
 
-    lambda_l2: float = 0.0
+    lambda_l2: float = 1e-5
 
 
 @dataclass
@@ -86,6 +86,7 @@ class GeneratedData:
     brain_mask: torch.Tensor
     fa_map: torch.Tensor
     avg_pd: Optional[float] = None
+    noisy_ksp: Optional[torch.Tensor] = None
 
     # Store this for debugging
     gt_coeffs: Optional[torch.Tensor] = None
@@ -94,7 +95,7 @@ class GeneratedData:
 
 @dataclass
 class DebugConfig:
-    guassian_lpf_sigma: float = 1
+    guassian_lpf_sigma: float = -1
     num_avgs: int = 1
     # This overrides the sampling rate and runs a fully sampled experiment
     fully_sampled: bool = False
@@ -114,7 +115,7 @@ class Config:
     run_stochastic_recon: bool = True
     init_stochastic_w_classic: bool = True
 
-    noise_std: float = 0  # 3e-3
+    noise_std: float = 3e-3
 
     device_idx = 0
     im_size = (220, 220)
@@ -199,9 +200,10 @@ def generate_data(args: Config) -> GeneratedData:
 
     if args.debug:
         sigma = args.debug_cfg.guassian_lpf_sigma
-        t1 = scipy.ndimage.gaussian_filter(t1, sigma=sigma)
-        t2 = scipy.ndimage.gaussian_filter(t2, sigma=sigma)
-        pd = scipy.ndimage.gaussian_filter(pd, sigma=sigma)
+        if sigma > 0:
+            t1 = scipy.ndimage.gaussian_filter(t1, sigma=sigma)
+            t2 = scipy.ndimage.gaussian_filter(t2, sigma=sigma)
+            pd = scipy.ndimage.gaussian_filter(pd, sigma=sigma)
 
     t1 = torch.from_numpy(t1).to(device)
     t2 = torch.from_numpy(t2).to(device)
@@ -224,9 +226,9 @@ def generate_data(args: Config) -> GeneratedData:
 
     # get the flip angle maps and cluster them
     fa_map, clusters, voxel_labels = generate_fa_map(
-        fas, modes, args.recon_params.n_clusters, args.mr_params.smooth_factor
+        fas, modes, args.recon_params.n_clusters, args.mr_params.smooth_factor, args.mr_params
     )
-    fa_examples = rearrange(torch.rad2deg(fa_map[::90, ::90, :]), "h w n -> (h w) n")[
+    fa_examples = rearrange(torch.rad2deg(fa_map[::20, ::20, :]), "h w n -> (h w) n")[
         :3
     ]
     plot_signals(fa_examples, args.exp_dir, "fa_exmp")
@@ -285,6 +287,11 @@ def generate_data(args: Config) -> GeneratedData:
             )
 
     trj = torch.from_numpy(trj).to(device)
+    # FIXME: there's a bug in the regular DCF calculation when using more than one group. The DCF is suppose to be
+    # calculated on the combined TR image, and rn it is per group per tr so when summing in the subspace recon it's not
+    # correct. For now, we use the cartesian DCF
+    # dcf = ds.est_dcf(trj).to(device)
+    dcf = cartesian_dcf(trj, args.im_size).to(device)
 
     # Plots all groups for the first TR
     plot_trj(trj, args.exp_dir)
@@ -299,15 +306,11 @@ def generate_data(args: Config) -> GeneratedData:
         seg_batch_size=1,
         fa_map=fa_map,
         grog_grid_oversamp=args.recon_params.grog_grid_oversamp,
+        dcf=dcf
     )
     gt_coeffs = rearrange(imgs.type(torch.complex64) @ phis[0].T, "h w c -> c h w")
 
     ksp = ksp.to(device)
-    # FIXME: there's a bug in the regular DCF calculation when using more than one group. The DCF is suppose to be
-    # calculated on the combined TR image, and rn it is per group per tr so when summing in the subspace recon it's not
-    # correct. For now, we use the cartesian DCF
-    # dcf = ds.est_dcf(trj).to(device)
-    dcf = cartesian_dcf(trj, args.im_size).to(device)
 
     data = GeneratedData(
         gt=gt,
@@ -367,6 +370,7 @@ def run_recon(
             args.noise_std / np.sqrt(args.mr_params.R)
         )
         noisy_ksp = data.ksp + noise
+        data.noisy_ksp = noisy_ksp
 
         img_mr_recon = rcn.run_recon(
             A_linop=A,
@@ -450,9 +454,12 @@ def jinc(x):
 
 
 def get_rand_modes(im_size, n_modes=3):
-    modes = 1 + 0.1 * torch.randn(n_modes, *im_size)
+    modes = 0.1 * torch.randn(n_modes, *im_size)
+    filtered_modes = []
+    for mode in modes:
+        filtered_modes.append(1 + 4 * torch.from_numpy(scipy.ndimage.gaussian_filter(mode.numpy(), sigma=5)))
 
-    return modes
+    return torch.stack(filtered_modes, dim=0)
 
 
 def get_shim_modes():
@@ -575,7 +582,7 @@ def pick_fas(fas, cluster, n_fas):
     return picked_fas
 
 
-def generate_fa_map(fa, modes, n_clusters, smooth_factor: Optional[int] = None):
+def generate_fa_map(fa, modes, n_clusters, smooth_factor: Optional[int] = None, mr_params:MRParams=None):
     """
     Generate FA map, clusters, and voxel labels.
 
@@ -620,7 +627,11 @@ def generate_fa_map(fa, modes, n_clusters, smooth_factor: Optional[int] = None):
     fa_map = torch.zeros(smoothed_modes.shape[1:] + (len(fa),))
     modes = torch.tile(smoothed_modes, [int(np.ceil(len(fa) / smoothed_n_modes)), 1, 1])
     modes = rearrange(modes, "n h w -> h w n")
-    fa_map = torch.clip(modes[..., : len(fa)] * fa, min=0, max=torch.pi / 2)
+    fa_map = modes[..., : len(fa)] * fa
+    # Low pass filter the FA map in time
+    if mr_params.excitation_ty != "flat":
+        fa_map = torch.from_numpy(scipy.ndimage.gaussian_filter1d(fa_map.cpu().numpy(), sigma=1, axis=-1)).to(fa_map.device)
+        fa_map = torch.clip(fa_map, min=0, max=torch.pi / 2)
 
     logger.info(f"Clustering the different FAs into {n_clusters} clusters")
     # Pytorch version
@@ -935,10 +946,12 @@ def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
     else:
         nufft = torchkb_nufft(args.im_size, device)
 
+    # TODO: do we need this?
     trj = nufft.rescale_trajectory(data.trj.to(device))
 
     sqrt_dcf = torch.sqrt(data.dcf.to(device))
-    data.ksp = data.ksp * sqrt_dcf[None, ...]
+    ksp = (data.ksp if data.noisy_ksp is None else data.noisy_ksp) * sqrt_dcf[None, ...]
+    # data.ksp = data.ksp * sqrt_dcf[None, ...]
 
     def A(x):
         img_coil = x[:, None, ...] * mps_torch[None, ...]  # T nc 220 220
@@ -990,6 +1003,7 @@ def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
         )
 
         params = init_params.to(device).type(torch.float32).clone()
+        params.requires_grad = True
     else:
         pd = (
             recon_data.tissues[..., 0]
@@ -1013,7 +1027,6 @@ def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
             .requires_grad_(True)
         )
         params = torch.stack([pd, t1, t2], dim=-1).unsqueeze(2)
-    params.requires_grad = True
 
     def calc_mape(params, gt):
         mape = torch.abs(params.squeeze() - gt) / (gt + 1e-8)
@@ -1034,20 +1047,21 @@ def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
     scheduler = ReduceLROnPlateau(
         optim, mode="min", patience=50, factor=0.2, verbose=True, min_lr=1e-4
     )
-    loss_func = torch.nn.MSELoss(reduction="sum")
+    # loss_func = torch.nn.MSELoss(reduction="sum")
+    loss_func = torch.nn.L1Loss(reduction="sum")
     losses = []
 
     for i in tqdm(range(nsteps)):
         params = torch.stack([pd, t1, t2], dim=-1).unsqueeze(2)
-        if i == 0:
+        if i == -1:
             ims = rearrange(
                 seq(data.gt.unsqueeze(2).type(torch.float32), data.fa_map).squeeze(),
                 "h w t -> t h w",
             )
             ksp_est = A(ims)
 
-            loss = loss_func(data.ksp.real, ksp_est.real) + loss_func(
-                data.ksp.imag, ksp_est.imag
+            loss = loss_func(ksp.real, ksp_est.real) + loss_func(
+                ksp.imag, ksp_est.imag
             )
 
         ims = rearrange(seq(params, data.fa_map).squeeze(), "h w t -> t h w")
@@ -1055,8 +1069,8 @@ def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
         ksp_est = A(ims)
         ksp_est.retain_grad()
 
-        loss = loss_func(data.ksp.real, ksp_est.real) + loss_func(
-            data.ksp.imag, ksp_est.imag
+        loss = loss_func(ksp.real, ksp_est.real) + loss_func(
+            ksp.imag, ksp_est.imag
         )
         # loss += 1e-6 * torch.sum(torch.abs(params) ** 2)
         # loss += 1e-7 * torch.sum(torch.abs(ims) ** 2)
@@ -1067,8 +1081,8 @@ def stochastic_recon(data: GeneratedData, args: Config, recon_data: ReconData):
         pd.grad.nan_to_num_()
         t1.grad.nan_to_num_()
         t2.grad.nan_to_num_()
-        t1.grad = 10 * torch.sign(t1.grad)
-        t2.grad = 2 * torch.sign(t2.grad)
+        t1.grad = 5 * torch.sign(t1.grad)
+        t2.grad = 1 * torch.sign(t2.grad)
         optim.step()
         optim.zero_grad()
         with torch.no_grad():

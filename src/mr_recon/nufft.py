@@ -285,7 +285,8 @@ class gridded_nufft(NUFFT):
     def forward(self, 
                 img: torch.Tensor, 
                 trj: torch.Tensor) -> torch.Tensor:
-        
+        assert img.shape[0] == trj.shape[0], "Batch size mismatch!"
+
         # To torch
         img_torch, trj_torch = np_to_torch(img, trj)
 

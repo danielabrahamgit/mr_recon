@@ -1,7 +1,7 @@
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import pickle
 import pprint
@@ -44,15 +44,15 @@ class MRParams:
     n_interleaves: int = 100
     R: int = 100
     dt: float = 4e-6
-    excitation_ty: str = "shim-ring"
+    excitation_ty: str = "flat"
     smooth_factor: Optional[int] = 50
     trj_type: str = "radial"
 
 
 @dataclass
 class ReconParams:
-    n_clusters: int = 10
-    n_fas_per_cluster: int = 10
+    n_clusters: int = 1
+    n_fas_per_cluster: int = 1
 
     n_coeffs: int = 6
     n_iters: int = 100
@@ -123,7 +123,7 @@ class Config:
 
     recon_params: ReconParams = field(default_factory=lambda: ReconParams())
 
-    debug: bool = False
+    debug: bool = True
     debug_cfg: DebugConfig = field(default_factory=lambda: DebugConfig())
 
 
@@ -132,7 +132,7 @@ def main():
 
     args = tyro.cli(Config)
     exp_name = (
-        f"{args.exp_name}-excitation_type={args.mr_params.excitation_ty}-"
+        f"{args.exp_name}-excitation_type={args.mr_params.excitation_ty}-sampling={args.mr_params.trj_type}-"
         f"n_interleaves={args.mr_params.n_interleaves}-R={args.mr_params.R}-n_coils={args.mr_params.n_coils}"
     )
     args.exp_dir = create_exp_dir(args.log_dir, exp_name)
@@ -318,7 +318,7 @@ def generate_data(args: Config) -> GeneratedData:
         avg_pd=avg_pd,
         fa_map=fa_map,
         gt_coeffs=gt_coeffs,
-        ims=imgs,
+        gt_ims=imgs,
     )
 
     if args.save_generated_data:
