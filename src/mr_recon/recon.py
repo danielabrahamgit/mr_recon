@@ -6,11 +6,11 @@ import sigpy as sp
 
 from tqdm import tqdm
 from typing import Optional
-from mr_recon.utils.func import np_to_torch, torch_to_np
+from mr_recon.utils import np_to_torch, torch_to_np
 from mr_recon.algs import (
     density_compensation, 
     conjugate_gradient, 
-    largest_eigenvalue, 
+    power_method_operator, 
     FISTA
 )
 
@@ -103,7 +103,7 @@ class recon:
         # Estimate largest eigenvalue so that lambda max of AHA is 1
         if max_eigen is None:
             x0 = torch.randn(A_linop.ishape, dtype=torch.complex64, device=self.torch_dev)
-            max_eigen = largest_eigenvalue(A_linop.normal, x0, verbose=self.verbose)
+            _, max_eigen = power_method_operator(A_linop.normal, x0, verbose=self.verbose)
             max_eigen *= 1.01
         else:
             max_eigen = 1.0
@@ -116,6 +116,11 @@ class recon:
         end = time.perf_counter()
         if self.verbose:
             print(f'AHb took {end-start:.3f}(s)')
+
+        # Clear data
+        y = y.cpu()
+        with self.torch_dev:
+            torch.cuda.empty_cache()
 
         # Wrap normal with max eigen
         AHA = lambda x : A_linop.normal(x) / max_eigen

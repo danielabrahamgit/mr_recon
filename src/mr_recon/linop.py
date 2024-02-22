@@ -2,15 +2,16 @@ import gc
 import torch
 import torch.nn as nn
 
-from mr_recon.utils.func import batch_iterator, sp_fft, sp_ifft
-from mr_recon.utils.pad import PadLast
-from mr_recon.field import field_handler
-from mr_recon.nufft import (
+from mr_recon.fourier import fft, ifft
+from mr_recon.utils import batch_iterator
+from mr_recon.pad import PadLast
+from mr_recon.imperfections.field import field_handler
+from mr_recon.fourier import (
     gridded_nufft,
     sigpy_nufft,
     torchkb_nufft
 )
-from mr_recon.utils.indexing import multi_grid
+from mr_recon.indexing import multi_grid
 from einops import rearrange, einsum
 from typing import Optional, Union
 from tqdm import tqdm
@@ -277,7 +278,7 @@ class subspace_linop(nn.Module):
                         psf_col = nufft_adjoint(alpha_ksp, trj_seg)
 
                         # Transform to k-space
-                        T_col = sp_fft(psf_col, dim=tuple(range(-d, 0))) 
+                        T_col = fft(psf_col, dim=tuple(range(-d, 0))) 
                         T_col = T_col * (os_factor ** d) # Scaling
                         
                         # Update Toeplitz kernels
@@ -481,14 +482,14 @@ class subspace_linop(nn.Module):
 
                         # Toeplitz
                         BSx_os = padder.forward(BSx)
-                        FBSx_os = sp_fft(BSx_os, dim=tuple(range(-dim, 0)))
+                        FBSx_os = fft(BSx_os, dim=tuple(range(-dim, 0)))
                         for a2, b2 in batch_iterator(nsub, self.sub_batch_size):
                             if save_memory:
                                 kerns = self.toep_kerns[t:u, None, a2:b2, a:b].to(self.torch_dev)
                             else:
                                 kerns = toep_kerns[:, None, a2:b2, :]
                             MFBSx_os = torch.sum(kerns * FBSx_os[:, :, None, ...], dim=3)
-                            FMFBSx_os = sp_ifft(MFBSx_os, dim=tuple(range(-dim, 0)))
+                            FMFBSx_os = ifft(MFBSx_os, dim=tuple(range(-dim, 0)))
                             FMFBSx = padder.adjoint(FMFBSx_os)
 
                             # Apply adjoint sense/phase maps

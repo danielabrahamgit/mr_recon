@@ -1,12 +1,11 @@
-from typing import Optional, Literal
+from typing import Optional, Literal, Union
 from warnings import warn
-from einops import rearrange
+from einops import rearrange, einsum
 
 import numpy as np
 import sigpy as sp
 import sigpy.mri as mri
 import torch
-import torch.fft as fft
 from torchkbnufft import (
     KbNufft,
     KbNufftAdjoint,
@@ -15,6 +14,8 @@ from torchkbnufft import (
 )
 
 from mr_recon.algs import conjugate_gradient
+from mr_recon.fourier import fft
+from mr_recon.utils import np_to_torch, torch_to_np
 
 __all__ = [
     'truncate_trj_ksp',
@@ -24,19 +25,41 @@ __all__ = [
     'get_mps_kgrid_toep_pcg',
 ]
 
-def sp_fft(x, dim=None):
-    """Matches Sigpy's fft, but in torch"""
-    x = fft.ifftshift(x, dim=dim)
-    x = fft.fftn(x, dim=dim, norm='ortho')
-    x = fft.fftshift(x, dim=dim)
-    return x
 
-def sp_ifft(x, dim=None, norm=None):
-    """Matches Sigpy's fft adjoint, but in torch"""
-    x = fft.ifftshift(x, dim=dim)
-    x = fft.ifftn(x, dim=dim, norm='ortho')
-    x = fft.fftshift(x, dim=dim)
-    return x
+def calc_coil_subspace(ksp_mat: torch.Tensor,
+                       new_coil_size: Union[int, float],
+                       *args):
+
+    # Move to torch
+    np_flag = type(ksp_mat) is np.ndarray
+    ksp_mat = np_to_torch(ksp_mat)
+
+    # Estimate coil subspace
+    n_coil = ksp_mat.shape[0]
+    u, s, vt = torch.linalg.svd(ksp_mat.reshape((n_coil, -1)), full_matrices=False)
+    if new_coil_size is None:
+        new_coil_size = n_coil
+    elif type(new_coil_size) is float:
+        cmsm = torch.cumsum(s, dim=0)
+        n_coil = torch.argwhere(cmsm > new_coil_size * cmsm[-1]).squeeze()[0]
+    elif type(new_coil_size) is int:
+        n_coil = new_coil_size
+    coil_subspace = u[:, :n_coil]
+    coil_subspace.imag *= -1 # conj without .conj() for weird numpy conversion reasons
+
+    comps = []
+    for arg in args:
+        arg_torch = np_to_torch(arg)
+        arg_compressed = einsum(arg_torch, coil_subspace, 'nc ..., nc nc2 -> nc2 ...')
+        if np_flag:
+            arg_compressed = torch_to_np(arg_compressed)
+        comps.append(arg_compressed)
+
+    if len(comps) == 0:
+        return coil_subspace
+
+    else:
+        return [coil_subspace] + comps
 
 def convert_trj(trj, from_type, to_type, im_size = None):
     if (from_type == 'sigpy' or to_type == 'sigpy') and im_size == None:
@@ -92,7 +115,6 @@ def truncate_trj_ksp(trj, ksp, max_k, dcf: Optional[np.ndarray] = None):
         dcf_truncated = dcf[mask]
         return trj_truncated, ksp_truncated, dcf_truncated
     return trj_truncated, ksp_truncated
-
 
 def to_cartesian(trj, ksp, im_size, dcf: Optional[np.ndarray] = None):
     """Convert non-cartesian kspace to cartesian kspace
@@ -213,10 +235,9 @@ def synth_cal(trj, ksp, acs_size: int,
             img_cal = inverse_nufft_pcg(omega, ksp, cal_size, dcf=dcf, device=device, toeplitz=toeplitz)
             img_cal = img_cal[0] # remove batch dimension
 
-        ksp_cal = sp_fft(img_cal, dim=tuple(range(-D, 0)))
+        ksp_cal = fft(img_cal, dim=tuple(range(-D, 0)))
 
         return ksp_cal.detach().cpu().numpy()
-
 
 def inverse_nufft_pcg(omega, ksp, cal_size,
                       dcf=None,
@@ -253,7 +274,6 @@ def inverse_nufft_pcg(omega, ksp, cal_size,
     img_cal = conjugate_gradient(AHA=A_op,
                                  AHb=x_init)
     return img_cal
-
 
 def get_mps_kgrid_toep_pcg(
         ksp, trj, im_size,

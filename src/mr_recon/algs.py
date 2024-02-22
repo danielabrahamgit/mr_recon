@@ -1,40 +1,87 @@
 import time
 import torch
+import sigpy as sp
 import torch.nn as nn
 
 from tqdm import tqdm
 from typing import Optional
+from einops import rearrange
+from mr_recon.utils import torch_to_np, np_to_torch
 
 def density_compensation(trj: torch.Tensor,
                          im_size: tuple,
                          num_iters: Optional[int] = 30):
     raise NotImplementedError
 
-def largest_eigenvalue(A: nn.Module,
-                       x0: torch.Tensor,
-                       num_iters: Optional[int] = 15,
-                       verbose: Optional[bool] = True) -> float:
+def power_method_matrix(M: torch.Tensor,
+                        vec_init: Optional[torch.Tensor] = None,
+                        num_iter: Optional[int] = 100,
+                        verbose: Optional[bool] = True) -> (torch.Tensor, torch.Tensor):
     """
-    Estimates the largest eigenvalue of A.
+    Uses power method to find largest eigenvalue and corresponding eigenvector
 
-    Parameters
-    ----------
-    A : nn.Module
-        Linear operator, input shape and output shape should be the same
-    x0 : torch.tensor
-        Initial guess of largest eigenvector
-    num_iters : int
-        Number of iterations
+    Parameters:
+    -----------
+    M : torch.Tensor
+        input matrix with shape (..., n, n)
+    vec_init : torch.Tensor
+        initial guess of eigenvector with shape (..., n)
+    num_iter : int
+        number of iterations to run power method
     verbose : bool
-        toggles print statements
+        toggles progress bar
+    
+    Returns:
+    --------
+    eigen_vec : torch.Tensor
+        eigenvector with shape (..., n)
+    eigen_val : torch.Tensor
+        eigenvalue with shape (...)
+    """
+    # Consts
+    n = M.shape[-1]
+    assert M.shape[-2] == n
+    assert M.ndim >= 2
 
-    Returns
-    ---------
-    lamda_max : float
-        Largest eigenvalue of A
+    if vec_init:
+        eigen_vec = vec_init[..., None]
+    else:
+        eigen_vec = torch.ones((*M.shape[:-1], 1), device=M.device, dtype=M.dtype)
+    for i in tqdm(range(num_iter), 'Power Iterations', disable=not verbose):
+        eigen_vec = M @ eigen_vec
+        eigen_val = torch.linalg.norm(eigen_vec, axis=-2, keepdims=True)
+        eigen_vec = eigen_vec / eigen_val
+    eigen_vec = rearrange(eigen_vec, '... n 1 -> n ...')
+    
+    return eigen_vec, eigen_val.squeeze()
+
+def power_method_operator(A: callable,
+                          x0: torch.Tensor,
+                          num_iter: Optional[int] = 15,
+                          verbose: Optional[bool] = True) -> (torch.Tensor, float):
+    """
+    Uses power method to find largest eigenvalue and corresponding eigenvector
+
+    Parameters:
+    -----------
+    A : callable
+        linear operator
+    vec_init : torch.Tensor
+        initial guess of eigenvector with shape (*vec_shape)
+    num_iter : int
+        number of iterations to run power method
+    verbose : bool
+        toggles progress bar
+    
+    Returns:
+    --------
+    eigen_vec : torch.Tensor
+        eigenvector with shape (*vec_shape)
+    eigen_val : float
+        eigenvalue
     """
     
-    for _ in tqdm(range(num_iters), 'Max Eigenvalue', disable=not verbose):
+    for _ in tqdm(range(num_iter), 'Max Eigenvalue', disable=not verbose):
         
         z = A(x0)
         ll = torch.norm(z)
@@ -44,6 +91,54 @@ def largest_eigenvalue(A: nn.Module,
         print(f'Max Eigenvalue = {ll}')
     
     return ll.item()
+
+def lin_solve(AHA: torch.Tensor, 
+              AHb: torch.Tensor, 
+              lamda: Optional[float] = 0.0, 
+              solver: Optional[int] = 'lstsq'):
+    """
+    Solves (AHA + lamda I) @ x = AHb for x
+
+    Parameters:
+    -----------
+    AHA : torch.Tensor
+        square matrix with shape (..., n, n)
+    AHb : torch.Tensor
+        matrix with shape (..., n, m)
+    lamda : float
+        optional L2 regularization 
+    solver : str
+        'pinv' - pseudo inverse 
+        'lstsq' - least squares
+        'inv' - regular inverse
+    
+    Returns:
+    --------
+    x : torch.Tensor
+        solution with shape (..., n, m)
+    """
+    I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
+    tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
+    AHA += lamda * I[tup]
+    if solver == 'lstsq_torch':
+        x = torch.linalg.lstsq(AHA, AHb, rcond=None).solution
+    elif solver == 'lstsq':
+        n, m = AHb.shape[-2:]
+        AHA_cp = torch_to_np(AHA).reshape(-1, n, n)
+        AHb_cp = torch_to_np(AHb).reshape(-1, n, m)
+        dev = sp.get_device(AHA_cp)
+        with dev:
+            x = dev.xp.zeros_like(AHb_cp)
+            for i in range(AHA_cp.shape[0]):
+                x[i] = dev.xp.linalg.lstsq(AHA_cp[i], AHb_cp[i], rcond=None)[0]
+        x = np_to_torch(x).reshape(AHb.shape)
+    elif solver == 'pinv':
+        x = torch.linalg.pinv(AHA, hermitian=True) @ AHb
+    elif solver == 'inv':
+        x = torch.linalg.inv(AHA) @ AHb
+    else:
+        raise NotImplementedError
+    return x
 
 def FISTA(AHA: nn.Module, 
           AHb: torch.Tensor, 

@@ -4,16 +4,14 @@ import sigpy as sp
 from tqdm import tqdm
 from typing import Optional, Union
 from einops import rearrange, einsum
-from fast_pytorch_kmeans import KMeans
-from mr_recon.utils.func import (
-    batch_iterator, 
+from mr_recon.utils import (
     torch_to_np, 
     np_to_torch,
-    sp_fft,
-    sp_ifft,
     apply_window,
-    lin_solve
+    quantize_data
 )
+from mr_recon.fourier import fft, ifft
+from mr_recon.algs import lin_solve
 
 def bases(x, y, z):
         assert x.shape == y.shape
@@ -321,15 +319,21 @@ class field_handler:
         self.verbose = verbose
         self.spatial_batch_size = 2 ** 8
 
+        # Store flattened version without more memory
+        self.phis_flt = rearrange(phis, 'nbasis ... -> nbasis (...)')
+        self.alphas_flt = rearrange(alphas, '... nbasis -> (...) nbasis')
+
         if 'ts' in method.lower():
             # Compute time segmentation
-            self.betas = self._quantize_data(alphas.reshape((-1, self.nbasis)), 
+            self.betas = quantize_data(alphas.reshape((-1, self.nbasis)), 
                                              nseg, method=quant_type)
-            self.interp_coeffs = self._calc_temporal_interpolators(self.betas, interp_type)
+            self.temporal_funcs = self._calc_temporal_interpolators(self.betas, interp_type)
+            self.temporal_funcs_flt = rearrange(self.temporal_funcs, '... nseg -> nseg (...)')
         elif 'fs' in method.lower():
-            self.thetas = self._quantize_data(phis.reshape((self.nbasis, -1)).T, 
+            self.thetas = quantize_data(phis.reshape((self.nbasis, -1)).T, 
                                               nseg, method=quant_type)
-            self.interp_coeffs = self._calc_spatial_interpolators(self.thetas, interp_type)
+            self.spatial_funcs = self._calc_spatial_interpolators(self.thetas, interp_type)
+            self.spatial_funcs_flt = rearrange(self.spatial_funcs, 'nseg ... -> nseg (...)')
         else:
             raise NotImplementedError
 
@@ -356,7 +360,7 @@ class field_handler:
         phis_rs = torch.pi * self.phis / mxs[tup]
 
         # FFT
-        PHI = sp_fft(torch.exp(1j * phis_rs), dim=tuple(range(-ndim, 0)))
+        PHI = fft(torch.exp(1j * phis_rs), dim=tuple(range(-ndim, 0)))
 
         # Zero pad/chop
         PHI_sp = torch_to_np(PHI)
@@ -370,13 +374,14 @@ class field_handler:
         PHI_rs = np_to_torch(PHI_rs)
 
         # Recover phis
-        phis_rs = sp_ifft(PHI_rs, dim=tuple(range(-ndim, 0)))
+        phis_rs = ifft(PHI_rs, dim=tuple(range(-ndim, 0)))
         phis_new = mxs[tup] * torch.angle(phis_rs) / torch.pi
 
         self.phis = phis_new
 
     def get_spatial_funcs(self,
-                          segs: Optional[torch.Tensor] = slice(None)):
+                          segs: Optional[torch.Tensor] = slice(None),
+                          r_inds: Optional[torch.Tensor] = None):
         """
         Gets spatial basis functons at given segments
 
@@ -385,26 +390,38 @@ class field_handler:
         segs : torch.Tensor <int>
             segments with shape (N,) where N <= self.nseg, 
             seg[i] in [0, ..., self.nseg]
+        r_inds : torch.Tensor <int>
+            Optionally selects subset of spatial inds.
+            Spatial indices are for flattened spatial terms, shape is (Nr,)
         
         Returns:
         --------
         spatial_funcs : torch.tensor <complex64>
             spatial basis functions with shape (len(segs), N_{ndim-1}, ..., N_0)
+            OR, if r_inds is given
+            spatial basis functions with shape (len(segs), len(r_inds))
         """
 
         if 'ts' in self.method:
-            phase = einsum(self.phis, self.betas[segs], 'nbasis ..., nseg nbasis -> nseg ...')
+            if r_inds is None:
+                phase = einsum(self.phis, self.betas[segs], 'nbasis ..., nseg nbasis -> nseg ...')
+            else:
+                phase = einsum(self.phis_flt[:, r_inds], self.betas[segs], 'nbasis R, nseg nbasis -> nseg R')
             phase_maps = torch.exp(-2j * torch.pi * phase)
             spatial_funcs = phase_maps.type(torch.complex64)
         elif 'fs' in self.method:
-            spatial_funcs = self.interp_coeffs[segs]
+            if r_inds is None:
+                spatial_funcs = self.spatial_funcs[segs]
+            else:
+                spatial_funcs = self.spatial_funcs_flt[segs, r_inds]
         else:
             raise NotImplementedError
 
         return spatial_funcs
 
     def get_temporal_funcs(self,
-                           segs: Optional[torch.Tensor] = slice(None)):
+                           segs: Optional[torch.Tensor] = slice(None),
+                           t_inds: Optional[torch.Tensor] = None):
         """
         Gets temporal functions at given segments
 
@@ -413,18 +430,30 @@ class field_handler:
         segs : torch.Tensor <int>
             segments with shape (N,) where N <= self.nseg, 
             seg[i] in [0, ..., self.nseg]
+        t_inds : torch.Tensor <int>
+            Optionally selects subset of temporal inds.
+            Temporal indices are for flattened temporal terms, shape is (Nt,)
         
         Returns:
         --------
         temporal_funcs : torch.tensor <float32>
             temporal functions 'h_l(t)' with shape (*trj_size, len(segs))
+            OR, if t_inds is given
+            temporal functions 'h_l(t)' with shape (len(t_inds), len(segs))
         """
 
         if 'ts' in self.method:
-            temporal_funcs = self.interp_coeffs[..., segs]
+            if t_inds is None:
+                temporal_funcs = self.temporal_funcs[..., segs]
+            else:
+                temporal_funcs = self.temporal_funcs_flt[t_inds, segs]
         elif 'fs' in self.method:
-            phase = einsum(self.alphas, self.thetas[segs], 
-                           '... nbasis, nseg nbasis -> ... nseg')
+            if t_inds is None:
+                phase = einsum(self.alphas, self.thetas[segs], 
+                            '... nbasis, nseg nbasis -> ... nseg')
+            else:
+                phase = einsum(self.alphas_flt[t_inds], self.thetas[segs], 
+                            'T nbasis, nseg nbasis -> T nseg')
             phase = torch.exp(-2j * torch.pi * phase)
             temporal_funcs = phase.type(torch.complex64)
         else:
@@ -432,7 +461,59 @@ class field_handler:
 
         return temporal_funcs
 
+    def get_grog_features(self):
+
+        alpha_vecs = self.alphas # *trj_size nbasis
+        temporal_functions = self.get_temporal_funcs() # *trj_size nseg
+        grog_features = torch.hstack([alpha_vecs, temporal_functions.real])
+        imag_nrm = torch.sum(torch.abs(temporal_functions.imag))
+        if imag_nrm > 1e-9:
+            grog_features = torch.hstack([grog_features, temporal_functions.imag])
+        return grog_features
+
     def phase_est(self,
+                  r_inds: torch.Tensor,
+                  t_inds: torch.Tensor,
+                  lowrank: Optional[bool] = False) -> torch.Tensor:
+        """
+        Estimates phase at given spatial/temporal points.
+         
+        If lowrank:
+
+            e^{-j 2pi phi(r, t)} = sum_l b_l(r) * h_l(t)
+        
+        Otherwise
+
+            e^{-j 2pi phi(r, t)} = e^{-j 2pi sum_k phis_k(r) * alphas_k(t)}
+
+        Parameters:
+        -----------
+        r_inds : torch.Tensor
+            spatial indices for flattened spatial terms, shape is (N,)
+        t_inds : tuple
+            temporal indices for flattened temporal terms, shape is (N,)
+        lowrank : bool
+            if True, uses low rank phase model
+        
+        Returns:
+        --------
+        phase_est : torch.Tensor
+            estimated phase with shape (N, )
+        """
+
+        if lowrank:
+            b = self.get_spatial_funcs(r_inds)
+            h = self.get_temporal_funcs(t_inds)
+            return einsum (b, h, 'nseg N, N nseg -> N')
+        else:
+            phi_chunk = self.phis_flt[:, r_inds]
+            alpha_chunk = self.alphas_flt[t_inds, :]
+            phase_chunk = einsum(phi_chunk, alpha_chunk, 'nbasis N, N nbasis -> N')
+            phase_est = torch.exp(-2j * torch.pi * phase_chunk)
+
+        return phase_est
+
+    def phase_est_slice(self,
                   r_slice: tuple, 
                   t_slice: tuple,
                   lowrank: Optional[bool] = False) -> torch.Tensor:
@@ -453,6 +534,8 @@ class field_handler:
             spatial indices with length len(im_size)
         t_slice : tuple
             temporal indices with length len(trj_size)
+        lowrank : bool
+            if True, uses low rank phase model
         
         Returns:
         --------
@@ -495,69 +578,6 @@ class field_handler:
             phase_est = torch.exp(-2j * torch.pi * phase_est)
 
         return phase_est
-
-    def _quantize_data(self,
-                       data: torch.Tensor,  
-                       K: int,
-                       method: Optional['str'] = 'uniform') -> torch.Tensor:
-        """
-        Given data of shape (..., d), finds K 'clusters' with shape (K, d)
-
-        Parameters:
-        -----------
-        data : torch.Tensor
-            data to quantize with shape (..., d)
-        K : int
-            number of clusters/quantization centers
-        method : str
-            selects the quantization method
-            'cluster' - uses k-means to optimally find centers
-            'uniform' - uniformly spaced bins
-        
-        Returns:
-        --------
-        centers : torch.Tensor
-            cluster/quantization centers with shape (K, d)
-        """
-
-        # Consts
-        torch_dev = data.device
-        d = data.shape[-1]
-        data_flt = data.reshape((-1, d))
-
-        # Cluster
-        if method == 'cluster':
-            max_iter = 1000
-            mode = 'euclidean'
-            verbose = 1
-            # mode = 'cosine'
-            if (torch_dev.index == -1) or (torch_dev.index is None):
-                kmeans = KMeans(n_clusters=K,
-                                max_iter=max_iter,
-                                verbose=verbose,
-                                mode=mode)
-                idxs = kmeans.fit_predict(data_flt)
-            else:
-                with torch.cuda.device(torch_dev):
-                    kmeans = KMeans(n_clusters=K,
-                                    max_iter=max_iter,
-                                    verbose=verbose,
-                                    mode=mode)
-                    idxs = kmeans.fit_predict(data_flt)
-            centers = kmeans.centroids
-
-        # Uniformly spaced time segments
-        else:
-            # TODO FIXME For higher dims, only works for d = 1
-            centers = torch.zeros((K, d), dtype=data.dtype, device=data.device)
-            for i in range(d):
-                lin = torch.linspace(start=data_flt[:, i].min(), 
-                                     end=data_flt[:, i].max(), 
-                                     steps=K + 1, 
-                                     device=torch_dev)
-                centers[:, i] = (lin[:-1] + lin[1:]) / 2
-
-        return centers
    
     def _calc_temporal_interpolators(self,
                                      betas: torch.Tensor,
@@ -632,8 +652,6 @@ class field_handler:
             
             # Reshape (nseg, T)
             interp_coeffs = x.T.reshape((*trj_size, nseg))
-            interp_coeffs = rearrange(x, 'nseg (nro npe ntr) -> nro npe ntr nseg',
-                                      nro=trj_size[0], npe=trj_size[1], ntr=trj_size[2])
             
         # Linear interpolator
         elif 'lin' in interp_type:
@@ -713,7 +731,7 @@ class field_handler:
 
             # Spatial batching
             batch_size = self.spatial_batch_size
-            for n1 in tqdm(range(0, phis_flt.shape[0], batch_size), 'Least Squares Interpolators', diable=not self.verbose):
+            for n1 in tqdm(range(0, phis_flt.shape[0], batch_size), 'Least Squares Interpolators', disable=not self.verbose):
                 n2 = min(n1 + batch_size, phis_flt.shape[0])
 
                 # Compute B matrix
@@ -759,8 +777,8 @@ class field_handler:
         assert len(self.im_size) == 2
 
         r_slice = (slice(None),) * 2
-        phase_est = self.phase_est(r_slice, t_slice, lowrank=True)
-        phase = self.phase_est(r_slice, t_slice, lowrank=False)
+        phase_est = self.phase_est_slice(r_slice, t_slice, lowrank=True)
+        phase = self.phase_est_slice(r_slice, t_slice, lowrank=False)
         vmin = torch.angle(phase).min() * 180 / torch.pi
         vmax = torch.angle(phase).max() * 180 / torch.pi
         plt.figure(figsize=(14,7))
@@ -803,8 +821,8 @@ class field_handler:
                 r_slice = (slice(None),) * (ndim - 1) + (slc,)
             else:
                 r_slice = (slice(None),) * ndim
-        phase = self.phase_est(r_slice, t_slice, lowrank=False).cpu()
-        phase_LR = self.phase_est(r_slice, t_slice, lowrank=True).cpu()
+        phase = self.phase_est_slice(r_slice, t_slice, lowrank=False).cpu()
+        phase_LR = self.phase_est_slice(r_slice, t_slice, lowrank=True).cpu()
         vmin = torch.angle(phase).min()
         vmax = torch.angle(phase).max()
 

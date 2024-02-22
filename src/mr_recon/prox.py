@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sigpy as sp
 
-from mr_recon.utils.block import Block
+from mr_recon.block import Block
 
 
 __all__ = [
