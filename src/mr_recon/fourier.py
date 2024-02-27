@@ -48,7 +48,7 @@ def ifft(x, dim=None, oshape=None, norm='ortho'):
 
 def calc_toep_kernel_helper(nufft_adj_os: callable,
                             trj: torch.Tensor,
-                            dcf: Optional[torch.Tensor] = None):
+                            weights: Optional[torch.Tensor] = None):
         """
         Calculate the Toeplitz kernels for the NUFFT
 
@@ -58,10 +58,8 @@ def calc_toep_kernel_helper(nufft_adj_os: callable,
             Performs adjoint NUFFT to oversampled image shape (*im_size_os)
         trj : torch.Tensor <float32>
             input trajectory with shape (N, *trj_batch, len(im_size))
-        dcf : torch.Tensor <float32>
-            density compensation function with shape (N, *trj_batch)
-        os_factor : float
-            oversampling factor for toeplitz
+        weights : torch.Tensor <float32>
+            weighting function with shape (N, *trj_batch)
 
         Returns:
         --------
@@ -72,17 +70,17 @@ def calc_toep_kernel_helper(nufft_adj_os: callable,
 
         # Consts
         torch_dev = trj.device
-        if dcf is None:
-            dcf = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
+        if weights is None:
+            weights = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
         else:
-            assert dcf.device == torch_dev
+            assert weights.device == torch_dev
         trj_batch = trj.shape[1:-1]
         N = trj.shape[0]
         d = trj.shape[-1]
         
         # Get toeplitz kernel via adjoint nufft on 1s ksp
         ksp = torch.ones((N, 1, *trj_batch), device=torch_dev, dtype=torch.complex64)
-        ksp_weighted = ksp * dcf[:, None, ...]
+        ksp_weighted = ksp * weights[:, None, ...]
         img = nufft_adj_os(ksp_weighted, trj)[:, 0, ...] # (N, *im_size_os)
 
         # FFT
@@ -94,7 +92,7 @@ class NUFFT(nn.Module):
 
     def __init__(self,
                  im_size: tuple,
-                 device_idx: Optional[int] = -1):
+                 device_idx: Optional[int] = None):
         """
         Parameters:
         -----------
@@ -105,7 +103,7 @@ class NUFFT(nn.Module):
         """
         super(NUFFT, self).__init__()
         self.im_size = im_size
-        if device_idx == -1:
+        if device_idx is None or device_idx == -1:
             self.torch_dev = torch.device('cpu')
         else:
             self.torch_dev = torch.device(device_idx)
@@ -179,7 +177,7 @@ class NUFFT(nn.Module):
 
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
-                              dcf: Optional[torch.Tensor] = None,
+                              weights: Optional[torch.Tensor] = None,
                               os_factor: Optional[float] = 2.0,):
         """
         Calculate the Toeplitz kernels for the NUFFT
@@ -188,8 +186,8 @@ class NUFFT(nn.Module):
         -----------
         trj : torch.Tensor <float32>
             input trajectory with shape (N, *trj_batch, len(im_size))
-        dcf : torch.Tensor <float32>
-            density compensation function with shape (N, *trj_batch)
+        weights : torch.Tensor <float32>
+            weighting function with shape (N, *trj_batch)
         os_factor : float
             oversampling factor for toeplitz
 
@@ -299,7 +297,8 @@ class sigpy_nufft(NUFFT):
             ksp = sp.util.resize(ksp, os_shape)
 
             # FFT
-            ksp = sp.fft(ksp, axes=range(-ndim, 0), norm=None)
+            # ksp = sp.fft(ksp, axes=range(-ndim, 0), norm=None)
+            ksp = torch_to_np(fft(np_to_torch(ksp), dim=tuple(range(-ndim, 0)), norm=None))
 
             # Interpolate
             trj_cp = _scale_coord(trj_cp, img_cp.shape, oversamp)
@@ -338,7 +337,8 @@ class sigpy_nufft(NUFFT):
             output /= width**ndim
 
             # IFFT
-            output = sp.ifft(output, axes=range(-ndim, 0), norm=None)
+            # output = sp.ifft(output, axes=range(-ndim, 0), norm=None)
+            output = torch_to_np(ifft(np_to_torch(output), dim=tuple(range(-ndim, 0)), norm=None))
 
             # Crop
             output = sp.util.resize(output, oshape)
@@ -351,7 +351,7 @@ class sigpy_nufft(NUFFT):
 
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
-                              dcf: Optional[torch.Tensor] = None,
+                              weights: Optional[torch.Tensor] = None,
                               os_factor: Optional[float] = 2.0,):
         """
         Calculate the Toeplitz kernels for the NUFFT
@@ -360,8 +360,8 @@ class sigpy_nufft(NUFFT):
         -----------
         trj : torch.Tensor <float32>
             input trajectory with shape (N, *trj_batch, len(im_size))
-        dcf : torch.Tensor <float32>
-            density compensation function with shape (N, *trj_batch)
+        weights : torch.Tensor <float32>
+            weighting function with shape (N, *trj_batch)
         os_factor : float
             oversampling factor for toeplitz
 
@@ -379,7 +379,7 @@ class sigpy_nufft(NUFFT):
         nufft_os = sigpy_nufft(im_size=im_size_os, device_idx=self.torch_dev.index, 
                                oversamp=self.oversamp, width=self.width)
 
-        return calc_toep_kernel_helper(nufft_os.adjoint, trj * os_factor, dcf)
+        return calc_toep_kernel_helper(nufft_os.adjoint, trj * os_factor, weights)
 
 class torchkb_nufft(NUFFT):
 
@@ -438,7 +438,7 @@ class torchkb_nufft(NUFFT):
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
-                              dcf: Optional[torch.Tensor] = None,
+                              weights: Optional[torch.Tensor] = None,
                               os_factor: Optional[float] = 2.0,):
         """
         Calculate the Toeplitz kernels for the NUFFT
@@ -447,8 +447,8 @@ class torchkb_nufft(NUFFT):
         -----------
         trj : torch.Tensor <float32>
             input trajectory with shape (N, *trj_batch, len(im_size))
-        dcf : torch.Tensor <float32>
-            density compensation function with shape (N, *trj_batch)
+        weights : torch.Tensor <float32>
+            weighting function with shape (N, *trj_batch)
         os_factor : float
             oversampling factor for toeplitz
 
@@ -465,8 +465,8 @@ class torchkb_nufft(NUFFT):
         # Make new instance of NUFFT with oversampled image size
         nufft_os = torchkb_nufft(im_size_os, device_idx=self.torch_dev.index)
 
-        return calc_toep_kernel_helper(nufft_os.adjoint, trj, dcf)
-
+        return calc_toep_kernel_helper(nufft_os.adjoint, trj, weights)
+    
 class gridded_nufft(NUFFT):
 
     def __init__(self,
@@ -510,7 +510,7 @@ class gridded_nufft(NUFFT):
         ksp = torch.zeros((*img.shape[:-d], *trj.shape[1:-1]), 
                           dtype=torch.complex64, device=img_torch.device)
         for i in range(N):
-            ksp[i] = multi_index(ksp_os[i], d, trj_torch[i])
+            ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
         
         return ksp
                     
@@ -549,7 +549,7 @@ class gridded_nufft(NUFFT):
         ksp_os = torch.zeros((*ksp.shape[:-(trj.ndim - 2)], *grid_os_size), 
                              dtype=torch.complex64, device=ksp_torch.device)
         for i in range(N):
-            ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i], grid_os_size)
+            ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), grid_os_size)
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
         img = self.grog_padder.adjoint(img_os)
 
@@ -557,7 +557,7 @@ class gridded_nufft(NUFFT):
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
-                              dcf: Optional[torch.Tensor] = None,
+                              weights: Optional[torch.Tensor] = None,
                               os_factor: Optional[float] = 1.0,):
         """
         Calculate the Toeplitz kernels for the NUFFT
@@ -566,8 +566,8 @@ class gridded_nufft(NUFFT):
         -----------
         trj : torch.Tensor <float32>
             input trajectory with shape (N, *trj_batch, len(im_size))
-        dcf : torch.Tensor <float32>
-            density compensation function with shape (N, *trj_batch)
+        weights : torch.Tensor <float32>
+            weighting function with shape (N, *trj_batch)
         os_factor : float
             oversampling factor for toeplitz
 
@@ -584,4 +584,4 @@ class gridded_nufft(NUFFT):
         # Make new instance of NUFFT with oversampled image size
         nufft_os = gridded_nufft(im_size_os, device_idx=self.torch_dev.index, grid_oversamp=self.grid_oversamp)
 
-        return calc_toep_kernel_helper(nufft_os.adjoint, (trj * os_factor).type(torch.int32), dcf)
+        return calc_toep_kernel_helper(nufft_os.adjoint, (trj * os_factor).type(torch.int32), weights)

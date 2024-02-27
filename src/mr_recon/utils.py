@@ -301,6 +301,8 @@ def normalize(shifted, target, ofs=True, mag=False):
     np.ndarray
         corrected data
     """
+    target = torch_to_np(target)
+    shifted = torch_to_np(shifted)
     try:
         if mag:
             col1 = np.abs(shifted).flatten()

@@ -90,7 +90,7 @@ def power_method_operator(A: callable,
     if verbose:
         print(f'Max Eigenvalue = {ll}')
     
-    return ll.item()
+    return x0, ll.item()
 
 def lin_solve(AHA: torch.Tensor, 
               AHb: torch.Tensor, 
@@ -214,7 +214,7 @@ def conjugate_gradient(AHA: nn.Module,
                        AHb: torch.Tensor, 
                        P: Optional[nn.Module] = None,
                        num_iters: Optional[int] = 10, 
-                       lamda_l2: Optional[float] = 1e-2,
+                       lamda_l2: Optional[float] = 0.0,
                        tolerance: Optional[float] = 1e-8,
                        verbose=True) -> torch.Tensor:
     """Conjugate gradient for complex numbers. The output is also complex.

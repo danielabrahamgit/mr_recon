@@ -6,8 +6,8 @@ import torch
 import numpy as np
 import sigpy as sp
 import sigpy.mri as mri
-from mr_recon.recon import recon
-from mr_recon.linop import subspace_linop
+from mr_recon.recons import recon
+from mr_recon.linops import subspace_linop
 from mr_recon.fourier import sigpy_nufft, torchkb_nufft, gridded_nufft
 from mr_recon.utils import np_to_torch, torch_to_np
 from einops import rearrange
@@ -60,8 +60,8 @@ trj = np_to_torch(trj).to(torch_dev)
 dcf = np_to_torch(dcf).to(torch_dev)
 
 # Batched method
-nfft = sigpy_nufft(im_size, device_idx=device_idx)
-# nfft = torchkb_nufft(im_size, device_idx=device_idx)
+# nfft = sigpy_nufft(im_size, device_idx=device_idx)
+nfft = torchkb_nufft(im_size, device_idx=device_idx)
 # nfft = gridded_nufft(im_size, device_idx=device_idx, grid_oversamp=1.0)
 trj = nfft.rescale_trajectory(trj)
 ksp_batched = nfft.forward(phantoms, trj)
