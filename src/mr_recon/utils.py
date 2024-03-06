@@ -28,6 +28,8 @@ def quantize_data(data: torch.Tensor,
     --------
     centers : torch.Tensor
         cluster/quantization centers with shape (K, d)
+    idxs : torch.Tensor <int>
+        indices of the closest center for each point with shape (...)
     """
 
     # Consts
@@ -58,19 +60,28 @@ def quantize_data(data: torch.Tensor,
 
     # Uniformly spaced time segments
     else:
-        # TODO FIXME For higher dims, only works for d = 1
-        centers = torch.zeros((K, d), dtype=data.dtype, device=data.device)
-        for i in range(d):
-            lin = torch.linspace(start=data_flt[:, i].min(), 
-                                    end=data_flt[:, i].max(), 
-                                    steps=K + 1, 
-                                    device=torch_dev)
-            centers[:, i] = (lin[:-1] + lin[1:]) / 2
+        assert d == 1, 'uniform quantization only works for 1D data'
 
-    return centers
+        # Pick clusters
+        centers = torch.zeros((K, d), dtype=data.dtype, device=data.device)
+        lin = torch.linspace(start=data_flt[:, 0].min(), 
+                                end=data_flt[:, 0].max(), 
+                                steps=K + 1, 
+                                device=torch_dev)
+        centers[:, 0] = (lin[:-1] + lin[1:]) / 2
+
+        # indices
+        idxs = torch.zeros_like(data_flt[:, 0], dtype=torch.int)
+        b = centers[0, 0]
+        m = centers[-1, 0]
+        idxs = torch.round((data_flt[:, 0] - b) / m).type(torch.int)
+
+    idxs = idxs.reshape(data.shape[:-1])
+
+    return centers, idxs
 
 def gen_grd(im_size: tuple, 
-            fovs: tuple) -> torch.Tensor:
+            fovs: Optional[tuple] = None) -> torch.Tensor:
     """
     Generates a grid of points given image size and FOVs
 
@@ -86,6 +97,8 @@ def gen_grd(im_size: tuple,
     grd : torch.Tensor
         grid of points with shape (*im_size, len(im_size))
     """
+    if fovs is None:
+        fovs = (1,) * len(im_size)
     lins = [
         fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2) / (im_size[i]) 
         for i in range(len(im_size))
@@ -301,6 +314,7 @@ def normalize(shifted, target, ofs=True, mag=False):
     np.ndarray
         corrected data
     """
+    is_torch = torch.is_tensor(shifted)
     target = torch_to_np(target)
     shifted = torch_to_np(shifted)
     try:
@@ -319,7 +333,11 @@ def normalize(shifted, target, ofs=True, mag=False):
             b = 0
             a = np.linalg.lstsq(np.array([col1]).T, y, rcond=None)[0]
 
-        return a * shifted + b
+        out = a * shifted + b
     except:
         print('Normalize Failed')
-        return shifted
+        out = shifted
+    
+    if is_torch:
+        out = np_to_torch(out)
+    return out

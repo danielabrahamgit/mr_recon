@@ -379,17 +379,20 @@ class sigpy_nufft(NUFFT):
         nufft_os = sigpy_nufft(im_size=im_size_os, device_idx=self.torch_dev.index, 
                                oversamp=self.oversamp, width=self.width)
 
-        return calc_toep_kernel_helper(nufft_os.adjoint, trj * os_factor, weights)
+        return calc_toep_kernel_helper(nufft_os.adjoint, trj * os_factor, weights) * (os_factor ** len(self.im_size))
 
 class torchkb_nufft(NUFFT):
 
     def __init__(self,
                  im_size: tuple,
-                 device_idx: Optional[int] = -1):
+                 device_idx: Optional[int] = -1,
+                 oversamp: Optional[float] = 2.0):
         super().__init__(im_size, device_idx)
-
-        self.kb_ob = KbNufft(im_size, device=self.torch_dev).to(self.torch_dev)
-        self.kb_adj_ob = KbNufftAdjoint(im_size, device=self.torch_dev).to(self.torch_dev)
+        
+        im_size_os = tuple([round(i * oversamp) for i in im_size])
+        self.kb_ob = KbNufft(im_size, device=self.torch_dev, grid_size=im_size_os).to(self.torch_dev)
+        self.kb_adj_ob = KbNufftAdjoint(im_size, device=self.torch_dev, grid_size=im_size_os).to(self.torch_dev)
+        self.oversamp = oversamp
 
     def rescale_trajectory(self,
                            trj: torch.Tensor) -> torch.Tensor:
@@ -416,7 +419,7 @@ class torchkb_nufft(NUFFT):
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
         ksp = self.kb_ob(image=img_torchkb, omega=omega, norm='ortho')
         ksp = ksp.reshape((N, *img.shape[1:-d], *trj.shape[1:-1]))
-        return ksp
+        return ksp * self.oversamp
 
     def adjoint(self,
                 ksp: torch.Tensor,
@@ -434,7 +437,7 @@ class torchkb_nufft(NUFFT):
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
         img = self.kb_adj_ob(data=ksp_torch_kb, omega=omega, norm='ortho')
         img = img.reshape((N, *ksp.shape[1:-(trj.ndim - 2)], *im_size))
-        return img
+        return img * self.oversamp
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
@@ -465,7 +468,7 @@ class torchkb_nufft(NUFFT):
         # Make new instance of NUFFT with oversampled image size
         nufft_os = torchkb_nufft(im_size_os, device_idx=self.torch_dev.index)
 
-        return calc_toep_kernel_helper(nufft_os.adjoint, trj, weights)
+        return calc_toep_kernel_helper(nufft_os.adjoint, trj, weights) * (os_factor ** len(self.im_size))
     
 class gridded_nufft(NUFFT):
 
@@ -512,7 +515,7 @@ class gridded_nufft(NUFFT):
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
         
-        return ksp
+        return ksp * self.grid_oversamp
                     
     def adjoint(self, 
                 ksp: torch.Tensor, 
@@ -553,12 +556,12 @@ class gridded_nufft(NUFFT):
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
         img = self.grog_padder.adjoint(img_os)
 
-        return img
+        return img * self.grid_oversamp
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
                               weights: Optional[torch.Tensor] = None,
-                              os_factor: Optional[float] = 1.0,):
+                              os_factor: Optional[float] = None):
         """
         Calculate the Toeplitz kernels for the NUFFT
 
@@ -569,7 +572,7 @@ class gridded_nufft(NUFFT):
         weights : torch.Tensor <float32>
             weighting function with shape (N, *trj_batch)
         os_factor : float
-            oversampling factor for toeplitz
+            oversampling factor for toeplitz (unused here)
 
         Returns:
         --------
@@ -579,9 +582,10 @@ class gridded_nufft(NUFFT):
         """
 
         # Consts
+        os_factor = self.grid_oversamp
         im_size_os = tuple([round(i * os_factor) for i in self.im_size])
 
         # Make new instance of NUFFT with oversampled image size
         nufft_os = gridded_nufft(im_size_os, device_idx=self.torch_dev.index, grid_oversamp=self.grid_oversamp)
 
-        return calc_toep_kernel_helper(nufft_os.adjoint, (trj * os_factor).type(torch.int32), weights)
+        return calc_toep_kernel_helper(nufft_os.adjoint, (trj * os_factor).type(torch.int32), weights) * (os_factor ** len(self.im_size))

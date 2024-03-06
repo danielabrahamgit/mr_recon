@@ -3,7 +3,7 @@ import torch
 import sigpy as sp
 
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, Tuple
 from einops import rearrange, einsum
 from torchkbnufft import KbNufftAdjoint
 from mr_recon.algs import power_method_matrix
@@ -16,7 +16,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
                      kernel_width: Optional[int] = 6,
                      crp: Optional[float] = 0.95,
                      max_iter: Optional[int] = 100,
-                     verbose: Optional[bool] = True) -> (torch.Tensor, torch.Tensor):
+                     verbose: Optional[bool] = True) -> Tuple(torch.Tensor, torch.Tensor):
     """
     Copy of sigpy implementation of ESPIRiT calibration, but in torch:
     Martin Uecker, ... ESPIRIT - An Eigenvalue Approach to Autocalibrating Parallel MRI
@@ -104,7 +104,7 @@ def csm_from_kernels(grappa_kernels: torch.Tensor,
                      im_size: tuple,
                      crp: Optional[float] = 0.95,
                      num_iter: Optional[int] = 100,
-                     verbose: Optional[bool] = True) -> (torch.Tensor, torch.Tensor):
+                     verbose: Optional[bool] = True) -> Tuple(torch.Tensor, torch.Tensor):
     """
     Estimates coil sensitivty maps from grappa kernels
 

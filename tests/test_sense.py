@@ -15,7 +15,7 @@ from mr_recon.fourier import sigpy_nufft, gridded_nufft
 im_size = (220, 220)
 ninter = 16
 ncoil = 32
-R = 8
+R = 4
 lamda_l2 = 1e-3 * 0
 max_iter = 100
 device_idx = 4
@@ -32,7 +32,7 @@ trj = mri.spiral(fov=1,
                  gm=40e-3,
                  sm=100)
 trj = trj.reshape((-1, ninter, 2), order='F')[:, ::round(R), :]
-trj = np.round(trj)
+# trj = np.round(trj)
 mps = mri.birdcage_maps((ncoil, *im_size), r=1.2)
 dcf = sp.to_device(mri.pipe_menon_dcf(trj, im_size, device=sp.Device(device_idx)))
 dcf /= dcf.max()

@@ -6,23 +6,23 @@ import sigpy as sp
 from tqdm import tqdm
 from typing import Optional, Union
 from einops import rearrange, einsum
-from mr_recon.imperfections.motion_op_torch import rigid_motion
 from mr_recon.utils import (
     batch_iterator, 
     torch_to_np, 
     np_to_torch,
     apply_window,
     rotation_matrix,
-    quantize_data
+    quantize_data,
+    gen_grd
 )
 from mr_recon.fourier import fft, ifft
-from mr_recon.algs import lin_solve
 
 class motion_handler:
 
     def __init__(self,
                  motion_params: torch.Tensor,
-                 mps: torch.Tensor,
+                 mps_unmasked: torch.Tensor,
+                 mask: torch.Tensor,
                  nseg: int,
                  method: Optional[str] = 'ts',
                  interp_type: Optional[str] = 'zero',
@@ -40,10 +40,13 @@ class motion_handler:
         -----------
         motion_params : torch.Tensor
             The motion parameters with shape (*trj_size, 6). 
-            First three motion params are translations in x, y, z in mm. 
+            First three motion params are translations in x, y, z in meters. 
             Last three motion params are rotations in x, y, z in degrees.
-        mps : torch.Tensor
+        mps_unmasked : torch.Tensor
             The coil sensitivity maps with shape (nc, *im_size)
+            Make sure these are unmasked!
+        mask : torch.Tensor
+            The mask with shape (*im_size)
         nseg : int
             number of segments
         method : str
@@ -59,25 +62,31 @@ class motion_handler:
         verbose : bool
             toggles print statements
         """
-        msg = 'mps and motion params must be on the same device'
-        assert mps.device == motion_params.device, msg
+        assert mps_unmasked.device == motion_params.device
+        assert mps_unmasked.device == mask.device
 
         self.motion_params = motion_params
-        self.mps = mps
+        self.mps = mps_unmasked
+        self.mask = mask
         self.nseg = nseg
-        self.torch_dev = mps.device
+        self.torch_dev = mps_unmasked.device
         self.method = method.lower()
         self.interp_type = interp_type.lower()
         self.trj_size = motion_params.shape[:-1]
-        self.im_size = mps.shape[1:]
+        self.im_size = mps_unmasked.shape[1:]
         self.verbose = verbose
         self.spatial_batch_size = 2 ** 8
 
+        # Cluster motion states
+        self.motion_clusters = quantize_data(motion_params.reshape((-1, self.nbasis)), 
+                                                nseg, method=quant_type)
+        
         if 'ts' in method.lower():
             # Compute time segmentation
-            self.motion_clusters = self._quantize_data(motion_params.reshape((-1, self.nbasis)), 
-                                                       nseg, method=quant_type)
             self.interp_coeffs = self._calc_motion_interpolators(self.motion_clusters, interp_type)
+        elif 'svd' in method.lower():
+            # Compute SVD based splitting
+            self.
         else:
             raise NotImplementedError
     
@@ -109,7 +118,6 @@ class motion_handler:
         motion_params = self.motion_params
         trj_size = trj.shape[:-1]
         assert ksp.shape[1:] == trj_size, "Trajectory and k-space data must have same shape"
-        assert is_broadcastable(motion_params.shape, trj_size), "Motion parameters must have broadcastable shape to trajectory"
 
         # Correct for rotation
         rots = motion_params[..., 3:]
@@ -132,126 +140,154 @@ class motion_handler:
         ksp_rot = ksp * torch.exp(-2j * torch.pi * dot)
 
         return trj_rot, ksp_rot
+
+class motion_op(torch.nn.Module):
     
-    def _gen_grid(self) -> Union[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __init__(self,
+                 im_size: tuple,
+                 fovs: Optional[tuple] = None):
         """
-        Generates grids needed for 3 shear model
+        Parameters:
+        -----------
+        im_size : tuple
+            The image dimensions
+        fovs : tuple
+            The field of views, same size as im_size
+        """
+        super(motion_op, self).__init__()
+
+        # Consts
+        d = len(im_size)
+        assert d == len(fovs)
+        assert d == 2 or d == 3
+        if fovs is None:
+            fovs = (1,) * d
+    
+        # Gen grid
+        fovsk = tuple([im_size[i] / fovs[i] for i in range(d)])
+        rgrid = gen_grd(im_size, fovs=fovs) # ... d from (-FOV/2, FOV/2)
+        kgrid = 2 * torch.pi * gen_grd(im_size, fovsk) # ... d from (-N/2, N/2) / FOV
+        if d == 2:
+            rgrid = torch.cat((rgrid, rgrid[..., :1] * 0), dim=-1) # ... 3
+            kgrid = torch.cat((kgrid, kgrid[..., :1] * 0), dim=-1) # ... 3
+        # Save
+        self.im_size = im_size
+        self.rgrid = rgrid.type(torch.float32)
+        self.kgrid = kgrid.type(torch.float32)
+        self.U = None
+        self.V = None
+    
+    def _build_U(self,
+                 translations: torch.Tensor) -> torch.Tensor:
+        """
+        Builds U terms from translation parameters
+
+        Parameters:
+        -----------
+        translations : torch.Tensor
+            The translations with shape (N, 3), x y z in meters
 
         Returns:
         --------
-        rGrids : torch.Tensor
-            The real space grid
-        kGrids : torch.Tensor
-            The k-space grid
-        rkGrids : torch.Tensor
-            The hybrid-space grid
+        U : torch.Tensor
+            The U terms with shape (N, *im_size)
         """
-        rGrids = []
-        kGrids = []
-        rkGrids = []
-        for ax_ in range(len(ishape)):
-            min_k = -np.floor(ishape[ax_] / 2) 
-            max_k = np.ceil(ishape[ax_] / 2) 
-            Nk = max_k - min_k
-            
-            r_m = torch.arange(min_k, max_k, 1)
-            if len(r_m)== 0:
-                r_m = torch.Tensor([0.])
-            kGrids.append(2 / Nk * np.pi * r_m)
-            rGrids.append(r_m)
 
-        per =  [ [0, 2, 1], [1, 0, 2] ]
-        for ii in range(2):
-            rk = []
-            for jj in range(3):
-                rk.append( torch.outer(kGrids[per[ii][jj]], rGrids[per[1-ii][jj]]) )
-            rkGrids.append(rk)
-            
-        return rGrids, kGrids, rkGrids
- 
-    # def _calc_motion_interpolators(self,
-    #                                motion_clusters: torch.Tensor,
-    #                                interp_type: Optional[str] = 'zero') -> torch.Tensor:
-    #     """
-    #     Calculates motion interpolation coefficients h_l(motion_params) 
-    #     from the following model:
+        return torch.exp(-1j * einsum(self.kgrid, translations.type(torch.float32), 
+                                      '... out, N out -> N ...'))
+    
+    def _build_V(self,
+                 rotations: torch.Tensor) -> torch.Tensor:
+        """
+        Builds V terms from rotation parameters
+
+        Parameters:
+        -----------
+        rotations : torch.Tensor
+            The rotations with shape (N, 3), x y z in degrees
+
+        Returns:
+        --------
+        V : torch.Tensor
+            The V terms with shape (6, N, *im_size)
+        """
+
+        roations_radians = torch.deg2rad(rotations).type(torch.float32)
+        v_1_tan = torch.tan(roations_radians[:, 0] / 2) * \
+                  self.kgrid[None, ..., 1] * self.rgrid[None, ..., 2]
+        v_1_sin = torch.sin(roations_radians[:, 0]) * \
+                  -self.kgrid[None, ..., 2] * self.rgrid[None, ..., 1]
+        v_2_tan = torch.tan(roations_radians[:, 1] / 2) * \
+                  self.kgrid[None, ..., 2] * self.rgrid[None, ..., 0]
+        v_2_sin = torch.sin(roations_radians[:, 1]) * \
+                  -self.kgrid[None, ..., 0] * self.rgrid[None, ..., 2]
+        v_3_tan = torch.tan(roations_radians[:, 2] / 2) * \
+                  self.kgrid[None, ..., 0] * self.rgrid[None, ..., 1]
+        v_3_sin = torch.sin(roations_radians[:, 2]) * \
+                  -self.kgrid[None, ..., 1] * self.rgrid[None, ..., 0]
+        V = torch.stack((v_1_tan, v_1_sin,
+                         v_2_tan, v_2_sin,
+                         v_3_tan, v_3_sin), dim=0)
+        V = torch.exp(1j * V)
+        return V
+
+    def forward(self,
+                img: torch.Tensor,
+                motion_params: torch.Tensor) -> torch.Tensor:
+        """
+        Applies motion operation to the image
         
-    #     mps(Rotate_theta(r - t)) = sum_l h_l(theta, t) * mps(Rotate_theta_l(r - t_l))
+        Parameters:
+        -----------
+        img : torch.tensor
+            The image with shape (..., *im_size)
+        motion_params : torch.Tensor
+            The motion parameters with shape (N, 6). 
+            First three motion params are translations in x, y, z in meters. 
+            Last three motion params are rotations in x, y, z in degrees.
+        """
 
-    #     Parameters:
-    #     -----------
-    #     motion_clusters : torch.tensor <float32>
-    #         motion segmentation coeffs with shape (nseg, 6)
-    #     interp_type : str
-    #         interpolator type from the list
-    #             'zero' - zero order interpolator
-    #             'linear' - linear interpolator 
-    #             'lstsq' - least squares interpolator
+        # Consts
+        d = len(self.im_size)
+        assert img.shape[-d:] == self.im_size
+
+        # Build U and V operators
+        if self.U is None or self.V is None:
+            U = self._build_U(motion_params[:, :3]) # (N *im_size)
+            V = self._build_V(motion_params[:, 3:]) # (6, N, *im_size)
+        else:
+            U = self.U
+            V = self.V
+
+        # Add empty dims
+        img_nbatch_dims = len(img.shape) - d
+        tup = (slice(None),) * img_nbatch_dims + (None,) + (slice(None),) * d
+        img = img[tup] # (... 1 *im_size)
+        if d == 2:
+            img = img[..., None]
+            V = V[..., None]
+            U = U[..., None]
+            
+        # Apply V
+        V_dims = [
+            4, 5, 4,
+            2, 3, 2,
+            0, 1, 0
+        ]
+        ft_dims = [
+            -3, -2, -3,
+            -1, -3, -1,
+            -2, -1, -2
+        ]
+        for i in range(9):
+            img = ifft(V[V_dims[i]] * fft(img, dim=ft_dims[i]), dim=ft_dims[i])
+
+        # Apply U
+        dims = tuple(range(-3, 0))
+        img = ifft(U * fft(img, dim=dims), dim=dims)
         
-    #     Returns:
-    #     --------
-    #     interp_coeffs : torch.tensor <complex64>
-    #         interpolation coefficients 'h_l(t)' with shape (*trj_size, nseg)
-    #     """
+        # Remove empty dim 
+        if d == 2:
+            img = img[..., 0]
 
-    #     # Consts
-    #     assert self.torch_dev == motion_clusters.device
-    #     nseg = motion_clusters.shape[0]
-    #     trj_size = self.trj_size
-
-    #     # Least squares interpolator
-    #     if 'lstsq' in interp_type:
-
-    #         # Prep AHA, AHB matrices
-    #         motion_flt = rearrange(self.motion_params, '... 6 -> (...) 6').type(torch.float32)
-    #         mps_flt = rearrange(self.mps, 'nc ... -> nc (...)').type(torch.complex64)
-    #         AHA = torch.zeros((nseg, nseg), 
-    #                           dtype=torch.complex64, device=self.torch_dev)
-    #         AHb = torch.zeros((nseg, motion_flt.shape[0]), 
-    #                           dtype=torch.complex64, device=self.torch_dev)
-            
-    #         # Compute AHA and AHB in batches
-    #         N = mps_flt.shape[1]
-    #         batch_size = self.spatial_batch_size
-    #         for n1 in tqdm(range(0, N, batch_size), 'Least Squares Interpolators'):
-    #             n2 = min(n1 + batch_size, N)
-
-    #             # Accumulate AHA
-                
-    #             AHA += A_batch.H @ A_batch / (n2 - n1)
-
-    #             # Accumulate AHb
-                
-    #             AHb += A_batch.H @ B_batch / (n2 - n1)
-
-    #         # Solve for x = (AHA)^{-1} AHb
-    #         x = lin_solve(AHA, AHb, solver='pinv')
-            
-    #         # Reshape (nseg, T)
-    #         interp_coeffs = x.T.reshape((*trj_size, nseg))
-            
-    #     # Linear interpolator
-    #     elif 'lin' in interp_type:
-    #         raise NotImplementedError
-        
-    #     # Zero order hold/nearest interpolator
-    #     else:
-        
-    #         # Empty return coefficients
-    #         interp_coeffs = torch.zeros((*trj_size, nseg), dtype=torch.float32, device=self.torch_dev)
-
-    #         # Find closest points
-    #         tup = (slice(None),) + (None,) * (self.alphas.ndim - 1) + (slice(None),)
-    #         inds = torch.argmin(
-    #             torch.linalg.norm(self.alphas[None, ...] - betas[tup], dim=-1),
-    #             dim=0) # *trj_size -> values in [0, ..., nseg-1]
-            
-    #         # Indicator function
-    #         for i in range(nseg):
-    #             interp_coeffs[..., i] = 1.0 * (inds == i)
-            
-    #         del inds
-
-    #     return interp_coeffs.type(torch.complex64)
-  
-   
+        return img

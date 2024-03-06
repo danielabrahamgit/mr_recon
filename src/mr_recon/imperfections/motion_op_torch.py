@@ -1,192 +1,206 @@
-# +
-import sigpy as sp
-from sigpy.linop import Linop 
-import copy
-import numpy as np
-
 import torch
-from torch import nn
-import torch.nn.functional as F
-from typing import List, Tuple, Optional
-import copy
 
-def generate_grids(ishape):
+from typing import Optional
+from einops import einsum
+from torch import fft as fft_torch
+
+def gen_grd(im_size: tuple, 
+            fovs: Optional[tuple] = None) -> torch.Tensor:
     """
-    Generate spatio, temporal and spatio-temporal grids for a cubic image of shape Nkm.
+    Generates a grid of points given image size and FOVs
+
+    Parameters:
+    -----------
+    im_size : tuple
+        image dimensions
+    fovs : tuple
+        field of views, same size as im_size
     
-    ishape : tuple
-        input array shape, make sure dimension sizes are even
-    
+    Returns:
+    --------
+    grd : torch.Tensor
+        grid of points with shape (*im_size, len(im_size))
     """
-    rGrids = []
-    kGrids = []
-    rkGrids = []
-    for ax_ in range(len(ishape)):
-        min_k = -np.floor(ishape[ax_] / 2) 
-        max_k = np.ceil(ishape[ax_] / 2) 
-        Nk = max_k - min_k
+    if fovs is None:
+        fovs = (1,) * len(im_size)
+    lins = [
+        fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2) / (im_size[i]) 
+        for i in range(len(im_size))
+        ]
+    grds = torch.meshgrid(*lins, indexing='ij')
+    grd = torch.cat(
+        [g[..., None] for g in grds], dim=-1)
         
-        r_m = torch.arange(min_k, max_k, 1)
-        if len(r_m)== 0:
-            r_m = torch.Tensor([0.])
-        kGrids.append(2 / Nk * np.pi * r_m)
-        rGrids.append(r_m)
+    return grd
 
-    per =  [ [0, 2, 1], [1, 0, 2] ]
-    for ii in range(2):
-        rk = []
-        for jj in range(3):
-            rk.append( torch.outer(kGrids[per[ii][jj]], rGrids[per[1-ii][jj]]) )
-        rkGrids.append(rk)
-        
-    return rGrids, kGrids, rkGrids
+def fft(x, dim=None, norm='ortho'):
+    """Matches Sigpy's fft, but in torch"""
+    x = fft_torch.ifftshift(x, dim=dim)
+    x = fft_torch.fftn(x, dim=dim, norm=norm)
+    x = fft_torch.fftshift(x, dim=dim)
+    return x
 
-class rigid_motion(nn.Module):
+def ifft(x, dim=None, norm='ortho'):
+    """Matches Sigpy's fft adjoint, but in torch"""
+    x = fft_torch.ifftshift(x, dim=dim)
+    x = fft_torch.ifftn(x, dim=dim, norm=norm)
+    x = fft_torch.fftshift(x, dim=dim)
+    return x
 
-    def __init__(self, 
-                 ishape: tuple,
-                 pad: Optional[bool] = False):
-        """
-        Sinc-interpolated 2D or 3D rotation operating in k-space.
-
-        ishape : tuple dimensions [batch_size, x, y(, z)]
-            input images are expected to be 2d or 3d tensors
-        pad : bool, optional 
-            whether to pad the input image to get a cubic tensor
-        """
-        super(rigid_motion, self).__init__()
+class motion_op(torch.nn.Module):
     
-        self.pad = False
-        if (len(ishape) == 2):
-            # add mock batch dimension
-            ishape = (1, ishape[0], ishape[1])
-        if (len(ishape) == 3):
-            if (ishape[-1] != ishape[-2]):
-                print('WARNING: input array will be padded to get a square array')
-                self.pad = True
-            self.padshape = (max(ishape), max(ishape), 1)
-        elif (len(ishape) == 4):
-            if (ishape[-1] != ishape[-2] or ishape[-2] != ishape[-3]):
-                print('WARNING: input array will be padded to get a cubic array')
-                self.pad = True
-            self.padshape = (max(ishape), max(ishape), max(ishape))
+    def __init__(self,
+                 im_size: tuple,
+                 fovs: Optional[tuple] = None,
+                 reuse_UV: Optional[bool] = False):
+        """
+        Parameters:
+        -----------
+        im_size : tuple
+            The image dimensions
+        fovs : tuple
+            The field of views, same size as im_size
+        reuse_UV : bool
+            Whether to reuse U and V operators after consecutive calls
+        """
+        super(motion_op, self).__init__()
+
+        # Consts
+        d = len(im_size)
+        assert d == len(fovs)
+        assert d == 2 or d == 3
+        if fovs is None:
+            fovs = (1,) * d
+    
+        # Gen grid
+        fovsk = tuple([im_size[i] / fovs[i] for i in range(d)])
+        rgrid = gen_grd(im_size, fovs=fovs) # ... d from (-FOV/2, FOV/2)
+        kgrid = 2 * torch.pi * gen_grd(im_size, fovsk) # ... d from (-N/2, N/2) / FOV
+        if d == 2:
+            rgrid = torch.cat((rgrid, rgrid[..., :1] * 0), dim=-1) # ... 3
+            kgrid = torch.cat((kgrid, kgrid[..., :1] * 0), dim=-1) # ... 3
+        # Save
+        self.im_size = im_size
+        self.rgrid = rgrid.type(torch.float32)
+        self.kgrid = kgrid.type(torch.float32)
+        self.U = None
+        self.V = None
+        self.reuse_UV = reuse_UV
+    
+    def _build_U(self,
+                 translations: torch.Tensor) -> torch.Tensor:
+        """
+        Builds U terms from translation parameters
+
+        Parameters:
+        -----------
+        translations : torch.Tensor
+            The translations with shape (N, 3), x y z in meters
+
+        Returns:
+        --------
+        U : torch.Tensor
+            The U terms with shape (N, *im_size)
+        """
+
+        return torch.exp(-1j * einsum(self.kgrid, translations.type(torch.float32), 
+                                      '... out, N out -> N ...'))
+    
+    def _build_V(self,
+                 rotations: torch.Tensor) -> torch.Tensor:
+        """
+        Builds V terms from rotation parameters
+
+        Parameters:
+        -----------
+        rotations : torch.Tensor
+            The rotations with shape (N, 3), x y z in degrees
+
+        Returns:
+        --------
+        V : torch.Tensor
+            The V terms with shape (6, N, *im_size)
+        """
+
+        roations_radians = torch.deg2rad(rotations).type(torch.float32)
+        v_1_tan = torch.tan(roations_radians[:, 0] / 2) * \
+                  self.kgrid[None, ..., 1] * self.rgrid[None, ..., 2]
+        v_1_sin = torch.sin(roations_radians[:, 0]) * \
+                  -self.kgrid[None, ..., 2] * self.rgrid[None, ..., 1]
+        v_2_tan = torch.tan(roations_radians[:, 1] / 2) * \
+                  self.kgrid[None, ..., 2] * self.rgrid[None, ..., 0]
+        v_2_sin = torch.sin(roations_radians[:, 1]) * \
+                  -self.kgrid[None, ..., 0] * self.rgrid[None, ..., 2]
+        v_3_tan = torch.tan(roations_radians[:, 2] / 2) * \
+                  self.kgrid[None, ..., 0] * self.rgrid[None, ..., 1]
+        v_3_sin = torch.sin(roations_radians[:, 2]) * \
+                  -self.kgrid[None, ..., 1] * self.rgrid[None, ..., 0]
+        V = torch.stack((v_1_tan, v_1_sin,
+                         v_2_tan, v_2_sin,
+                         v_3_tan, v_3_sin), dim=0)
+        V = torch.exp(1j * V)
+        return V
+
+    def forward(self,
+                img: torch.Tensor,
+                motion_params: torch.Tensor) -> torch.Tensor:
+        """
+        Applies motion operation to the image
+        
+        Parameters:
+        -----------
+        img : torch.tensor
+            The image with shape (..., *im_size)
+        motion_params : torch.Tensor
+            The motion parameters with shape (N, 6). 
+            First three motion params are translations in x, y, z in meters. 
+            Last three motion params are rotations in x, y, z in degrees.
+        """
+
+        # Consts
+        d = len(self.im_size)
+        assert img.shape[-d:] == self.im_size
+
+        # Build U and V operators
+        if self.U is None or self.V is None:
+            U = self._build_U(motion_params[:, :3]) # (N *im_size)
+            V = self._build_V(motion_params[:, 3:]) # (6, N, *im_size)
         else:
-            raise Exception('Can transform only 2d or 3d images, sorry')
+            U = self.U
+            V = self.V
+        if self.reuse_UV:
+            self.U = U
+            self.V = V
 
-        self.oshape = ishape[1:] # xy(z)
-        self.Nk = max(self.oshape)
-        
-        # save the grids as they'll be used for all motion params
-        self.rGrids, self.kGrids, self.rkGrids = generate_grids(self.padshape)
-    
-    def _reset_motion_params(self, 
-                             motion_params: torch.Tensor):
-        """
-        motion_params - Tensor of shape (N_shots, 6) - translations and rotations
-            translations are in [pixels]
-            rotation angles are in [rads]
-        """
-        self.do_rot = False
-        self.do_transl = False
-    
-        if motion_params.ndim == 1 and motion_params.shape[0] == 6:
-            self.mot_traj = motion_params[None, :]
-        elif motion_params.ndim == 2:
-            self.mot_traj = motion_params
-        else:
-            raise Exception('Motion parameters tensor should be of size (N_shots, N_motion_params)')
-    
-        self.device = self.mot_traj.device
-        thetas = self.mot_traj[:,-3:] * torch.Tensor([-1, 1, -1])[None, :].to(self.device) # sign indicates the rotation orientation
-        if (thetas.any()):
-            self.do_rot = True
-            # precompute the shear matrices    
-            tantheta2 = 1j * torch.tan(thetas/2)
-            sintheta = -1j * torch.sin(thetas)
+        # Add empty dims
+        img_nbatch_dims = len(img.shape) - d
+        tup = (slice(None),) * img_nbatch_dims + (None,) + (slice(None),) * d
+        img = img[tup] # (... 1 *im_size)
+        if d == 2:
+            img = img[..., None]
+            V = V[..., None]
+            U = U[..., None]
             
-            self.V_mat_tan_xyzr = [] # of size 3 - for each rotation axis, each element has size (rkGrid_size)
-            self.V_mat_sin_xyzr = []
-            for ax_ in range(3):
-                exp_ = torch.exp(tantheta2[None, None, :, 2-ax_] * self.rkGrids[0][ax_][:,:, None].to(self.device)) 
-                self.V_mat_tan_xyzr.append(exp_)
+        # Apply V
+        V_dims = [
+            4, 5, 4,
+            2, 3, 2,
+            0, 1, 0
+        ]
+        ft_dims = [
+            -3, -2, -3,
+            -1, -3, -1,
+            -2, -1, -2
+        ]
+        for i in range(9):
+            img = ifft(V[V_dims[i]] * fft(img, dim=ft_dims[i]), dim=ft_dims[i])
 
-                exp_ = torch.exp(sintheta[None, None, :, 2-ax_] * self.rkGrids[1][ax_][:,:, None].to(self.device))
-                self.V_mat_sin_xyzr.append(exp_)  
-                
-        shifts = self.mot_traj[:,:3] 
-        if (shifts.any()):
-            self.do_transl = True
-
-        if self.do_transl:
-            kxx, kyy, kzz = [tensor.to(self.device) for tensor in \
-                             torch.meshgrid(self.kGrids[0], self.kGrids[1], self.kGrids[2], indexing='ij')]
-            dim_k = self.kGrids[0].shape[0]
-            # dx is along y in Python, dy is along x and with the opposite sign
-            self.U_mat_xyzr = torch.exp(-1j * ( -kxx[...,None] * shifts[None, None, None,:,0] + \
-                                                 kyy[...,None] * shifts[None, None, None,:,1] + \
-                                                 kzz[...,None] * shifts[None, None, None,:,2])) 
-            
-    def _apply(self, 
-               input: torch.Tensor):
-        """
-        img : 2d-array and 3d-tensors
-            dimensions xy or xyz - coil and spatial
-
-        Return 
-            image_tr : ishape tensor
-            Warped image        
-        """
-        assert torch.is_complex(input)
-        assert input.device == self.device
-
-        image_in = copy.deepcopy(input) # bxy(z)
-        if image_in.ndim == 2:
-            image_in = image_in[None, ...]
-        if image_in.ndim == 4:
-            self.rot_axes = [0, 1, 2]
-            image_xyzr = image_in[..., None] # r - repetition or shot dimension
-        elif image_in.ndim == 3:
-            self.rot_axes = [0]
-            image_xyzr = image_in[..., None, None]
+        # Apply U
+        dims = tuple(range(-3, 0))
+        img = ifft(U * fft(img, dim=dims), dim=dims)
         
-        if self.pad:
-            pad = [0, 0]
-            for ax_ in range(len(self.oshape)-1, -1, -1):
-                diff = self.padshape[ax_] - self.oshape[ax_]
-                pad.append(int(np.floor(diff/2)))
-                pad.append(int(np.ceil(diff/2)))
-            image_xyzr = F.pad(input=image_xyzr, pad=tuple(pad), mode='constant', value=0)
-        
-        if self.do_rot:
-            per =  [ [1, 3, 2], [2, 1, 3] ] # one higher than corresponding to yzx
-            for axis in self.rot_axes:
-                newaxis = 2 - axis + 1
-                V_tan_exp_xyzr = torch.unsqueeze(torch.unsqueeze(self.V_mat_tan_xyzr[axis], dim=0), dim=newaxis)
-                V_sin_exp_xyzr = torch.unsqueeze(torch.unsqueeze(self.V_mat_sin_xyzr[axis], dim=0), dim=newaxis)
-                image_xyzr = torch.fft.fftshift(torch.fft.fft(image_xyzr, dim=per[0][axis]), dim=per[0][axis])
-                image_xyzr =  V_tan_exp_xyzr * image_xyzr 
-                image_xyzr = torch.fft.ifft(torch.fft.ifftshift(image_xyzr, dim=per[0][axis]), dim=per[0][axis])
-                
-                image_xyzr = torch.fft.fftshift(torch.fft.fft(image_xyzr, dim=per[1][axis]), dim=per[1][axis])
-                image_xyzr = (V_sin_exp_xyzr * image_xyzr)
-                image_xyzr = torch.fft.ifft(torch.fft.ifftshift(image_xyzr, dim=per[1][axis]), dim=per[1][axis])
+        # Remove empty dim 
+        if d == 2:
+            img = img[..., 0]
 
-                image_xyzr = torch.fft.fftshift(torch.fft.fft(image_xyzr, dim=per[0][axis]), dim=per[0][axis])
-                image_xyzr = (V_tan_exp_xyzr * image_xyzr)
-                image_xyzr = torch.fft.ifft(torch.fft.ifftshift(image_xyzr, dim=per[0][axis]), dim=per[0][axis])        
-        
-        if self.do_transl:
-            axes_ = (1, 2, 3) # hard code
-            image_xyzr = torch.fft.ifftn( torch.fft.ifftshift( self.U_mat_xyzr * torch.fft.fftshift(torch.fft.fftn\
-                                    ( image_xyzr, dim=axes_), \
-                                    dim=axes_ ), dim=axes_ ), dim=axes_ )   
-             
-        if self.pad:
-            if len(self.oshape) == 3:
-                image_xyzr = image_xyzr[:,pad[-2]:self.Nk-pad[-1], pad[0]:self.Nk-pad[1], 0, :]
-            elif len(self.oshape) == 4:
-                image_xyzr = image_xyzr[:,pad[-2]:self.Nk-pad[-1], pad[-4]:self.Nk-pad[-3], pad[-6]:self.Nk-pad[-5], :]
-                
-        return image_xyzr
-
-
+        return img

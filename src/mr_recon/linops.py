@@ -7,6 +7,7 @@ from mr_recon.fourier import fft, ifft
 from mr_recon.utils import batch_iterator
 from mr_recon.pad import PadLast
 from mr_recon.imperfections.field import field_handler
+from mr_recon.imperfections.lowrank_imperfection import lowdim_imperfection
 from mr_recon.fourier import (
     gridded_nufft,
     sigpy_nufft,
@@ -70,6 +71,7 @@ class sense_linop(linop):
                  mps: torch.Tensor,
                  dcf: Optional[torch.Tensor] = None,
                  nufft: Optional[NUFFT] = None,
+                 imperf_model: Optional[lowdim_imperfection] = None,
                  use_toeplitz: Optional[bool] = False,
                  bparams: Optional[batching_params] = batching_params()):
         """
@@ -86,6 +88,8 @@ class sense_linop(linop):
             the density comp. functon with shape (*trj_size)
         nufft : NUFFT
             the nufft object, defaults to torchkbnufft
+        imperf_model : lowdim_imperfection
+            models imperfections with lowrank splitting
         use_toeplitz : bool
             toggles toeplitz normal operator
         bparams : batching_params
@@ -110,21 +114,29 @@ class sense_linop(linop):
         # Rescale and change types
         trj = nufft.rescale_trajectory(trj).type(torch.float32)
         dcf = dcf.type(torch.float32)
+        mps = mps.type(torch.complex64)
         
         # Compute toeplitz kernels
         if use_toeplitz:
+            assert imperf_model is None, 'toeplitz normal operator not supported with imperfections'
             self.toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], dcf[None,])[0]
         else:
             self.toep_kerns = None
+
+        if imperf_model is not None:
+            self.imperf_rank = imperf_model.L
+        else:
+            self.imperf_rank = 1
 
         # Save
         self.im_size = im_size
         self.use_toeplitz = use_toeplitz
         self.trj = trj
-        self.mps = mps.type(torch.complex64)
+        self.mps = mps
         self.dcf = dcf
         self.nufft = nufft
         self.bparams = bparams
+        self.imperf_model = imperf_model
         self.torch_dev = torch_dev
 
     def forward(self,
@@ -144,8 +156,10 @@ class sense_linop(linop):
         """
 
         # Useful constants
+        imperf_rank = self.imperf_rank
         nc = self.mps.shape[0]
         coil_batch_size = self.bparams.coil_batch_size
+        seg_batch_size = self.bparams.field_batch_size
 
         # Result array
         ksp = torch.zeros((nc, *self.trj.shape[:-1]), dtype=torch.complex64, device=self.torch_dev)
@@ -153,13 +167,25 @@ class sense_linop(linop):
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
             mps = self.mps[c:d]
-            Sx = mps * img
 
-            # NUFFT and phi
-            FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]
+            # Batch over segments 
+            for l1, l2 in batch_iterator(imperf_rank, seg_batch_size):
+                if imperf_rank == 1:
+                    mps_weighted = mps[:, None, ...]
+                else:
+                    mps_weighted = self.imperf_model.apply_spatial(mps, slice(l1, l2))
+                Sx = mps_weighted * img
 
-            # Append to k-space
-            ksp[c:d, ...] += FSx
+                # NUFFT and temporal terms
+                FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]
+
+                if imperf_rank == 1:
+                    HFSx = FSx[:, 0, ...]
+                else:
+                    HFSx = self.imperf_model.apply_temporal(FSx, slice(l1, l2))
+                
+                # Append to k-space
+                ksp[c:d, ...] += HFSx
 
         return ksp
     
@@ -180,25 +206,39 @@ class sense_linop(linop):
         """
 
         # Useful constants
+        imperf_rank = self.imperf_rank
         nc = self.mps.shape[0]
         coil_batch_size = self.bparams.coil_batch_size
+        seg_batch_size = self.bparams.field_batch_size
 
-        # Result subspace coefficients
+        # Result image
         img = torch.zeros(self.im_size, dtype=torch.complex64, device=self.torch_dev)
             
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
             mps = self.mps[c:d]
-            Wy = ksp[c:d, ...] * self.dcf
-            
-            # Adjoint
-            FWy = self.nufft.adjoint(Wy[None, ...], self.trj[None, ...])[0] # nc *im_size
+            ksp_weighted = ksp[c:d, ...] * self.dcf[None, ...]
 
-            # Conjugate maps
-            SFWy = einsum(FWy, mps.conj(), 'nc ..., nc ... -> ...')
+            # Batch over segments
+            for l1, l2 in batch_iterator(imperf_rank, seg_batch_size):
+                if imperf_rank == 1:
+                    HWy = ksp_weighted[:, None, ...]
+                else:
+                    HWy = self.imperf_model.apply_temporal_adjoint(ksp_weighted, slice(l1, l2))
+                
+                # Adjoint
+                FHWy = self.nufft.adjoint(HWy[None, ...], self.trj[None, ...])[0] # nc nseg *im_size
 
-            # Append to image
-            img += SFWy
+                # Conjugate maps
+                SFHWy = einsum(FHWy, mps.conj(), 'nc nseg ..., nc ... -> nseg ...')
+
+                if imperf_rank == 1:
+                    BSFHWy = SFHWy[0]
+                else:
+                    BSFHWy = self.imperf_model.apply_spatial_adjoint(SFHWy, slice(l1, l2))
+
+                # Append to image
+                img += BSFHWy
 
         return img
     
@@ -269,6 +309,7 @@ class subspace_linop(linop):
                  phi: torch.Tensor,
                  dcf: Optional[torch.Tensor] = None,
                  nufft: Optional[NUFFT] = None,
+                 field_obj: Optional[field_handler] = None,
                  use_toeplitz: Optional[bool] = False,
                  bparams: Optional[batching_params] = batching_params()):
         """
@@ -287,6 +328,8 @@ class subspace_linop(linop):
             the density comp. functon with shape (nro, ...)
         nufft : NUFFT
             the nufft object, defaults to torchkbnufft
+        field_obj : field_handler
+            represents phase due to field imperfections
         use_toeplitz : bool
             toggles toeplitz normal operator
         bparams : batching_params
@@ -309,8 +352,11 @@ class subspace_linop(linop):
         else:
             assert dcf.device == torch_dev
         
-        # Rescale trajectory to match nufft format
+        # Rescale and type cast
         trj = nufft.rescale_trajectory(trj).type(torch.float32)
+        dcf = dcf.type(torch.float32)
+        mps = mps.type(torch.complex64)
+        phi = phi.type(torch.complex64)
         
         # Compute toeplitz kernels
         if use_toeplitz:
@@ -319,6 +365,9 @@ class subspace_linop(linop):
             phis = phi.conj()[:, None, :] * phi[None, ...] # nsub nsub ntr
             weights = rearrange(phis, 'nsub1 nsub2 ntr -> (nsub1 nsub2) 1 1 ntr')
             weights = weights * dcf
+
+            if field_obj is not None:
+                raise NotImplementedError
 
             # Compute kernels
             toep_kerns = None
@@ -338,10 +387,12 @@ class subspace_linop(linop):
         self.im_size = im_size
         self.use_toeplitz = use_toeplitz
         self.trj = trj
-        self.phi = phi.type(torch.complex64)
-        self.mps = mps.type(torch.complex64)
-        self.dcf = dcf.type(torch.float32)
+        self.phi = phi
+        self.mps = mps
+        self.dcf = dcf
         self.nufft = nufft
+        self.field_obj = field_obj
+        self.nseg = 1 if field_obj is None else field_obj.nseg
         self.bparams = bparams
         self.torch_dev = torch_dev
 
@@ -364,8 +415,11 @@ class subspace_linop(linop):
         # Useful constants
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
+        nseg = self.nseg
         coil_batch_size = self.bparams.coil_batch_size
         sub_batch_size = self.bparams.sub_batch_size
+        seg_batch_size = self.bparams.field_batch_size
+        field_correction = self.field_obj is not None
 
         # Result array
         ksp = torch.zeros((nc, *self.trj.shape[:-1]), dtype=torch.complex64, device=self.torch_dev)
@@ -374,17 +428,36 @@ class subspace_linop(linop):
         for c, d in batch_iterator(nc, coil_batch_size):
             mps = self.mps[c:d]
 
-            # Batch over subspace
-            for a, b in batch_iterator(nsub, sub_batch_size):
-                alpha = alphas[a:b]
-                Sx = mps[:, None, ...] * alpha[None, ...]
+            # Batch over segments
+            for t, u in batch_iterator(nseg, seg_batch_size):
+                
+                # Feild correction
+                if field_correction:
+                    spatial_funcs = self.field_obj.get_spatial_funcs(slice(t, u))
+                    temporal_funcs = self.field_obj.get_temporal_funcs(slice(t, u))
+                    mps_weighted = mps * spatial_funcs[:, None]
+                else:
+                    mps_weighted = mps[None,]
 
-                # NUFFT and phi
-                FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]
-                PFSx = einsum(FSx, self.phi[a:b], 'nc nsub nro npe ntr, nsub ntr -> nc nro npe ntr')
+                # Batch over subspace
+                for a, b in batch_iterator(nsub, sub_batch_size):
+                    alpha = alphas[a:b]
+                    Sx = einsum(mps_weighted, alpha, 'nseg nc ..., nsub ... -> nseg nc nsub ...')
 
-                # Append to k-space
-                ksp[c:d, ...] += PFSx
+                    # NUFFT and phi
+                    FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]
+
+                    # Subspace
+                    PFSx = einsum(FSx, self.phi[a:b], 'nseg nc nsub nro npe ntr, nsub ntr -> nseg nc nro npe ntr')
+
+                    # Field correction
+                    if field_correction:
+                        PFSx = einsum(PFSx, temporal_funcs, 'nseg nc ..., ... nseg -> nc ...')
+                    else:
+                        PFSx = PFSx[0]
+
+                    # Append to k-space
+                    ksp[c:d, ...] += PFSx
 
         return ksp
     
@@ -407,8 +480,11 @@ class subspace_linop(linop):
         # Useful constants
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
+        nseg = self.nseg
         coil_batch_size = self.bparams.coil_batch_size
         sub_batch_size = self.bparams.sub_batch_size
+        seg_batch_size = self.bparams.field_batch_size
+        field_correction = self.field_obj is not None
 
         # Result subspace coefficients
         alphas = torch.zeros((nsub, *self.im_size), dtype=torch.complex64, device=self.torch_dev)
@@ -416,18 +492,31 @@ class subspace_linop(linop):
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
             mps = self.mps[c:d]
-            Wy = ksp[c:d, ...] * self.dcf[None, ...] # nc nro npe ntr
-            
-            # Batch over subspace
-            for a, b in batch_iterator(nsub, sub_batch_size):
-                PWy = einsum(Wy, self.phi.conj()[a:b], 'nc nro npe ntr, nsub ntr -> nsub nc nro npe ntr')
-                FPWy = self.nufft.adjoint(PWy[None, ...], self.trj[None, ...])[0] # nsub nc *im_size
+            ksp_weighted = ksp[c:d, ...] * self.dcf[None, ...]
 
-                # Conjugate maps
-                SFPWy = einsum(FPWy, mps.conj(), 'nsub nc ..., nc ... -> nsub ...')
+            # Batch over segments
+            for t, u in batch_iterator(nseg, seg_batch_size):
+                
+                # Feild correction
+                if field_correction:
+                    spatial_funcs = self.field_obj.get_spatial_funcs(slice(t, u))
+                    temporal_funcs = self.field_obj.get_temporal_funcs(slice(t, u)).conj()
+                    mps_weighted = mps * spatial_funcs[:, None]
+                    Wy = einsum(ksp_weighted, temporal_funcs, 'nc ..., ... nseg -> nseg nc ...')
+                else:
+                    mps_weighted = mps[None,]
+                    Wy = ksp_weighted[None,]
 
-                # Append to image
-                alphas[a:b, ...] += SFPWy
+                # Batch over subspace
+                for a, b in batch_iterator(nsub, sub_batch_size):
+                    PWy = einsum(Wy, self.phi.conj()[a:b], 'nseg nc nro npe ntr, nsub ntr -> nseg nsub nc nro npe ntr')
+                    FPWy = self.nufft.adjoint(PWy[None, ...], self.trj[None, ...])[0] # nseg nsub nc *im_size
+
+                    # Conjugate maps
+                    SFPWy = einsum(FPWy, mps_weighted.conj(), 'nseg nsub nc ..., nseg nc ... -> nsub ...')
+
+                    # Append to image
+                    alphas[a:b, ...] += SFPWy
 
         return alphas
     

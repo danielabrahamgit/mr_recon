@@ -4,7 +4,7 @@ import sigpy as sp
 import torch.nn as nn
 
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, Tuple
 from einops import rearrange
 from mr_recon.utils import torch_to_np, np_to_torch
 
@@ -13,10 +13,96 @@ def density_compensation(trj: torch.Tensor,
                          num_iters: Optional[int] = 30):
     raise NotImplementedError
 
+def svd_power_method_tall(A: callable,
+                          AHA: callable,
+                          rank: int,
+                          inp_dims: tuple,
+                          niter: Optional[int] = 100,
+                          inp_dtype: Optional[torch.dtype] = torch.complex64,
+                          device: Optional[torch.device] = torch.device('cpu'),
+                          verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Perform SVD on operator A using power method. This returns the compact SVD.
+    http://www.cs.yale.edu/homes/el327/datamining2013aFiles/07_singular_value_decomposition.pdf
+
+    Parameters:
+    -----------
+    A : callable
+        linear operator maps from M to N, assuming M > N
+    AHA : callable
+        linear operator maps from N to N, AHA = hermetian(A) * A
+    rank : int
+        rank of the SVD
+    inp_dims : tuple
+        input dimensions of A, corresponds to N but can be tuple
+    inp_dtype : torch.dtype
+        input data type
+    device : torch.device
+        device to run on
+    verbose : bool
+        toggles progress bar
+    
+    Returns:
+    --------
+    U : torch.Tensor
+        left singular vectors with shape (out_dims, rank)
+    S : torch.Tensor
+        singular values with shape (rank)
+    Vh : torch.Tensor
+        right singular vectors with shape (rank, inp_dims)
+    """
+
+    # Consts
+    # delta = 0.001
+    # epsilon = 0.97
+    # lamda = .1
+    # N = torch.prod(torch.tensor(inp_dims)).item()
+    # niter = round((torch.log(
+    #     4 * torch.log(torch.tensor(2 * N / delta)) / (epsilon * delta)) / (2 * lamda)).item())
+
+    # SVD return params
+    U = []
+    S = []
+    V = []
+
+    # Residual Operators
+    def A_resid_operator(x):
+        y = A(x)
+        for i in range(len(U)):
+            rank1_op = U[i] * torch.sum(V[i].conj() * x * S[i])
+            y = y - rank1_op
+        return y
+    def AHA_resid_operator(x):
+        y = AHA(x)
+        for i in range(len(U)):
+            rank1_op = V[i] * torch.sum(V[i].conj() * x * (S[i] ** 2))
+            y = y - rank1_op
+        return y
+    
+    for r in tqdm(range(rank), 'SVD Iterations', disable=not verbose):
+        # Power method to calc u_i sigma_i v_i
+        x0 = torch.randn(inp_dims, device=device, dtype=inp_dtype)
+        v, _ = power_method_operator(AHA_resid_operator, x0, num_iter=niter, verbose=False)
+        v = v / torch.linalg.norm(v)
+        u = A_resid_operator(v)
+        sigma = torch.linalg.norm(u)
+        u = u / sigma
+
+        # Append to list
+        U.append(u)
+        S.append(sigma)
+        V.append(v)
+
+    U = torch.stack(U, dim=-1)
+    S = torch.tensor(S, device=device)
+    Vh = torch.stack(V, dim=0).conj()
+
+    return U, S, Vh
+
 def power_method_matrix(M: torch.Tensor,
                         vec_init: Optional[torch.Tensor] = None,
                         num_iter: Optional[int] = 100,
-                        verbose: Optional[bool] = True) -> (torch.Tensor, torch.Tensor):
+                        verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Uses power method to find largest eigenvalue and corresponding eigenvector
 
@@ -58,7 +144,7 @@ def power_method_matrix(M: torch.Tensor,
 def power_method_operator(A: callable,
                           x0: torch.Tensor,
                           num_iter: Optional[int] = 15,
-                          verbose: Optional[bool] = True) -> (torch.Tensor, float):
+                          verbose: Optional[bool] = True) -> Tuple[torch.Tensor, float]:
     """
     Uses power method to find largest eigenvalue and corresponding eigenvector
 
@@ -95,7 +181,7 @@ def power_method_operator(A: callable,
 def lin_solve(AHA: torch.Tensor, 
               AHb: torch.Tensor, 
               lamda: Optional[float] = 0.0, 
-              solver: Optional[int] = 'lstsq'):
+              solver: Optional[int] = 'lstsq') -> torch.Tensor:
     """
     Solves (AHA + lamda I) @ x = AHb for x
 
@@ -209,6 +295,45 @@ def FISTA(AHA: nn.Module,
     if verbose:
         print(f'Gradient Took {t_gr:.3f}(s), Prox Took {t_prox:.3f}(s)')
     return x
+
+def gradient_descent(AHA: nn.Module,
+                     AHb: torch.Tensor,
+                     lr: float,
+                     num_iters: Optional[int] = 100,
+                     lamda_l2: Optional[float] = 0.0,
+                     tolerance: Optional[float] = 1e-8,
+                     verbose: Optional[bool] = True) -> torch.Tensor:
+    """
+    Parameters:
+    -----------
+    AHA : nn.Module 
+        Linear operator representing the gram/normal operator of A
+    AHb : torch.tensor
+        The A hermitian transpose times b
+    lr : float
+        learning rate
+    num_iters : int 
+        Max number of iterations.
+    lamda_l2 : float
+        Replaces AHA with AHA + lamda_l2 * I
+    tolerance : float 
+        Used as stopping criteria
+    verbose : bool
+        toggles print statements
+    
+    Returns:
+    ---------
+    x : torch.tensor <complex>
+        least squares estimate of x
+    """
+    x = AHb
+    for i in tqdm(range(num_iters), 'GD Iterations', disable=not verbose):
+        grad = AHA(x) - AHb
+        x = x - lr * grad
+        if torch.norm(grad) < tolerance:
+            break
+    return x
+
 
 def conjugate_gradient(AHA: nn.Module, 
                        AHb: torch.Tensor, 

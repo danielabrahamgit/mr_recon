@@ -8,10 +8,11 @@ from mr_recon.utils import (
     torch_to_np, 
     np_to_torch,
     apply_window,
-    quantize_data
+    quantize_data,
+    batch_iterator
 )
 from mr_recon.fourier import fft, ifft
-from mr_recon.algs import lin_solve
+from mr_recon.algs import lin_solve, svd_power_method_tall
 
 def bases(x, y, z):
         assert x.shape == y.shape
@@ -334,6 +335,10 @@ class field_handler:
                                               nseg, method=quant_type)
             self.spatial_funcs = self._calc_spatial_interpolators(self.thetas, interp_type)
             self.spatial_funcs_flt = rearrange(self.spatial_funcs, 'nseg ... -> nseg (...)')
+        elif 'svd' in method.lower():
+            self.spatial_funcs, self.temporal_funcs = self._calc_svd(operator_method=True, spatial_batch_size=2 ** 15)
+            self.spatial_funcs_flt = rearrange(self.spatial_funcs, 'nseg ... -> nseg (...)')
+            self.temporal_funcs_flt = rearrange(self.temporal_funcs, '... nseg -> nseg (...)')
         else:
             raise NotImplementedError
 
@@ -379,6 +384,18 @@ class field_handler:
 
         self.phis = phis_new
 
+    def topelitz_weights(self):
+
+        # Zero order interp has O(L) toeplitz weights
+        if 'svd' not in self.method and self.interp_type == 'zero':
+            weights = self.get_temporal_funcs()
+            weights = (weights * weights.conj())[None,]
+        # Other interp has O(L^2) toeplitz weights
+        else:
+            weights = self.get_temporal_funcs()
+            weights = weights[None,].conj() * weights[:, None]
+        return weights
+
     def get_spatial_funcs(self,
                           segs: Optional[torch.Tensor] = slice(None),
                           r_inds: Optional[torch.Tensor] = None):
@@ -409,7 +426,7 @@ class field_handler:
                 phase = einsum(self.phis_flt[:, r_inds], self.betas[segs], 'nbasis R, nseg nbasis -> nseg R')
             phase_maps = torch.exp(-2j * torch.pi * phase)
             spatial_funcs = phase_maps.type(torch.complex64)
-        elif 'fs' in self.method:
+        elif 'fs' in self.method or 'svd' in self.method:
             if r_inds is None:
                 spatial_funcs = self.spatial_funcs[segs]
             else:
@@ -442,7 +459,7 @@ class field_handler:
             temporal functions 'h_l(t)' with shape (len(t_inds), len(segs))
         """
 
-        if 'ts' in self.method:
+        if 'ts' in self.method or 'svd' in self.method:
             if t_inds is None:
                 temporal_funcs = self.temporal_funcs[..., segs]
             else:
@@ -508,7 +525,7 @@ class field_handler:
         else:
             phi_chunk = self.phis_flt[:, r_inds]
             alpha_chunk = self.alphas_flt[t_inds, :]
-            phase_chunk = einsum(phi_chunk, alpha_chunk, 'nbasis N, N nbasis -> N')
+            phase_chunk = einsum(phi_chunk, alpha_chunk, 'nbasis nr, nt nbasis -> nr nt')
             phase_est = torch.exp(-2j * torch.pi * phase_chunk)
 
         return phase_est
@@ -578,7 +595,117 @@ class field_handler:
             phase_est = torch.exp(-2j * torch.pi * phase_est)
 
         return phase_est
-   
+
+    def _calc_svd(self,
+                  operator_method: Optional[bool] = False,
+                  assume_b0: Optional[bool] = True,
+                  spatial_batch_size: Optional[int] = 2 ** 14) -> torch.Tensor:
+        """
+        Calculates spatial and temporal functions from SVD 
+        of spatio-temporal matrix
+
+        Parameters:
+        -----------
+        operator_method : bool
+            if True, uses operator method to calculate SVD. 
+            This is more memory efficient, but slower
+            Otherwise constructs big spatiotemporal matrix
+        assume_b0 : bool
+            if True, assumes B0 case where alphas are 1d 
+            and proportional to  time
+        spatial_batch_size : int
+            batch size over spatial terms
+        
+        Returns:
+        --------
+        spatial_funcs : torch.tensor <complex64>
+            spatial basis functions with shape (nseg, *im_size)
+        temporal_funcs : torch.tensor <complex64>
+            temporal basis functions with shape (*trj_size, nseg)
+        """
+
+        if operator_method:
+            def A(x):
+                x = x.reshape((-1))
+                nvox = torch.prod(torch.tensor(self.im_size)).item()
+                y = torch.zeros((nvox,), dtype=torch.complex64, device=x.device)
+                for n1, n2 in batch_iterator(nvox, spatial_batch_size):
+                    y[n1:n2] = self.phase_est(slice(n1, n2), slice(None), lowrank=False) @ x
+                return y.reshape(self.im_size)
+            
+            def AH(y):
+                y = y.reshape((-1))
+                nvox = torch.prod(torch.tensor(self.im_size)).item()
+                ntrj = torch.prod(torch.tensor(self.trj_size)).item()
+                x = torch.zeros((ntrj,), dtype=torch.complex64, device=y.device)
+                for n1, n2 in batch_iterator(nvox, spatial_batch_size):
+                    x += self.phase_est(slice(n1, n2), slice(None), lowrank=False).H @ y[n1:n2]
+                return x.reshape(self.trj_size)
+            if assume_b0:
+                assert self.nbasis == 1
+
+                import torchaudio
+
+                def AHA(x):
+                    # apply convolution is freq domain
+                    orig_shape = x.shape
+                    x = x.reshape((-1))
+                    x_hat = torchaudio.functional.convolve(x, impulse_response, mode='same')
+                    # x_hat = torch.fft.fft(x, n=2*len(x)) * impulse_FT
+                    # x_hat = torch.fft.ifft(x_hat)#[:len(x)]
+                    return x_hat.reshape(orig_shape)
+
+                def AHA_plz(x):
+                    return AH(A(x))
+                
+                # Find impulse response
+                impulse_response = AH(torch.ones(self.im_size, dtype=torch.complex64, device=self.torch_dev))
+                impulse_response = impulse_response.flatten()
+                impulse_response = torch.hstack((torch.flip(impulse_response, dims=(0,)).conj(), impulse_response[1:]))
+
+                delta = torch.zeros(self.trj_size, dtype=torch.complex64, device=self.torch_dev)
+                delta[0, 0, 23] = 1
+                impulse_response_AHA = AHA_plz(delta).flatten()
+
+                impulse_response_AHA = impulse_response_AHA.cpu()
+                impulse_response = impulse_response.cpu()
+                
+                import matplotlib.pyplot as plt
+                from mr_recon.utils import normalize
+                impulse_response_AHA = normalize(impulse_response_AHA, impulse_response, ofs=False, mag=True)
+                plt.plot(impulse_response.abs().cpu(), label='AH(1)', alpha=0.4)
+                plt.plot(impulse_response_AHA.abs().cpu(), label='AHA(d)', alpha=0.4)
+                plt.legend()
+                
+                plt.show()
+                quit()
+            else:
+                
+                def AHA(s):
+                    return AH(A(s))
+            
+            U, S, Vh = svd_power_method_tall(A=A, 
+                                             AHA=AHA,
+                                             inp_dims=self.trj_size,
+                                             rank=self.nseg,
+                                             device=self.torch_dev)
+            spatial_funcs = rearrange(U * S, '... nseg -> nseg ...')
+            temporal_funcs = rearrange(Vh, 'nseg ... -> ... nseg')
+
+        else:
+            # Build spatio temporal matrix
+            A = self.phase_est_slice(slice(None), slice(None), lowrank=False)
+            if self.verbose:
+                print(f'Calculating SVD')
+            A = A.reshape((-1, *self.trj_size))
+            A = A.reshape((A.shape[0], -1))
+            U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+            spatial_funcs = (S[:self.nseg] * U[:, :self.nseg]).reshape((*self.im_size, self.nseg))
+            spatial_funcs = rearrange(spatial_funcs, '... nseg -> nseg ...')
+            temporal_funcs = Vh[:self.nseg, :].T.reshape((*self.trj_size, self.nseg))        
+
+        return spatial_funcs, temporal_funcs
+
     def _calc_temporal_interpolators(self,
                                      betas: torch.Tensor,
                                      interp_type: Optional[str] = 'zero') -> torch.Tensor:
@@ -779,28 +906,32 @@ class field_handler:
         r_slice = (slice(None),) * 2
         phase_est = self.phase_est_slice(r_slice, t_slice, lowrank=True)
         phase = self.phase_est_slice(r_slice, t_slice, lowrank=False)
-        vmin = torch.angle(phase).min() * 180 / torch.pi
-        vmax = torch.angle(phase).max() * 180 / torch.pi
+
+        if phase.ndim == 2:
+            phase = phase[..., None]
+            phase_est = phase_est[..., None]
+        true_phase = torch.angle(phase).cpu().mean(dim=-1).cpu()
+        est_phase = torch.angle(phase_est).cpu().mean(dim=-1).cpu()
+        err = torch.mean(torch.abs(phase_est - phase), dim=-1).cpu()
+
         plt.figure(figsize=(14,7))
-        plt.suptitle(f'{self.method.upper()} Model, {self.interp_type.upper()} Interpolator, {self.nseg} Segments')
-        plt.subplot(221)
+        if 'svd' in self.method:
+            plt.suptitle(f'{self.method.upper()} Model, {self.nseg} Segments')
+        else:
+            plt.suptitle(f'{self.method.upper()} Model, {self.interp_type.upper()} Interpolator, {self.nseg} Segments')
+        plt.subplot(131)
         plt.title('True Phase')
-        plt.imshow(torch.rad2deg(torch.angle(phase).cpu()), vmin=vmin, vmax=vmax, cmap='jet')
+        plt.imshow(torch.rad2deg(true_phase), vmin=-180, vmax=180, cmap='jet')
         plt.colorbar()
         plt.axis('off')
-        plt.subplot(222)
-        plt.title('Low Rank Phase Model')
-        plt.imshow(torch.rad2deg(torch.angle(phase_est)).cpu(), vmin=vmin, vmax=vmax, cmap='jet')
+        plt.subplot(132)
+        plt.title('Estimated Phase')
+        plt.imshow(torch.rad2deg(est_phase), vmin=-180, vmax=180, cmap='jet')
         plt.colorbar()
         plt.axis('off')
-        plt.subplot(223)
-        plt.title('Residual Phase')
-        plt.imshow(torch.rad2deg(torch.angle(phase.conj() * phase_est)).cpu(), cmap='jet')
-        plt.colorbar()
-        plt.axis('off')
-        plt.subplot(224)
-        plt.title('Residual Magnitude')
-        plt.imshow(torch.abs(phase_est / phase).cpu(), cmap='gray')
+        plt.subplot(133)
+        plt.title('Error = |True - Estimated|')
+        plt.imshow(err, cmap='gray', vmin=0, vmax=0.5)
         plt.colorbar()
         plt.axis('off')
         plt.tight_layout()
