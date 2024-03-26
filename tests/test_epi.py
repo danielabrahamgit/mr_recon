@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 
 from mr_recon.utils import np_to_torch, torch_to_np
 from mr_recon.linops import subspace_linop, sense_linop, batching_params
-from mr_recon.recons import CG_SENSE_recon
+from mr_recon.recons import CG_SENSE_recon, FISTA_recon
+from mr_recon.prox import L1Wav
 from mr_recon.fourier import gridded_nufft
 from mr_recon.imperfections.field import field_handler
 from mr_recon.imperfections.main_field import main_field_imperfection
@@ -37,32 +38,18 @@ print(f'phi shape = {phi.shape}')
 print(f'te shape = {te.shape}')
 print(f'b0 shape = {b0.shape}')
 
-field_obj = main_field_imperfection(b0_map=np_to_torch(b0).to(device).type(torch.float32),
+imperf_model = main_field_imperfection(b0_map=-np_to_torch(b0).to(device).type(torch.float32),
                                     trj_dims=(1, 1, ksp.shape[-1]),
                                     dt=te[1] - te[0],
-                                    L=15,
+                                    L=30,
                                     method='svd',
-                                    interp_type='lstsq',)
-
-# # Custom alpha phis since weird time evolution
-# nro = trj.shape[0]
-# ro_lin = 0e-3 * torch.arange(-(nro//2), nro//2, device=device) / nro
-# tup = (slice(None),) + (None,) * (trj.ndim - 1)
-# # alphas = ro_lin[tup] + np_to_torch(te[None, None, :, None]).to(device).type(torch.float32)
-# alphas = np_to_torch(te[None, None, :, None]).to(device).type(torch.float32)
-# phis = -np_to_torch(b0)[None, ...].to(device).type(torch.float32)
-# field_obj = field_handler(alphas, phis, 
-#                           nseg=15,
-#                           method='svd',
-#                           interp_type='lstsq',
-#                           quant_type='uniform')
-# field_obj._plot_approx_err(t_slice=(0, 0, slice(None)))
+                                    interp_type='zero',)
 
 # Make linop
 # nufft = None
 nufft = gridded_nufft(mps.shape[1:], device_idx)
 bparams = batching_params(
-    coil_batch_size=2,
+    coil_batch_size=mps.shape[0],
     sub_batch_size=3,
     field_batch_size=4
 )
@@ -70,20 +57,20 @@ A = subspace_linop(im_size=mps.shape[1:],
                    trj=np_to_torch(trj).to(device),
                    mps=np_to_torch(mps).to(device),
                    phi=np_to_torch(phi).to(device),
-                   field_obj=field_obj,
+                   imperf_model=imperf_model,
                    bparams=bparams,
                    nufft=nufft)
 
 # Run recon
-coeffs = CG_SENSE_recon(A=A,
-                        ksp=np_to_torch(ksp).to(device),
-                        max_iter=15,
-                        max_eigen=1.0,
-                        lamda_l2=0.0).cpu()
+proxg = L1Wav((phi.shape[0], *mps.shape[1:]), 
+              lamda=5e0, 
+              axes=(-2, -1)).forward
+coeffs = FISTA_recon(A, np_to_torch(ksp).to(device), proxg, max_iter=40, verbose=True).cpu()
+# np.save('./data/coeffs.npy', coeffs.numpy())
 
 # Show results
 plt.figure(figsize=(14,7))
-plt.suptitle(f'Nseg = {field_obj.nseg}, Interp = {field_obj.interp_type}')
+plt.suptitle(f'Nseg = {imperf_model.L}, Interp = {imperf_model.interp_type}')
 for i in range(coeffs.shape[0]):
     plt.subplot(1, coeffs.shape[0], i+1)
     plt.title(f'Subspace Coeff {i + 1}')

@@ -86,7 +86,8 @@ class L1Wav(nn.Module):
         input_torch = torch.roll(input, (shift,)*nd, dims=self.axes)
 
         # Move to sigpy
-        input_sigpy = input_torch.numpy()
+        dev = input_torch.device
+        input_sigpy = input_torch.cpu().numpy()
 
         # Appoly random phase ...
         input_sigpy *= phase
@@ -100,7 +101,7 @@ class L1Wav(nn.Module):
         input_sigpy *= np.conj(phase)
         
         # Move to pytorch
-        output_torch = torch.asarray(input_sigpy).to('cpu')
+        output_torch = torch.asarray(input_sigpy).to(dev)
 
         # Unroll
         output_torch = torch.roll(output_torch, (-shift,)*nd, dims=self.axes)

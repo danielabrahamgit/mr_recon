@@ -1,166 +1,17 @@
 import torch
 
 from tqdm import tqdm
-from typing import Optional, Union
+from typing import Optional
 from einops import rearrange, einsum
 from mr_recon.utils import (
-    torch_to_np, 
-    np_to_torch,
-    apply_window,
     quantize_data,
     batch_iterator
 )
-from mr_recon.fourier import torchkb_nufft, sigpy_nufft
+from mr_recon.fourier import sigpy_nufft
 from mr_recon.algs import lin_solve, svd_power_method_tall
+from mr_recon.imperfections.imperfection import imperfection
 
-class lowdim_imperfection:
-    """
-    Base class for imperfections in MRI. All Imperfections
-    take the form:
-
-    b(t) = int_r m(r) T(t){s(r)} e^{-j 2pi k(t) r} dr
-
-    Where T(t) is a spatio-temporal transform describing the imperfection,
-    which is applied to the sens maps independently per channel.
-
-    The lowrank model is given by:
-
-    T(t){x(r)} = sum_{l=1}^L h_l(t) T_l{x(r)}
-    """
-
-    def __init__(self, 
-                 L: int,
-                 method: Optional[str] = 'ts',
-                 interp_type: Optional[str] = 'zero',
-                 verbose: Optional[bool] = True):
-        """
-        Parameters:
-        -----------
-        L : int 
-            The rank of the low-rank model.
-        method : str
-            'ts' - time segmentation
-            'svd' - SVD based splitting
-        interp_type : str
-            'zero' - zero order interpolator
-            'linear' - linear interpolator 
-            'lstsq' - least squares interpolator
-        verbose : bool
-            toggles print statements
-        """
-        self.L = L
-        self.method = method.lower()
-        self.interp_type = interp_type.lower()
-        self.verbose = verbose
-
-        if self.method not in ['ts', 'svd']:
-            raise ValueError('method must be one of ["ts", "svd"]')
-        
-        if self.interp_type not in ['zero', 'linear', 'lstsq']:
-            raise ValueError('interp_type must be one of ["zero", "linear", "lstsq"]')
-        
-        if self.method == 'ts':
-            self._calc_time_segmentation()
-        else:
-            self.spatial_funcs, self.temporal_funcs = self._calc_svd()
-    
-    def _calc_time_segmentation(self):
-        """
-        Computes necessary information for time segmented based splitting
-        """
-        raise NotImplementedError
-
-    def _calc_svd(self):
-        """
-        Computes necessary information for SVD based splitting
-        """
-        raise NotImplementedError
-    
-    def apply_spatial(self,
-                      x: torch.Tensor,
-                      ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        """
-        Applies the spatial part of the lowrank model to image
-        y(r, l) = T_l{x(r)}
-
-        Parameters:
-        -----------
-        x : torch.Tensor
-            The input image with shape (..., *im_size)
-        ls : Optional[torch.Tensor]
-            Slices the lowrank dimension, has size at most L
-        
-        Returns:
-        --------
-        y : torch.Tensor
-            The images with spatial transforms applied with shape (..., len(ls), *im_size)
-        """
-        raise NotImplementedError
-    
-    def apply_spatial_adjoint(self,
-                              y: torch.Tensor,
-                              ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        """
-        Applies the adjoint of the spatial part of the lowrank model to images
-        x(r) = T_l^H{y(r, l)}
-
-        Parameters:
-        -----------
-        y : torch.Tensor
-            The input images with shape (..., len(ls), *im_size)
-        ls : Optional[torch.Tensor]
-            Slices the lowrank dimension
-        
-        Returns:
-        --------
-        x : torch.Tensor
-            The image with spatial adjoint transforms applied with shape (..., *im_size)
-        """
-        raise NotImplementedError
-
-    def apply_temporal(self,
-                       x: torch.Tensor,
-                       ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        """
-        Applies the temporal part of the lowrank model to temporal data
-        y(t) = sum_l h_l(t) * x_l(t)
-
-        Parameters:
-        -----------
-        x : torch.Tensor
-            The input temporal data with shape (..., len(ls), *trj_size)
-        ls : Optional[torch.Tensor]
-            Slices the lowrank dimension
-        
-        Returns:
-        --------
-        y : torch.Tensor
-            The output temporal data with shape (..., *trj_size)
-        """
-        raise NotImplementedError
-    
-    def apply_temporal_adjoint(self,
-                               y: torch.Tensor,
-                               ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        """
-        Applies the adjoint of the temporal part of the lowrank model to input
-        x_l(t) = conj(h_l(t)) * y(t)
-
-        Parameters:
-        -----------
-        y : torch.Tensor
-            The input temporal data with shape (..., *trj_size)
-        ls : Optional[torch.Tensor]
-            Slices the lowrank dimension
-        
-        Returns:
-        --------
-        x : torch.Tensor
-            The output temporal data with shape (..., len(ls), *trj_size)
-        """
-        raise NotImplementedError
-    
-class exponential_imperfection(lowdim_imperfection):
+class exponential_imperfection(imperfection):
     """
     Broadly represents class of exponential imperfections. These will have the form:
     b(t) = int_r m(r) T(t){s(r)} e^{-j 2pi k(t) r} dr
@@ -248,9 +99,9 @@ class exponential_imperfection(lowdim_imperfection):
             alphas_flt = rearrange(self.alphas, 'nbasis ... -> (...) nbasis')
             phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis')
             AHA = torch.zeros((self.L, self.L), 
-                              dtype=self.phis.dtype, device=self.torch_dev)
+                              dtype=torch.complex64, device=self.torch_dev)
             AHb = torch.zeros((self.L, alphas_flt.shape[0]), 
-                              dtype=self.phis.dtype, device=self.torch_dev)
+                              dtype=torch.complex64, device=self.torch_dev)
             
             # Compute AHA and AHB in batches
             batch_size = spatial_batch_size
@@ -278,7 +129,7 @@ class exponential_imperfection(lowdim_imperfection):
             raise NotImplementedError
         elif 'zero' in self.interp_type:
             # Indicator function
-            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=self.phis.dtype, device=self.torch_dev)
+            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=torch.complex64, device=self.torch_dev)
             for i in range(self.L):
                 interp_funcs[i, ...] = 1.0 * (idxs == i)
         else:
@@ -381,7 +232,8 @@ class exponential_imperfection(lowdim_imperfection):
 
         return spatial_funcs, temporal_funcs
     
-    def _calc_svd_fourier_time(self) -> torch.Tensor:
+    def _calc_svd_fourier_time(self,
+                               use_topeplitz: Optional[bool] = True) -> torch.Tensor:
         """
         Calculates spatial and temporal functions from SVD using the 
         fourier and Toeplitz method in time.
@@ -392,8 +244,8 @@ class exponential_imperfection(lowdim_imperfection):
 
         Parameters:
         -----------
-        spatial_batch_size : int
-            batch size over spatial terms
+        use_topeplitz : bool
+            if True, uses toeplitz for extra speed
         
         Returns:
         --------
@@ -406,22 +258,37 @@ class exponential_imperfection(lowdim_imperfection):
         # Make sure this is the right thing to do
         assert self.B == 1, 'This method only works for B=1'
         alphas_flt = self.alphas.squeeze()
+        phis = self.phis
         assert alphas_flt.ndim == 1, 'This method only works for 1D broadcastable alphas'
         nro = alphas_flt.shape[0]
+        assert nro % 2 == 0
+        nvox = torch.prod(torch.tensor(self.im_size)).item()
         
-        # Build operators via fourier method
-        nufft = torchkb_nufft(im_size=(nro,), device_idx=self.torch_dev.index)
-        freqs = nufft.rescale_trajectory(self.phis * nro)[0, ..., None]
+        # Use NUFFT to evaluate A : int_t x(t) e^{-j 2pi t phi(r)} dt
+        # And its adjoint/normal operator
+        nufft = sigpy_nufft(im_size=(nro,), device_idx=self.torch_dev.index)
+        freqs = nufft.rescale_trajectory(phis * nro)[0, ..., None]
+
+        # Compute phase_0 to make sure that no phase is applied at first time point
         x_0 = torch.zeros((nro,), dtype=torch.complex64, device=self.torch_dev)
         x_0[0] = 1
-        phase_0 = nufft(x_0[None,], freqs[None,])[0]
+        phase_0 = nufft(x_0[None,], freqs[None,])[0] * nro / nvox # scaling nro / nvox helps with numerical stability
+
+        # Define forward and adjoint operators
         def A(x):
-            return nufft(x[None], freqs[None])[0] * phase_0.conj() * nro
-        # def AH(y):
-        #     return nufft.adjoint(y[None,] * phase_0, freqs[None])[0] * nro
-        kerns = nufft.calc_teoplitz_kernels(freqs[None])
-        def AHA(x):
-            return nufft.normal_toeplitz(x[None,None,], kerns)[0,0]
+            return nufft(x[None], freqs[None])[0] * phase_0.conj()
+        def AH(y):
+            return nufft.adjoint(y[None,] * phase_0, freqs[None])[0]
+        
+        # Use toeplitz for extra speed
+        if use_topeplitz:
+            weights = phase_0 * phase_0.conj()
+            kerns = nufft.calc_teoplitz_kernels(freqs[None,], weights[None,])
+            def AHA(x):
+                return nufft.normal_toeplitz(x[None,None,], kerns)[0,0]
+        else:
+            def AHA(x):
+                return AH(A(x))
         
         # Compute SVD
         U, S, Vh = svd_power_method_tall(A=A, 
@@ -429,13 +296,13 @@ class exponential_imperfection(lowdim_imperfection):
                                          inp_dims=(nro,),
                                          rank=self.L,
                                          device=self.torch_dev)
-        spatial_funcs = rearrange(U * S, '... nseg -> nseg ...')
+        spatial_funcs = rearrange(U * S, '... nseg -> nseg ...') * nvox
         temporal_funcs = Vh.reshape((self.L, *self.trj_size))
 
         return spatial_funcs, temporal_funcs
                                          
     def _calc_svd_fourier_space(self,
-                                spatial_batch_size: Optional[int] = 2 ** 14) -> torch.Tensor:
+                               use_topeplitz: Optional[bool] = True) -> torch.Tensor:
         """
         Calculates spatial and temporal functions from SVD using the 
         Fourier and Toeplitz method in space.
@@ -446,8 +313,8 @@ class exponential_imperfection(lowdim_imperfection):
 
         Parameters:
         -----------
-        spatial_batch_size : int
-            batch size over spatial terms
+        use_topeplitz : bool
+            if True, uses toeplitz for extra speed
         
         Returns:
         --------
@@ -459,7 +326,7 @@ class exponential_imperfection(lowdim_imperfection):
         assert self.B == len(self.im_size)
 
         # Build operators via fourier method
-        nufft = torchkb_nufft(im_size=self.im_size, device_idx=self.torch_dev.index)
+        nufft = sigpy_nufft(im_size=self.im_size, device_idx=self.torch_dev.index)
         trj = -rearrange(self.alphas, 'B ... -> ... B')
         trj = nufft.rescale_trajectory(trj)
         nvox = torch.prod(torch.tensor(self.im_size)).item()
@@ -468,8 +335,13 @@ class exponential_imperfection(lowdim_imperfection):
         def AH(y):
             return nufft(y[None,], trj[None,])[0] * nvox ** 0.5
         kerns = nufft.calc_teoplitz_kernels(trj[None])
-        def AAH(y):
-            return nufft.normal_toeplitz(y[None,None,], kerns)[0,0] * nvox
+
+        if use_topeplitz:
+            def AAH(y):
+                return nufft.normal_toeplitz(y[None,None,], kerns)[0,0] * nvox
+        else:
+            def AAH(y):
+                return A(AH(y))
         
         # Compute SVD
         U, S, Vh = svd_power_method_tall(A=AH,
@@ -480,75 +352,8 @@ class exponential_imperfection(lowdim_imperfection):
                                          device=self.torch_dev)
         self.temporal_funcs = rearrange(U * S, '... nseg -> nseg ...').conj()
         self.spatial_funcs = Vh.conj()
-        
-        # ro, pe = 300, 0
-        # kern_test = self._build_spatio_temporal_matrix(t_slice=(ro, pe), flatten=False, lowrank=False)
-        # kern_svd = self._build_spatio_temporal_matrix(t_slice=(ro, pe), flatten=False, lowrank=True)
-        # # kern_svd = self.spatial_funcs[0].abs() + 1j * self.spatial_funcs[1].abs()
-        # # sf, tf = self._calc_svd_batched()
-        # # kern_test = sf[0].abs() + 1j * sf[1].abs()
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(14,7))
-        # plt.subplot(221)
-        # plt.title('True Kernel')
-        # plt.imshow(kern_test.real.cpu())
-        # plt.axis('off')
-        # plt.subplot(222)
-        # plt.title('SVD Kernel')
-        # plt.imshow(kern_svd.real.cpu())
-        # plt.axis('off')
-        # plt.subplot(223)
-        # plt.imshow(kern_test.imag.cpu())
-        # plt.axis('off')
-        # plt.subplot(224)
-        # plt.imshow(kern_svd.imag.cpu())
-        # plt.axis('off')
-        # plt.tight_layout()
-        # plt.figure(figsize=(10,10))
-        # plt.imshow((kern_test - kern_svd).abs().cpu())
-        # plt.axis('off')
-        # plt.show()
-        # quit()
-
-        return self.spatial_funcs, self.temporal_funcs
-
-    def apply_spatial(self, 
-                      x: Optional[torch.Tensor] = None, 
-                      ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        if self.method == 'ts':
-            exp_term = einsum(self.phis, self.alpha_clusters[ls], 'B ..., L B -> L ...')
-            bs = torch.exp(-2j * torch.pi * exp_term)
-        elif self.method == 'svd':
-            bs = self.spatial_funcs[ls]
-        if x is None:
-            return bs
-        else:
-            return bs * x.unsqueeze(-len(self.im_size)-1)
     
-    def apply_spatial_adjoint(self, 
-                              y: torch.Tensor, 
-                              ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        if self.method == 'ts':
-            exp_term = einsum(self.phis, self.alpha_clusters[ls], 'B ..., L B -> L ...')
-            bs = torch.exp(-2j * torch.pi * exp_term)
-        elif self.method == 'svd':
-            bs = self.spatial_funcs[ls]
-        return torch.sum(bs.conj() * y, dim=-len(self.im_size)-1)
-        
-    def apply_temporal(self, 
-                       x: torch.Tensor, 
-                       ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        h = self.temporal_funcs[ls]
-        return (h * x).sum(dim=-len(self.trj_size)-1)
-
-    def apply_temporal_adjoint(self, 
-                               y: Optional[torch.Tensor] = None, 
-                               ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
-        h = self.temporal_funcs[ls]
-        if y is None:
-            return h
-        else:
-            return h.conj() * y.unsqueeze(-len(self.trj_size)-1)
+        return self.spatial_funcs, self.temporal_funcs
 
     def _build_spatio_temporal_matrix(self,
                                       r_slice: Optional[tuple] = slice(None), 
@@ -573,7 +378,7 @@ class exponential_imperfection(lowdim_imperfection):
         Returns:
         --------
         st_matrix : torch.Tensor
-            The spatio-temporal matrix with shape (*im_size(r_slice), *trj_size(t_slice))
+            The spatio-temporal matrix with shape (... *im_size(r_slice), *trj_size(t_slice))
         """
 
         if lowrank:
@@ -622,3 +427,98 @@ class exponential_imperfection(lowdim_imperfection):
             st_matrix = torch.exp(-2j * torch.pi * st_matrix)
 
         return st_matrix 
+    
+    def get_network_features(self) -> torch.Tensor:
+        """
+        Relevant network features are the alpha coefficients and the hl functions
+
+        Returns:
+        --------
+        features : torch.Tensor
+            The features of the imperfection with shape (*trj_size, nfeat)
+        """
+        if self.method == 'ts' and self.interp_type == 'zero':
+            self.temporal_funcs /= self.temporal_funcs.abs().max()
+            features = torch.cat((self.alphas, 
+                                self.temporal_funcs.real, 
+                                self.temporal_funcs.imag), dim=0)
+        else:
+            features = self.alphas
+        features = rearrange(features, 'nfeat ... -> ... nfeat')
+        return features
+    
+    def apply_spatio_temporal(self,
+                              x: torch.Tensor,
+                              r_inds: Optional[torch.Tensor] = slice(None), 
+                              t_inds: Optional[torch.Tensor] = slice(None),
+                              lowrank: Optional[bool] = False) -> torch.Tensor:
+        """
+        Applies the full spatio-temporal imperfection model to the data
+
+        Parameters:
+        -----------
+        x : torch.Tensor
+            The input data with shape (..., nc, *im_size)
+        r_inds : Optional[tuple]
+            Slices the flattened spatial terms with shape (N,)
+        t_inds : Optional[tuple]
+            Slices the flattened temporal terms with shape (N,)
+        lowrank : Optional[bool]
+            if True, uses lowrank approximation
+        
+        Returns:
+        --------
+        xt : torch.Tensor
+            The spatio-temporal data with shape (..., nc, N)
+        """
+        
+        # Flatten spatial and temporal dims
+        x = x.flatten(start_dim=-len(self.im_size))[..., r_inds]
+
+        if lowrank:
+            h = self.apply_temporal_adjoint().reshape((self.L, -1))[:, t_inds]
+            b = self.apply_spatial().reshape((self.L, -1))[:, r_inds]
+            xt = torch.sum(b * h, dim=0) * x
+        else:
+            alphas = self.alphas.reshape((self.B, -1))[:, t_inds]
+            phis = self.phis.reshape((self.B, -1))[:, r_inds]
+            xt = torch.exp(-2j * torch.pi * torch.sum(alphas * phis, dim=0)) * x
+        return xt
+    
+    def apply_spatial(self, 
+                      x: Optional[torch.Tensor] = None, 
+                      ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
+        if self.method == 'ts':
+            exp_term = einsum(self.phis, self.alpha_clusters[ls], 'B ..., L B -> L ...')
+            bs = torch.exp(-2j * torch.pi * exp_term)
+        elif self.method == 'svd':
+            bs = self.spatial_funcs[ls]
+        if x is None:
+            return bs
+        else:
+            return bs * x.unsqueeze(-len(self.im_size)-1)
+    
+    def apply_spatial_adjoint(self, 
+                              y: torch.Tensor, 
+                              ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
+        if self.method == 'ts':
+            exp_term = einsum(self.phis, self.alpha_clusters[ls], 'B ..., L B -> L ...')
+            bs = torch.exp(-2j * torch.pi * exp_term)
+        elif self.method == 'svd':
+            bs = self.spatial_funcs[ls]
+        return torch.sum(bs.conj() * y, dim=-len(self.im_size)-1)
+        
+    def apply_temporal(self, 
+                       x: torch.Tensor, 
+                       ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
+        h = self.temporal_funcs[ls]
+        return (h * x).sum(dim=-len(self.trj_size)-1)
+
+    def apply_temporal_adjoint(self, 
+                               y: Optional[torch.Tensor] = None, 
+                               ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
+        h = self.temporal_funcs[ls]
+        if y is None:
+            return h
+        else:
+            return h.conj() * y.unsqueeze(-len(self.trj_size)-1)

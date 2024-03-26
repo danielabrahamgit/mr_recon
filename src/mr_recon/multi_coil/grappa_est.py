@@ -1,7 +1,7 @@
 import torch
 import sigpy as sp
 
-from typing import Optional
+from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.fourier import fft, ifft
 from mr_recon.utils import np_to_torch, torch_to_np, rotation_matrix
@@ -102,7 +102,7 @@ def rect_trj(cal_shape: tuple,
 def grappa_AHA_AHb(img_cal: torch.Tensor, 
                    source_vectors: torch.Tensor,
                    width: Optional[int] = 6,
-                   oversamp: Optional[float] = 1.25) -> (torch.Tensor, torch.Tensor):
+                   oversamp: Optional[float] = 1.25) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Computes AHA and AHb matrices for grappa kernel estimation using
     NUFFT interpolation on the calibration
@@ -186,7 +186,7 @@ def grappa_AHA_AHb(img_cal: torch.Tensor,
 def grappa_AHA_AHb_fast(img_cal: torch.Tensor, 
                         source_vectors: torch.Tensor, 
                         width: Optional[int] = 6, 
-                        oversamp: Optional[float] = 1.25) -> (torch.Tensor, torch.Tensor):
+                        oversamp: Optional[float] = 1.25) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         A faster grappa kernel estimation algorithm from:
         Luo, T., Noll, D. C., Fessler, J. A., & Nielsen, J. (2019). 

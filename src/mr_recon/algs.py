@@ -178,6 +178,47 @@ def power_method_operator(A: callable,
     
     return x0, ll.item()
 
+def inverse_power_method_operator(A: callable,
+                                  x0: torch.Tensor,
+                                  num_iter: Optional[int] = 15,
+                                  n_cg_iter: Optional[int] = 10,
+                                  verbose: Optional[bool] = True) -> Tuple[torch.Tensor, float]:
+    """
+    Uses power method to find largest eigenvalue and corresponding eigenvector
+    of A^-1
+
+    Parameters:
+    -----------
+    A : callable
+        linear operator
+    x0 : torch.Tensor
+        initial guess of eigenvector with shape (*vec_shape)
+    num_iter : int
+        number of iterations to run power method
+    n_cg_iter : int
+        number of iterations to run conjugate gradient
+    verbose : bool
+        toggles progress bar
+    
+    Returns:
+    --------
+    eigen_vec : torch.Tensor
+        eigenvector with shape (*vec_shape)
+    eigen_val : float
+        eigenvalue
+    """
+    
+    for _ in tqdm(range(num_iter), 'Max Eigenvalue', disable=not verbose):
+        
+        z = conjugate_gradient(A, x0, num_iters=n_cg_iter, verbose=False, lamda_l2=1e-5)
+        ll = torch.linalg.norm(z)
+        x0 = z / ll
+    
+    if verbose:
+        print(f'Max Eigenvalue = {ll}')
+    
+    return x0, ll.item()
+
 def lin_solve(AHA: torch.Tensor, 
               AHb: torch.Tensor, 
               lamda: Optional[float] = 0.0, 
@@ -302,6 +343,7 @@ def gradient_descent(AHA: nn.Module,
                      num_iters: Optional[int] = 100,
                      lamda_l2: Optional[float] = 0.0,
                      tolerance: Optional[float] = 1e-8,
+                     return_resids: Optional[bool] = False,
                      verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Parameters:
@@ -318,6 +360,8 @@ def gradient_descent(AHA: nn.Module,
         Replaces AHA with AHA + lamda_l2 * I
     tolerance : float 
         Used as stopping criteria
+    return_resids : bool
+        toggles return of residuals
     verbose : bool
         toggles print statements
     
@@ -327,13 +371,19 @@ def gradient_descent(AHA: nn.Module,
         least squares estimate of x
     """
     x = AHb
+    AHA_wrapper = lambda x : AHA(x) + lamda_l2 * x
+    resids = []
     for i in tqdm(range(num_iters), 'GD Iterations', disable=not verbose):
-        grad = AHA(x) - AHb
+        grad = AHA_wrapper(x) - AHb
         x = x - lr * grad
-        if torch.norm(grad) < tolerance:
+        nrm = torch.norm(grad)
+        resids.append(nrm.item())
+        if nrm < tolerance:
             break
-    return x
-
+    if return_resids:
+        return resids, x
+    else:
+        return x
 
 def conjugate_gradient(AHA: nn.Module, 
                        AHb: torch.Tensor, 
@@ -341,6 +391,7 @@ def conjugate_gradient(AHA: nn.Module,
                        num_iters: Optional[int] = 10, 
                        lamda_l2: Optional[float] = 0.0,
                        tolerance: Optional[float] = 1e-8,
+                       return_resids: Optional[bool] = False,
                        verbose=True) -> torch.Tensor:
     """Conjugate gradient for complex numbers. The output is also complex.
     Solve for argmin ||Ax - b||^2. Inspired by sigpy!
@@ -359,6 +410,8 @@ def conjugate_gradient(AHA: nn.Module,
         Replaces AHA with AHA + lamda_l2 * I
     tolerance : float 
         Used as stopping criteria
+    return_resids : bool
+        toggles return of residuals
     verbose : bool
         toggles print statements
     
@@ -385,6 +438,8 @@ def conjugate_gradient(AHA: nn.Module,
     z = P(r)
     p = z.clone()
 
+    resids = []
+
     # Main loop
     for i in tqdm(range(num_iters), 'CG Iterations', disable=not verbose):
 
@@ -400,7 +455,9 @@ def conjugate_gradient(AHA: nn.Module,
 
         # Update r
         r = r - alpha * Ap
-        if torch.norm(r) < tolerance:
+        rnrm = torch.norm(r)
+        resids.append(rnrm.item())
+        if rnrm < tolerance:
             break
 
         # Update z
@@ -409,5 +466,8 @@ def conjugate_gradient(AHA: nn.Module,
         # Update p
         beta = torch.real(torch.sum(r.conj() * z)) / rz
         p = z + beta * p
-
-    return x0
+    
+    if return_resids:
+        return resids, x0
+    else:
+        return x0

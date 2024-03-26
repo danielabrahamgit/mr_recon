@@ -75,6 +75,8 @@ def calc_toep_kernel_helper(nufft_adj_os: callable,
         else:
             assert weights.device == torch_dev
         trj_batch = trj.shape[1:-1]
+        if trj.shape[0] == 1 and weights.shape[0] != 1:
+            trj = trj.expand((weights.shape[0], *trj.shape[1:]))
         N = trj.shape[0]
         d = trj.shape[-1]
         

@@ -14,7 +14,7 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 # Params
-device_idx = 6
+device_idx = 6 * 0 - 1
 grd_os = 2.0
 try:
     torch_dev = torch.device(device_idx)
@@ -24,7 +24,9 @@ im_size = (220, 220)
 
 # Make grid and k-space coordinates
 grd = gen_grd(im_size).to(torch_dev)
-crds = 20 * (torch.rand((4, 2), dtype=torch.float32, device=torch_dev) - 0.5) # in [-10, 10]
+crds = (torch.rand((4, 2), dtype=torch.float32, device=torch_dev) - 0.5)
+crds[..., 0] *= im_size[0] * 0.99
+crds[..., 1] *= im_size[1] * 0.99
 crds = torch.round(crds * grd_os) / grd_os
 img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
 
@@ -39,7 +41,7 @@ crds_kb = kb_nufft.rescale_trajectory(crds)
 ksp_kb = kb_nufft(img[None,], crds_kb[None,])[0]
 
 # sigpy NUFFt
-sp_nufft = sigpy_nufft(im_size, device_idx=device_idx)
+sp_nufft = sigpy_nufft(im_size, device_idx=device_idx, oversamp=1.5, width=6)
 crds_sp = sp_nufft.rescale_trajectory(crds)
 ksp_sp = sp_nufft(img[None,], crds_sp[None,])[0]
 
@@ -93,3 +95,21 @@ aha_grd = grd_nufft.normal_toeplitz(img[None, None], kern_grd)[0,0]
 assert torch.allclose(aha_dft, aha_kb, atol=0.0, rtol=1e-2)
 assert torch.allclose(aha_dft, aha_sp, atol=0.0, rtol=1e-2)
 assert torch.allclose(aha_dft, aha_grd, atol=0.0, rtol=1e-2), torch.norm(aha_dft) / torch.norm(aha_grd)
+
+# ------------- Test Toeplitz Compared to no Toeplitz ---------------
+nuffts = [kb_nufft, sp_nufft, grd_nufft]
+for nufft in nuffts:
+
+    # rescale
+    crds_rs = nufft.rescale_trajectory(crds)
+
+    # Forward backward approach
+    frwrd = nufft(img[None,], crds_rs[None,])[0]
+    aha_no = nufft.adjoint(frwrd[None,], crds_rs[None,])[0]
+
+    # Toeplitz approach
+    kern = nufft.calc_teoplitz_kernels(crds_rs[None,])
+    aha = nufft.normal_toeplitz(img[None, None], kern)[0,0]
+
+    assert torch.allclose(aha, aha_no, atol=0.0, rtol=1e-2), f'{nufft} failed'
+plt.show()

@@ -28,22 +28,22 @@ def bases(x, y, z):
         y3 = y ** 3
         z3 = z ** 3
         return torch.cat([
-            torch.ones_like(x),
-            x,
-            y,
-            z,
-            x * y,
-            z * y,
-            3 * z2 - (x2 + y2 + z2),
-            x * z,
-            x2 - y2,
-            3 * y * x2 - y3, 
-            x * y * z,
-            (5 * z2 - (x2 + y2 + z2)) * y,
-            5 * z3 - 3 * z * (x2 + y2 + z2),
-            (5 * z2 - (x2 + y2 + z2)) * x,
-            z * x2 - z * y2,
-            x3 - 3 * x * y2
+            torch.ones_like(x), # 0
+            x, # 1
+            y, # 2 
+            z, # 3
+            x * y, # 4
+            z * y, # 5
+            3 * z2 - (x2 + y2 + z2), # 6
+            x * z, # 7
+            x2 - y2, # 8
+            3 * y * x2 - y3, # 9
+            x * y * z, # 10
+            (5 * z2 - (x2 + y2 + z2)) * y, # 11
+            5 * z3 - 3 * z * (x2 + y2 + z2), # 12
+            (5 * z2 - (x2 + y2 + z2)) * x, # 13
+            z * x2 - z * y2, # 14
+            x3 - 3 * x * y2 # 15
         ], dim=0)
         
 def alpha_phi_from_b0(b0_map: torch.Tensor,

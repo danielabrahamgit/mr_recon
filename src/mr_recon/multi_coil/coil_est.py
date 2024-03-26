@@ -10,13 +10,14 @@ from mr_recon.algs import power_method_matrix
 from mr_recon.fourier import ifft
 from mr_recon.utils import torch_to_np, np_to_torch
 
+# TODO give batch dims (useful for multi-slice)
 def csm_from_espirit(ksp_cal: torch.Tensor,
                      im_size: tuple,
                      thresh: Optional[float] = 0.02,
                      kernel_width: Optional[int] = 6,
                      crp: Optional[float] = 0.95,
                      max_iter: Optional[int] = 100,
-                     verbose: Optional[bool] = True) -> Tuple(torch.Tensor, torch.Tensor):
+                     verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Copy of sigpy implementation of ESPIRiT calibration, but in torch:
     Martin Uecker, ... ESPIRIT - An Eigenvalue Approach to Autocalibrating Parallel MRI
@@ -47,7 +48,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     """
 
     # Consts
-    img_ndim = ksp_cal.ndim - 1
+    img_ndim = len(im_size)
     num_coils = ksp_cal.shape[0]
     device = ksp_cal.device
 
@@ -103,8 +104,8 @@ def csm_from_kernels(grappa_kernels: torch.Tensor,
                      source_vectors: torch.Tensor,
                      im_size: tuple,
                      crp: Optional[float] = 0.95,
-                     num_iter: Optional[int] = 100,
-                     verbose: Optional[bool] = True) -> Tuple(torch.Tensor, torch.Tensor):
+                     max_iter: Optional[int] = 100,
+                     verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Estimates coil sensitivty maps from grappa kernels
 
@@ -134,7 +135,7 @@ def csm_from_kernels(grappa_kernels: torch.Tensor,
 
     # Compute image covariance and do power method
     BHB = calc_image_covariance_kernels(grappa_kernels, source_vectors, im_size, verbose=verbose)
-    mps, eigen_vals = power_method_matrix(BHB, num_iter, verbose=verbose)
+    mps, eigen_vals = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
 
     # Phase relative to first map
     mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-8))

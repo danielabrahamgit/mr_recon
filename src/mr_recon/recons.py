@@ -134,3 +134,64 @@ def CG_SENSE_recon(A: linop,
                                verbose=verbose)
     
     return recon
+
+def FISTA_recon(A: linop,
+                ksp: torch.Tensor,
+                proxg: callable,
+                max_iter: int = 40,
+                max_eigen: Optional[float] = None,
+                verbose: Optional[bool] = True) -> torch.Tensor:
+    """
+    Run FISTA recon
+    recon = min_x ||Ax - b||_2^2 + g(x)
+    
+    Parameters:
+    -----------
+    A : linop
+        The linear operator (see linop)
+    ksp : torch.Tensor
+        k-space data with shape (nc, nro, npe, ntr)
+    proxg : callable
+        proximal operator for g(x)
+    max_iter : int
+        max number of iterations for recon algorithm
+    max_eigen : float
+        maximum eigenvalue of AHA
+    verbose : bool 
+        Toggles print statements
+
+    Returns:
+    --------
+    recon : torch.Tensor
+        the reconstructed image/volume
+    """
+
+    # Consts
+    device = ksp.device
+
+    # Estimate largest eigenvalue so that lambda max of AHA is 1
+    if max_eigen is None:
+        x0 = torch.randn(A.ishape, dtype=torch.complex64, device=device)
+        _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
+        max_eigen *= 1.01
+    
+    # Starting with AHb
+    start = time.perf_counter()
+    y = ksp.type(torch.complex64)
+    AHb = A.adjoint(y) / (max_eigen ** 0.5)
+    end = time.perf_counter()
+    if verbose:
+        print(f'AHb took {end-start:.3f}(s)')
+
+    # Clear data (we dont need it anymore)
+    y = y.cpu()
+    with device:
+        torch.cuda.empty_cache()
+
+    # Wrap normal with max eigen
+    AHA = lambda x : A.normal(x) / max_eigen
+
+    # Run FISTA
+    recon = FISTA(AHA, AHb, proxg, max_iter)
+
+    return recon

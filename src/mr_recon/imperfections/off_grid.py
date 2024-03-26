@@ -2,7 +2,7 @@ import torch
 
 from typing import Optional
 from mr_recon.utils import gen_grd
-from mr_recon.imperfections.lowrank_imperfection import exponential_imperfection
+from mr_recon.imperfections.exponential import exponential_imperfection
 
 class off_grid_imperfection(exponential_imperfection):
 

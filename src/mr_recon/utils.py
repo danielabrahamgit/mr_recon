@@ -73,8 +73,12 @@ def quantize_data(data: torch.Tensor,
         # indices
         idxs = torch.zeros_like(data_flt[:, 0], dtype=torch.int)
         b = centers[0, 0]
-        m = centers[-1, 0]
+        if K > 1:
+            m = centers[1, 0] - b
+        else:
+            m = 1
         idxs = torch.round((data_flt[:, 0] - b) / m).type(torch.int)
+        idxs = torch.clamp(idxs, 0, K - 1)
 
     idxs = idxs.reshape(data.shape[:-1])
 
