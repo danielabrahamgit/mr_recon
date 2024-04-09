@@ -1,0 +1,90 @@
+import matplotlib
+matplotlib.use('webagg')
+import matplotlib.pyplot as plt
+
+import torch
+import numpy as np
+import sigpy as sp
+from mr_recon.fourier import sigpy_nufft, torchkb_nufft, gridded_nufft
+from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
+from einops import rearrange, einsum
+
+# Random seeds
+np.random.seed(0)
+torch.manual_seed(0)
+
+# Params
+device_idx = 5
+grd_os = 2.0
+try:
+    torch_dev = torch.device(device_idx)
+except:
+    torch_dev = torch.device('cpu')
+im_size = (220, 220)
+rtol = 5e-2 
+eps = 1e-2
+
+# Make grid and k-space coordinates
+grd = gen_grd(im_size).to(torch_dev)
+crds = (torch.rand((1000, 2), dtype=torch.float32, device=torch_dev) - 0.5)
+crds[..., 0] *= im_size[0] * 0.99
+crds[..., 1] *= im_size[1] * 0.99
+# crds = torch.round(crds * grd_os) / grd_os
+img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
+
+# Create nuffts
+kb_nufft = torchkb_nufft(im_size, device_idx=device_idx)
+sp_nufft = sigpy_nufft(im_size, device_idx=device_idx)
+# grd_nufft = gridded_nufft(im_size, device_idx=device_idx, grid_oversamp=grd_os)
+grd_nufft = torchkb_nufft(im_size, device_idx=device_idx)
+nuffts = [sp_nufft, kb_nufft, grd_nufft]
+names = ['sigpy', 'torchkb', 'gridded']
+def plot_err_ksp(err):
+    plt.plot(err.cpu())
+    plt.show()
+def plot_err_img(err):
+    plt.imshow(err.cpu())
+    plt.show()
+
+# ------------- Test Forward ---------------
+kern = torch.exp(-2j * torch.pi * einsum(crds, grd, 'n two, ... two -> n ...'))
+ksp_dft = einsum(kern, img, 'n ..., ... -> n') / np.sqrt(np.prod(im_size))
+for nufft, name in zip(nuffts, names):
+    crds_rs = nufft.rescale_trajectory(crds)
+    ksp = nufft(img[None,], crds_rs[None,])[0]
+    err = (ksp - ksp_dft).abs() / (ksp_dft.abs() + eps)
+    assert torch.all(err <= rtol), f'{name} forward failed {plot_err_ksp(err)}'
+
+# ------------- Test Adjoint ---------------
+ksp = ksp_dft.clone()
+img_dft = einsum(kern.conj(), ksp, 'n ... , n -> ...') / np.sqrt(np.prod(im_size))
+for nufft, name in zip(nuffts, names):
+    crds_rs = nufft.rescale_trajectory(crds)
+    img_adj = nufft.adjoint(ksp[None,], crds_rs[None,])[0]
+    err = (img_adj - img_dft).abs() / (img_dft.abs() + eps)
+    assert torch.all(err <= rtol), f'{name} adjoint failed {plot_err_img(err)}'
+
+# ------------- Test Toeplitz ---------------
+aha_dft = einsum(kern.conj(), ksp_dft, 'n ... , n -> ...') / np.sqrt(np.prod(im_size))
+for nufft, name in zip(nuffts, names):
+    crds_rs = nufft.rescale_trajectory(crds)
+    kern = nufft.calc_teoplitz_kernels(crds_rs[None,])
+    aha = nufft.normal_toeplitz(img[None, None], kern)[0,0]
+    err = (aha - aha_dft).abs() / (aha_dft.abs() + eps)
+    assert torch.all(err <= rtol), f'{name} toeplitz failed {plot_err_img(err)}'
+
+# ------------- Test Toeplitz Compared to no Toeplitz ---------------
+nuffts = [sp_nufft, kb_nufft, grd_nufft]
+for nufft, name in zip(nuffts, names):
+    crds_rs = nufft.rescale_trajectory(crds)
+
+    # Forward backward approach
+    frwrd = nufft(img[None,], crds_rs[None,])[0]
+    aha_no = nufft.adjoint(frwrd[None,], crds_rs[None,])[0]
+
+    # Toeplitz approach
+    kern = nufft.calc_teoplitz_kernels(crds_rs[None,])
+    aha = nufft.normal_toeplitz(img[None, None], kern)[0,0]
+
+    err = (aha - aha_no).abs() / (aha_no.abs() + eps)
+    assert torch.all(err <= rtol), f'{name} toeplitz - normal failed {plot_err_img(err)}'

@@ -8,12 +8,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sigpy as sp
 
-from mr_recon.utils.block import Block
+from mr_recon.block import Block
 
 
 __all__ = [
     'LLRHparams', 'LocallyLowRank',
 ]
+
+"""
+A proximal gradient is defined as 
+prox_g(w) = argmin_x 1/2 ||x - w||^2 + g(x)
+"""
 
 @dataclass
 class LLRHparams:
@@ -23,6 +28,25 @@ class LLRHparams:
                         Tuple[int, int, int]]
     threshold: float
     rnd_shift: int = 3
+
+def soft_thresh(x: torch.Tensor,
+                rho: float) -> torch.Tensor:
+    """
+    Soft thresholding operator
+
+    Parameters:
+    -----------
+    x : torch.Tensor
+        input tensor
+    rho : float
+        threshold value
+
+    Returns:
+    --------
+    x_thresh : torch.Tensor
+        thresholded tensor
+    """
+    return torch.exp(1j * torch.angle(x)) * torch.max(torch.abs(x) - rho, torch.zeros(x.shape, device=x.device))
 
 class L1Wav(nn.Module):
     """Wavelet proximal operator mimicking Sid's implimentation"""
@@ -86,7 +110,8 @@ class L1Wav(nn.Module):
         input_torch = torch.roll(input, (shift,)*nd, dims=self.axes)
 
         # Move to sigpy
-        input_sigpy = input_torch.numpy()
+        dev = input_torch.device
+        input_sigpy = input_torch.cpu().numpy()
 
         # Appoly random phase ...
         input_sigpy *= phase
@@ -100,12 +125,62 @@ class L1Wav(nn.Module):
         input_sigpy *= np.conj(phase)
         
         # Move to pytorch
-        output_torch = torch.asarray(input_sigpy).to('cpu')
+        output_torch = torch.asarray(input_sigpy).to(dev)
 
         # Unroll
         output_torch = torch.roll(output_torch, (-shift,)*nd, dims=self.axes)
         
         return output_torch
+
+# FIXME TODO
+class TV(nn.Module):
+    
+    def __init__(self,
+                 im_size: tuple,
+                 lamda: float,
+                 norm: Optional[str] = 'l1'):
+        """
+        TV operator is defined as
+
+        TV(x) = norm(D)
+
+        Parameters:
+        -----------
+        im_size : tuple
+            the image/volume dimensions
+        lamda : float
+            Regularization strength
+        norm : str
+            the type of norm to use from:
+            ['l1', 'l2']
+        """
+        super().__init__()
+        assert len(im_size) == 2 or len(im_size) == 3, 'Only 2D and 3D images are supported'
+        self.im_size = im_size
+        self.lamda = lamda
+    
+    def forward(self,
+                input: torch.tensor,
+                alpha: Optional[float] = 1.0):
+        """
+        Proximal operator
+
+        Parameters:
+        -----------
+        input : torch.tensor
+            image/volume input with shape (..., *im_size)
+        alpha : float
+            proximal weighting term on g(x)
+
+        Returns:
+        --------
+        output : torch.tensor
+            proximal output
+        """
+
+        return input # TODO
+
+
 
 class LocallyLowRank(nn.Module):
     """Version of LLR mimicking Sid's version in Sigpy
