@@ -9,14 +9,14 @@ import sigpy.mri as mri
 from mr_recon.linops import sense_linop, batching_params
 from mr_recon.utils import np_to_torch
 from mr_recon.recons import CG_SENSE_recon, min_norm_recon
-from mr_recon.fourier import sigpy_nufft, gridded_nufft
+from mr_recon.fourier import sigpy_nufft, gridded_nufft, torchkb_nufft
 
 # Params
 im_size = (220, 220)
 ninter = 16
 ncoil = 32
 R = 4
-lamda_l2 = 1e-3 * 0
+lamda_l2 = 1e-5 * 0
 max_iter = 100
 device_idx = 4
 torch_dev = torch.device(device_idx)
@@ -40,6 +40,23 @@ dcf /= dcf.max()
 # Simulate with sigpy 
 ksp = sp.nufft(phantom * mps, trj, oversamp=2.0, width=6)
 
+# Recon with mr_recon
+bparams = batching_params(coil_batch_size=ncoil)
+nufft = sigpy_nufft(im_size=im_size, device_idx=device_idx)
+# nufft = torchkb_nufft(im_size=im_size, device_idx=device_idx)
+# nufft = gridded_nufft(im_size=im_size, device_idx=device_idx)
+A = sense_linop(im_size=im_size,
+                trj=np_to_torch(trj).to(torch_dev),
+                mps=np_to_torch(mps).to(torch_dev),
+                dcf=np_to_torch(dcf).to(torch_dev),
+                bparams=bparams,
+                nufft=nufft,
+                use_toeplitz=False,)
+img_mr_recon = CG_SENSE_recon(A=A, 
+                              ksp=np_to_torch(ksp).to(torch_dev), 
+                              lamda_l2=lamda_l2,
+                              max_eigen=1.0,
+                              max_iter=max_iter).cpu().numpy()
 # Recon with sigpy
 img_sigpy = sp.to_device(mri.app.SenseRecon(ksp, mps, 
                                             weights=dcf, 
@@ -48,29 +65,9 @@ img_sigpy = sp.to_device(mri.app.SenseRecon(ksp, mps,
                                             device=sp.Device(device_idx), 
                                             max_iter=max_iter).run())
 
-# Recon with mr_recon
-bparams = batching_params(coil_batch_size=ncoil)
-# nufft = gridded_nufft(im_size=im_size, device_idx=device_idx)
-A = sense_linop(im_size=im_size,
-                trj=np_to_torch(trj).to(torch_dev),
-                mps=np_to_torch(mps).to(torch_dev),
-                dcf=np_to_torch(dcf).to(torch_dev),
-                bparams=bparams,
-                # nufft=nufft,
-                use_toeplitz=True,)
-img_mr_recon = CG_SENSE_recon(A=A, 
-                              ksp=np_to_torch(ksp).to(torch_dev), 
-                              lamda_l2=lamda_l2,
-                              max_eigen=1.0,
-                              max_iter=max_iter).cpu().numpy()
-# img_mr_recon = min_norm_recon(A=A, 
-#                               ksp=np_to_torch(ksp).to(torch_dev), 
-#                               max_eigen=1.0,
-#                               max_iter=max_iter).cpu().numpy()
-
 # Compare
 img_sigpy *= np.linalg.norm(img_mr_recon) / np.linalg.norm(img_sigpy)
-vmax = np.abs(img_sigpy).max() * 0.9
+vmax = np.abs(img_sigpy).max() * 0.8
 plt.figure(figsize=(10, 10))
 plt.subplot(221)
 plt.title('SigPy')
@@ -81,7 +78,7 @@ plt.title('mr_recon')
 plt.imshow(np.abs(img_mr_recon), cmap='gray', vmin=0, vmax=vmax)
 plt.axis('off')
 plt.subplot(223)
-plt.title('Trajectory')
+plt.title(f'Trajectory (R = {R})')
 for i in range(trj.shape[1]):
     plt.plot(trj[:, i, 0], trj[:, i, 1], color='black', alpha=0.2)
 plt.plot(trj[:, 0, 0], trj[:, 0, 1], color='red')

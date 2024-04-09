@@ -388,13 +388,15 @@ class torchkb_nufft(NUFFT):
     def __init__(self,
                  im_size: tuple,
                  device_idx: Optional[int] = -1,
-                 oversamp: Optional[float] = 2.0):
+                 oversamp: Optional[float] = 2.0,
+                 numpoints: Optional[int] = 6):
         super().__init__(im_size, device_idx)
         
         im_size_os = tuple([round(i * oversamp) for i in im_size])
-        self.kb_ob = KbNufft(im_size, device=self.torch_dev, grid_size=im_size_os).to(self.torch_dev)
-        self.kb_adj_ob = KbNufftAdjoint(im_size, device=self.torch_dev, grid_size=im_size_os).to(self.torch_dev)
+        self.kb_ob = KbNufft(im_size, device=self.torch_dev, grid_size=im_size_os, numpoints=numpoints).to(self.torch_dev)
+        self.kb_adj_ob = KbNufftAdjoint(im_size, device=self.torch_dev, grid_size=im_size_os, numpoints=numpoints).to(self.torch_dev)
         self.oversamp = oversamp
+        self.numpoints = numpoints
 
     def rescale_trajectory(self,
                            trj: torch.Tensor) -> torch.Tensor:
@@ -468,7 +470,7 @@ class torchkb_nufft(NUFFT):
         im_size_os = tuple([round(i * os_factor) for i in self.im_size])
 
         # Make new instance of NUFFT with oversampled image size
-        nufft_os = torchkb_nufft(im_size_os, device_idx=self.torch_dev.index)
+        nufft_os = torchkb_nufft(im_size_os, device_idx=self.torch_dev.index, oversamp=self.oversamp, numpoints=self.numpoints)
 
         return calc_toep_kernel_helper(nufft_os.adjoint, trj, weights) * (os_factor ** len(self.im_size))
     

@@ -269,7 +269,7 @@ def lin_solve(AHA: torch.Tensor,
 
 def FISTA(AHA: nn.Module, 
           AHb: torch.Tensor, 
-          proxg: nn.Module, 
+          proxg: callable, 
           num_iters: Optional[int] = 20,
           ptol_exit: Optional[float] = 0.5,
           verbose: Optional[bool] = True) -> torch.Tensor:
@@ -305,23 +305,13 @@ def FISTA(AHA: nn.Module,
     if num_iters <= 0:
         return x
 
-    # Benchmarking
-    t_gr = 0.0
-    t_prox = 0.0
-
     for k in tqdm(range(0, num_iters), 'FISTA Iterations', disable=not verbose):
 
         x_old = x.clone()
         x     = z.clone()
         
-        start = time.perf_counter()
         gr    = AHA(x) - AHb
-        end = time.perf_counter()
-        t_gr += end - start
-        start = time.perf_counter()
         x     = proxg(x - gr)
-        end = time.perf_counter()
-        t_prox += end - start
         if k == 0:
             z = x
         else:
@@ -332,9 +322,7 @@ def FISTA(AHA: nn.Module,
             if verbose:
                 print(f'Tolerance reached after {k+1} iterations, exiting FISTA')
             break
-
-    if verbose:
-        print(f'Gradient Took {t_gr:.3f}(s), Prox Took {t_prox:.3f}(s)')
+        
     return x
 
 def gradient_descent(AHA: nn.Module,

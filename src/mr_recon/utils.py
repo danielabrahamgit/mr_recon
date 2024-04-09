@@ -149,34 +149,6 @@ def rotation_matrix(axis: torch.Tensor,
     R[..., 2, 2] = a * a + d * d - b * b - c * c
     return R
 
-def fourier_resize(x, new_shape):
-
-    # Get GPU dev
-    x_np = torch_to_np(x)
-    dev = sp.get_device(x_np)
-    
-    with dev:
-
-        # FFT
-        ndim = len(new_shape)
-        X = sp.fft(x_np, axes=tuple(range(-ndim, 0)))
-
-        # Zero pad/chop
-        oshape = X.shape[:-ndim] + new_shape
-        X_rs = sp.resize(X, oshape)
-
-        # Windowing
-        X_rs = apply_window(X_rs, ndim, 'hamming')
-
-        # IFFT
-        x_rs = sp.ifft(X_rs, axes=tuple(range(-ndim, 0)))
-
-    # Convert to original
-    if torch.is_tensor(x):
-        return np_to_torch(x_rs)
-    else:
-        return x_rs
-
 def apply_window(sig: np.ndarray, 
                  ndim: int,
                  window_func: Optional[str] = 'hamming') -> np.ndarray:

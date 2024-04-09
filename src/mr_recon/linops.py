@@ -172,15 +172,14 @@ class sense_linop(linop):
 
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
-            mps = self.mps[c:d]
+            mps_times_img = self.mps[c:d] * img
 
             # Batch over segments 
             for l1, l2 in batch_iterator(imperf_rank, seg_batch_size):
                 if self.imperf_model is None:
-                    mps_weighted = mps[:, None, ...]
+                    Sx = mps_times_img[:, None, ...]
                 else:
-                    mps_weighted = self.imperf_model.apply_spatial(mps, slice(l1, l2))
-                Sx = mps_weighted * img
+                    Sx = self.imperf_model.apply_spatial(mps_times_img, slice(l1, l2))
 
                 # NUFFT and temporal terms
                 FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]

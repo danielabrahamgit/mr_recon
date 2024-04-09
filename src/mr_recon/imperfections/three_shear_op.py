@@ -3,49 +3,8 @@ import torch
 from typing import Optional
 from einops import einsum
 from torch import fft as fft_torch
-
-def gen_grd(im_size: tuple, 
-            fovs: Optional[tuple] = None) -> torch.Tensor:
-    """
-    Generates a grid of points given image size and FOVs
-
-    Parameters:
-    -----------
-    im_size : tuple
-        image dimensions
-    fovs : tuple
-        field of views, same size as im_size
-    
-    Returns:
-    --------
-    grd : torch.Tensor
-        grid of points with shape (*im_size, len(im_size))
-    """
-    if fovs is None:
-        fovs = (1,) * len(im_size)
-    lins = [
-        fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2) / (im_size[i]) 
-        for i in range(len(im_size))
-        ]
-    grds = torch.meshgrid(*lins, indexing='ij')
-    grd = torch.cat(
-        [g[..., None] for g in grds], dim=-1)
-        
-    return grd
-
-def fft(x, dim=None, norm='ortho'):
-    """Matches Sigpy's fft, but in torch"""
-    x = fft_torch.ifftshift(x, dim=dim)
-    x = fft_torch.fftn(x, dim=dim, norm=norm)
-    x = fft_torch.fftshift(x, dim=dim)
-    return x
-
-def ifft(x, dim=None, norm='ortho'):
-    """Matches Sigpy's fft adjoint, but in torch"""
-    x = fft_torch.ifftshift(x, dim=dim)
-    x = fft_torch.ifftn(x, dim=dim, norm=norm)
-    x = fft_torch.fftshift(x, dim=dim)
-    return x
+from mr_recon.utils import gen_grd
+from mr_recon.fourier import ifft, fft
 
 class motion_op(torch.nn.Module):
     

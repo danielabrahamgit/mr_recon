@@ -62,7 +62,8 @@ class exponential_imperfection(imperfection):
         super().__init__(L, method, interp_type, verbose)
 
     def _calc_time_segmentation(self,
-                                spatial_batch_size: Optional[int] = 2 ** 8) -> None:
+                                spatial_batch_size: Optional[int] = None,
+                                temporal_batch_size: Optional[int] = 2 ** 8) -> None:
         """
         Computes both h_l and T_l functions using time segmentation.
 
@@ -73,6 +74,8 @@ class exponential_imperfection(imperfection):
         -----------
         spatial_batch_size : int
             batch size over spatial terms
+        temporal_batch_size : int
+            batch size over temporal terms
 
         Saves:
         ------
@@ -95,36 +98,54 @@ class exponential_imperfection(imperfection):
             
         if 'lstsq' in self.interp_type:
 
-            # Prep AHA, AHB matrices
+            # Flatten spatial and temporal terms
             alphas_flt = rearrange(self.alphas, 'nbasis ... -> (...) nbasis')
             phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis')
+            T = alphas_flt.shape[0]
+            N = phis_flt.shape[0]
+
+            # Defualt batch
+            if spatial_batch_size is None:
+                spatial_batch_size = N
+            if temporal_batch_size is None:
+                temporal_batch_size = T
+
+            # Desired temporal functions
+            interp_funcs = torch.zeros((self.L, T),
+                                        dtype=torch.complex64, device=self.torch_dev)
+            
+            # Compute AHA
             AHA = torch.zeros((self.L, self.L), 
                               dtype=torch.complex64, device=self.torch_dev)
-            AHb = torch.zeros((self.L, alphas_flt.shape[0]), 
-                              dtype=torch.complex64, device=self.torch_dev)
-            
-            # Compute AHA and AHB in batches
-            batch_size = spatial_batch_size
-            for n1 in tqdm(range(0, phis_flt.shape[0], batch_size), 'Least Squares Interpolators'):
-                n2 = min(n1 + batch_size, phis_flt.shape[0])
-
-                # Accumulate AHA
-                A_batch = einsum(phis_flt[n1:n2, :], self.alpha_clusters, 
-                                 'B nbasis, L nbasis -> B L')
+            for n1, n2 in batch_iterator(N, spatial_batch_size):
+                n2 = min(n1 + spatial_batch_size, N)
+                A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
                 A_batch = torch.exp(-2j * torch.pi * A_batch)
                 AHA += A_batch.H @ A_batch / (n2 - n1)
+            # AHA_inv = torch.linalg.inv(AHA)
 
-                # Accumulate AHb
-                B_batch = einsum(phis_flt[n1:n2, :], alphas_flt,
-                                 'B nbasis, T nbasis -> B T')
-                B_batch = torch.exp(-2j * torch.pi * B_batch)
-                AHb += A_batch.H @ B_batch / (n2 - n1)
+            # Heavy batching for AHb
+            for t1 in tqdm(range(0, T, temporal_batch_size), 'Least Squares Interpolators'):
+                t2 = min(t1 + temporal_batch_size, T)
 
-            # Solve for x = (AHA)^{-1} AHb
-            x = lin_solve(AHA, AHb, solver='pinv')
+                # Combute AHb batch - this is slow!
+                AHb = torch.zeros((self.L, t2 - t1), 
+                                dtype=torch.complex64, device=self.torch_dev)
+                for n1, n2 in batch_iterator(N, spatial_batch_size):
+                    n2 = min(n1 + spatial_batch_size, N)
+                    A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
+                    A_batch = torch.exp(-2j * torch.pi * A_batch)
+                    B_batch = phis_flt[n1:n2, :] @ alphas_flt[t1:t2].T
+                    B_batch = torch.exp(-2j * torch.pi * B_batch)
+                    AHb += A_batch.H @ B_batch / (n2 - n1)
+
+                # Solve for ls = (AHA)^{-1} AHb
+                ls = lin_solve(AHA, AHb, solver='pinv')
+                # ls = AHA_inv @ AHb
+                interp_funcs[:, t1:t2] = ls
             
             # Reshape (L, T)
-            interp_funcs = x.reshape((self.L, *self.trj_size))
+            interp_funcs = interp_funcs.reshape((self.L, *self.trj_size))
         elif 'linear' in self.interp_type:
             raise NotImplementedError
         elif 'zero' in self.interp_type:
