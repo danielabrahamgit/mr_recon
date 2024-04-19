@@ -3,13 +3,13 @@ import torch
 from tqdm import tqdm
 from typing import Optional
 from einops import rearrange, einsum
+from mr_recon.fourier import sigpy_nufft
+from mr_recon.algs import lin_solve, svd_power_method_tall
+from mr_recon.imperfections.imperfection import imperfection
 from mr_recon.utils import (
     quantize_data,
     batch_iterator
 )
-from mr_recon.fourier import sigpy_nufft
-from mr_recon.algs import lin_solve, svd_power_method_tall
-from mr_recon.imperfections.imperfection import imperfection
 
 class exponential_imperfection(imperfection):
     """
@@ -63,7 +63,8 @@ class exponential_imperfection(imperfection):
 
     def _calc_time_segmentation(self,
                                 spatial_batch_size: Optional[int] = None,
-                                temporal_batch_size: Optional[int] = 2 ** 8) -> None:
+                                temporal_batch_size: Optional[int] = 2 ** 8,
+                                sketch_AHb: Optional[bool] = False) -> None:
         """
         Computes both h_l and T_l functions using time segmentation.
 
@@ -121,23 +122,30 @@ class exponential_imperfection(imperfection):
                 n2 = min(n1 + spatial_batch_size, N)
                 A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
                 A_batch = torch.exp(-2j * torch.pi * A_batch)
-                AHA += A_batch.H @ A_batch / (n2 - n1)
+                AHA += A_batch.H @ A_batch / N
             # AHA_inv = torch.linalg.inv(AHA)
 
             # Heavy batching for AHb
             for t1 in tqdm(range(0, T, temporal_batch_size), 'Least Squares Interpolators'):
                 t2 = min(t1 + temporal_batch_size, T)
 
-                # Combute AHb batch - this is slow!
+                # Compute AHb
                 AHb = torch.zeros((self.L, t2 - t1), 
                                 dtype=torch.complex64, device=self.torch_dev)
-                for n1, n2 in batch_iterator(N, spatial_batch_size):
-                    n2 = min(n1 + spatial_batch_size, N)
-                    A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
-                    A_batch = torch.exp(-2j * torch.pi * A_batch)
-                    B_batch = phis_flt[n1:n2, :] @ alphas_flt[t1:t2].T
-                    B_batch = torch.exp(-2j * torch.pi * B_batch)
-                    AHb += A_batch.H @ B_batch / (n2 - n1)
+
+                # Sketch over voxel dimension
+                if sketch_AHb:
+                    pass
+
+                # Combute AHb by batching over all voxels - this is slow!
+                else:
+                    for n1, n2 in batch_iterator(N, spatial_batch_size):
+                        n2 = min(n1 + spatial_batch_size, N)
+                        A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
+                        A_batch = torch.exp(-2j * torch.pi * A_batch)
+                        B_batch = phis_flt[n1:n2, :] @ alphas_flt[t1:t2].T
+                        B_batch = torch.exp(-2j * torch.pi * B_batch)
+                        AHb += A_batch.H @ B_batch / N
 
                 # Solve for ls = (AHA)^{-1} AHb
                 ls = lin_solve(AHA, AHb, solver='pinv')
@@ -527,7 +535,7 @@ class exponential_imperfection(imperfection):
             bs = torch.exp(-2j * torch.pi * exp_term)
         elif self.method == 'svd':
             bs = self.spatial_funcs[ls]
-        return torch.sum(bs.conj() * y, dim=-len(self.im_size)-1)
+        return (bs.conj() * y).sum(dim=-len(self.im_size)-1)
         
     def apply_temporal(self, 
                        x: torch.Tensor, 

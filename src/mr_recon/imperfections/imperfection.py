@@ -41,6 +41,12 @@ class imperfection:
         self.method = method.lower()
         self.interp_type = interp_type.lower()
         self.verbose = verbose
+        
+        # Should bepopulated by children of this class
+        if not hasattr(self, 'im_size'):
+            self.im_size = None
+        if not hasattr(self, 'trj_size'):
+            self.trj_size = None
 
         if self.method not in ['ts', 'svd']:
             raise ValueError('method must be one of ["ts", "svd"]')

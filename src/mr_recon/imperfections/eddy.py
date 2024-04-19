@@ -114,8 +114,8 @@ class eddy_imperfection(exponential_imperfection):
                 grd[..., 2] += z_ofs
         
         # Build phis
-        X = grd[..., 0]
-        Y = grd[..., 1]
+        X = grd[..., 0].flip(0)
+        Y = grd[..., 1].flip(1)
         Z = grd[..., 2]
         skope_inds = skope_inds.to(alphas.device)
         all_bases = bases(X, Y, Z).to(alphas.device)

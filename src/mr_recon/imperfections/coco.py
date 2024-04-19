@@ -97,17 +97,20 @@ class coco_imperfection(exponential_imperfection):
         # Build phis and alphas
         phis = torch.zeros((4, *im_size), dtype=trj.dtype, device=trj.device)
         alphas = torch.zeros((4, *trj_size), dtype=trj.dtype, device=trj.device)
-        X = grd[..., 0]
+        X = grd[..., 2]
         Y = grd[..., 1]
-        Z = grd[..., 2]
+        Z = grd[..., 0]
+        gx = g[..., 2]
+        gy = g[..., 1]
+        gz = g[..., 0]
         phis[0] = X ** 2 + Y ** 2
-        alphas[0] = (g[..., 2] ** 2) / 4
+        alphas[0] = (gz ** 2) / 4
         phis[1] = Z ** 2
-        alphas[1] = g[..., 0] ** 2 + g[..., 1] ** 2
+        alphas[1] = gx ** 2 + gy ** 2
         phis[2] = X * Z
-        alphas[2] = g[..., 0] * g[..., 2]
+        alphas[2] = gx * gz
         phis[3] = Y * Z
-        alphas[3] = g[..., 1] * g[..., 2]
+        alphas[3] = gy * gz
         alphas /= 2 * B0
 
         # Integral on alphas, gamma_bar to map T to phase

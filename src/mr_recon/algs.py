@@ -430,7 +430,7 @@ def conjugate_gradient(AHA: nn.Module,
 
     # Main loop
     for i in tqdm(range(num_iters), 'CG Iterations', disable=not verbose):
-
+        
         # Apply model
         Ap = AHA_wrapper(p)
         pAp = torch.real(torch.sum(p.conj() * Ap)).item()

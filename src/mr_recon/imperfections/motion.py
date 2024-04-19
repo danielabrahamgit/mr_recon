@@ -3,14 +3,9 @@
 import torch
 import torch.nn.functional as F
 
-from tqdm import tqdm
-from typing import Optional, Union
+from typing import Optional
 from einops import rearrange, einsum
 from mr_recon.utils import (
-    batch_iterator, 
-    torch_to_np, 
-    np_to_torch,
-    apply_window,
     rotation_matrix,
     quantize_data,
     gen_grd
@@ -360,7 +355,8 @@ class motion_op(torch.nn.Module):
     
     def __init__(self,
                  im_size: tuple,
-                 fovs: Optional[tuple] = None):
+                 fovs: Optional[tuple] = None,
+                 reuse_UV: Optional[bool] = False):
         """
         Parameters:
         -----------
@@ -368,6 +364,8 @@ class motion_op(torch.nn.Module):
             The image dimensions
         fovs : tuple
             The field of views, same size as im_size
+        reuse_UV : bool
+            Whether to reuse U and V operators after consecutive calls
         """
         super(motion_op, self).__init__()
 
@@ -391,6 +389,7 @@ class motion_op(torch.nn.Module):
         self.kgrid = kgrid.type(torch.float32)
         self.U = None
         self.V = None
+        self.reuse_UV = reuse_UV
     
     def _build_U(self,
                  translations: torch.Tensor) -> torch.Tensor:
@@ -473,6 +472,9 @@ class motion_op(torch.nn.Module):
         else:
             U = self.U
             V = self.V
+        if self.reuse_UV:
+            self.U = U
+            self.V = V
 
         # Add empty dims
         img_nbatch_dims = len(img.shape) - d
