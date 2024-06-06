@@ -415,8 +415,8 @@ class exponential_imperfection(imperfection):
             for i in range(self.L):
                 
                 # Get spatial temporal basis funcs
-                b = self.apply_spatial(None, ls=i)
-                h = self.apply_temporal_adjoint(None, ls=i)
+                b = self.apply_spatial(None, ls=slice(i, i+1))[0]
+                h = self.apply_temporal_adjoint(None, ls=slice(i, i+1))[0]
                 if flatten:
                     b = b.flatten()[r_slice]
                     h = h.flatten()[t_slice]
@@ -453,7 +453,7 @@ class exponential_imperfection(imperfection):
                 else:
                     st_matrix += phi[tup_p] * alpha[tup_a]
             
-            st_matrix = torch.exp(-2j * torch.pi * st_matrix)
+            # st_matrix = torch.exp(-2j * torch.pi * st_matrix)
 
         return st_matrix 
     
