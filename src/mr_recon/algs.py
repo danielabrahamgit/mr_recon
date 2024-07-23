@@ -1,17 +1,128 @@
-import time
+from turtle import forward
 import torch
 import sigpy as sp
 import torch.nn as nn
 
 from tqdm import tqdm
 from typing import Optional, Tuple
-from einops import rearrange
+from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
+from sigpy.mri import pipe_menon_dcf
+from mr_recon.fourier import sigpy_nufft
 
 def density_compensation(trj: torch.Tensor,
                          im_size: tuple,
-                         num_iters: Optional[int] = 30):
-    raise NotImplementedError
+                         num_iters: Optional[int] = 30,
+                         method='sigpy'):
+    """
+    Computes density compensation factor using Pipe Menon method.
+    Copied from sigpy.
+
+    Parameters:
+    -----------
+    trj : torch.Tensor
+        k-space trajectory with shape (..., d), scaled from -Ni/2 to Ni/2
+        where Ni = im_size[i]
+    im_size : tuple
+        image size 
+    num_iters : int
+        number of iterations
+    method : str
+        'sigpy' - uses sigpy implementation
+        'CG_ksp' - Congugate gradient in k-space
+        'CG_img' - Congugate gradient in image-space
+    
+    Returns:
+    --------
+    dcf : torch.Tensor
+        density compensation factor with shape (...)
+    """
+
+    # Consts
+    os = 1
+    im_size_os = [i * os for i in im_size]
+    method = method.lower()
+    torch_dev = trj.device
+    if 'cpu' in str(torch_dev):
+        idx = -1
+    else:
+        idx = torch_dev.index
+
+    # Sigpy dcf
+    if method == 'sigpy':
+        dcf = pipe_menon_dcf(torch_to_np(trj), im_size, 
+                            device=sp.Device(idx), 
+                            max_iter=num_iters)    
+        dcf = np_to_torch(dcf)
+    
+    # CG in k-space
+    elif method == 'cg_ksp':
+        # Define Gridding normal operator
+        # trj_sp = torch_to_np(trj)
+        # G = sp.linop.Gridding(im_size_os, trj, param=8,
+        #                       width=4, kernel='kaiser_bessel') 
+        # def GHG(x):
+        #     with sp.get_device(trj_sp):
+        #         psf = G.H * G * torch_to_np(x)
+        #         return np_to_torch(psf)
+        nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=1.0, width=4, beta=8, apodize=False)
+        def GHG(x):
+            adj = nft.adjoint(x[None,], trj[None,])
+            fwd = nft.forward(adj, trj[None,])[0].real
+            return fwd
+        
+        # Fix scaling factor and run CG
+        ones = torch.ones(trj.shape[:-1], device=torch_dev, dtype=torch.float32)
+        delta = ones.flatten() * 0
+        delta[0] = 1
+        scale = GHG(delta.reshape(ones.shape)).abs().max()
+        AHA = lambda x : GHG(x) / scale
+        dcf = conjugate_gradient(AHA, ones, num_iters=num_iters, lamda_l2=1e0 * 0, verbose=True).abs()
+
+    elif method == 'cg_img':
+        delta = torch.zeros(im_size_os, device=torch_dev, dtype=torch.complex64)
+        slc = tuple([im_size_os[i] // 2 for i in range(len(im_size_os))])
+        delta[slc] = 1
+
+        nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=os, width=4, beta=8, apodize=False)
+        kerns = nft.calc_teoplitz_kernels(trj[None,], os_factor=2.0)
+        # def FHF(x):
+        #     fwd = nft.forward(x[None,], trj[None,])
+        #     adj = nft.adjoint(fwd, trj[None,])[0]
+        #     return adj
+        def FHF(x):
+            adj = nft.normal_toeplitz(x[None,None], kerns)[0,0]
+            return adj
+        def FHF_inv(x):
+            adj = nft.normal_toeplitz(x[None,None], 1 / (kerns + 1e1))[0,0]
+            return adj
+        scale = FHF(delta).abs().max()
+        AHA = lambda x : FHF(x) / scale
+        print(scale)
+        # dcf_img = conjugate_gradient(AHA, delta, num_iters=num_iters*0 + 20, lamda_l2=1e1, verbose=True)
+        dcf_img = FHF_inv(delta)
+        # import matplotlib.pyplot as plt
+        # plt.figure(figsize=(14, 7))
+        # plt.subplot(221)
+        # plt.title('inv PSF')
+        # plt.imshow(dcf_img.abs().log().cpu())
+        # plt.axis('off')
+        # plt.subplot(223)
+        # plt.plot(dcf_img[:, im_size_os[1] // 2].abs().cpu())
+        # plt.axis('off')
+        # plt.subplot(222)
+        # plt.title('AHA(inv PSF)')
+        # plt.imshow(AHA(dcf_img).abs().log().cpu())
+        # plt.axis('off')
+        # plt.subplot(224)
+        # plt.plot(AHA(dcf_img)[:, im_size_os[1] // 2].abs().cpu())
+        # plt.axis('off')
+        # plt.show()
+        # quit()
+        dcf = nft.forward(dcf_img[None,], trj[None,])[0].abs()
+        
+    dcf /= dcf.max()
+    return dcf
 
 def svd_power_method_tall(A: callable,
                           AHA: callable,
@@ -35,6 +146,8 @@ def svd_power_method_tall(A: callable,
         rank of the SVD
     inp_dims : tuple
         input dimensions of A, corresponds to N but can be tuple
+    niter : int
+        number of iterations to run power method
     inp_dtype : torch.dtype
         input data type
     device : torch.device
@@ -178,10 +291,83 @@ def power_method_operator(A: callable,
     
     return x0, ll.item()
 
+def eigen_decomp_operator(A: callable,
+                          x0: torch.Tensor,
+                          num_eigen: int,
+                          num_power_iter: Optional[int] = 15,
+                          reverse_order: Optional[bool] = False,
+                          verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Uses power method to find largest num_erigen eigenvalues and corresponding eigenvectors
+
+    Parameters:
+    -----------
+    A : callable
+        linear operator square shape
+    x0 : torch.Tensor
+        initial guess of eigenvector with shape (*vec_shape)
+    num_eigen : int
+        number of eigenvalues to find
+    num_power_iter : int
+        number of iterations to run power method
+    reverse_order : bool
+        toggles reverse order of eigenvalues, uses inverse power method instead.
+    verbose : bool
+        toggles progress bar
+    
+    Returns:
+    --------
+    eigen_vecs : torch.Tensor
+        eigenvectors with shape (num_eigen, *vec_shape)
+    eigen_vals : torch.Tensor
+        eigenvalues with shape (num_eigen,)
+    """
+    eigen_vecs = torch.zeros(num_eigen, *x0.shape, device=x0.device, dtype=x0.dtype)
+    eigen_vals = torch.zeros(num_eigen, device=x0.device, dtype=x0.dtype)
+    def A_resid_operator(x):
+        y = A_clone(x)
+        VH_x = einsum(eigen_vecs.conj(), x, 'n ..., ... -> n') * eigen_vals
+        V_diag_VH_x = einsum(eigen_vecs, VH_x, 'n ..., n -> ...')
+        y = y - V_diag_VH_x
+        return y
+    
+    for r in tqdm(range(num_eigen), 'Eigen Iterations', disable=not verbose):
+        init = torch.randn_like(x0)
+        init /= torch.linalg.norm(init)
+        if reverse_order:
+            # vec, val = inverse_power_method_operator(A_resid_operator, init, 
+            #                                         num_iter=num_power_iter, 
+            #                                         verbose=False)
+            # Get largest eval first
+            if r == 0:
+                _, val_max = power_method_operator(A, init, 
+                                                num_iter=num_power_iter * 10, 
+                                                verbose=False)
+                val_max *= 1.0
+                A_clone = lambda x : val_max * x - A(x)
+            vec, val = power_method_operator(A_resid_operator, init, 
+                                            num_iter=num_power_iter, 
+                                            verbose=False)
+            
+        else:
+            vec, val = power_method_operator(A_resid_operator, init, 
+                                            num_iter=num_power_iter, 
+                                            verbose=False)
+        eigen_vecs[r] = vec
+        eigen_vals[r] = val
+
+
+    if reverse_order:
+        eigen_vals = val_max - eigen_vals
+        # eigen_vals = 1 / eigen_vals
+
+    return eigen_vecs, eigen_vals
+                          
 def inverse_power_method_operator(A: callable,
                                   x0: torch.Tensor,
                                   num_iter: Optional[int] = 15,
-                                  n_cg_iter: Optional[int] = 10,
+                                  n_cg_iter: Optional[int] = 12,
+                                  lamda_l2: Optional[float] = 0.0,
                                   verbose: Optional[bool] = True) -> Tuple[torch.Tensor, float]:
     """
     Uses power method to find largest eigenvalue and corresponding eigenvector
@@ -208,12 +394,13 @@ def inverse_power_method_operator(A: callable,
         eigenvalue
     """
     
+    # ray = lambda x : (x.conj() * A(x)).sum() / ((x.norm() ** 2))
     for _ in tqdm(range(num_iter), 'Max Eigenvalue', disable=not verbose):
-        
-        z = conjugate_gradient(A, x0, num_iters=n_cg_iter, verbose=False, lamda_l2=1e-5)
-        ll = torch.linalg.norm(z)
+        # mu = ray(x0)
+        z = conjugate_gradient(A, x0, num_iters=n_cg_iter, verbose=False, lamda_l2=0)
+        ll = z.norm()
         x0 = z / ll
-    
+    # ll = (x0.conj() * A(x0)).sum()
     if verbose:
         print(f'Max Eigenvalue = {ll}')
     
@@ -238,6 +425,8 @@ def lin_solve(AHA: torch.Tensor,
         'pinv' - pseudo inverse 
         'lstsq' - least squares
         'inv' - regular inverse
+        'cg' - conjugate gradient
+        'gd' - gradient descent
     
     Returns:
     --------
@@ -246,9 +435,10 @@ def lin_solve(AHA: torch.Tensor,
     """
     I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
     tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
+    solver = solver.lower()
     AHA += lamda * I[tup]
     if solver == 'lstsq_torch':
-        x = torch.linalg.lstsq(AHA, AHb, rcond=None).solution
+        x = torch.linalg.lstsq(AHA, AHb).solution
     elif solver == 'lstsq':
         n, m = AHb.shape[-2:]
         AHA_cp = torch_to_np(AHA).reshape(-1, n, n)
@@ -263,6 +453,10 @@ def lin_solve(AHA: torch.Tensor,
         x = torch.linalg.pinv(AHA, hermitian=True) @ AHb
     elif solver == 'inv':
         x = torch.linalg.inv(AHA) @ AHb
+    elif solver == 'cg':
+        x = conjugate_gradient(lambda x : AHA @ x, AHb, num_iters=100, lamda_l2=lamda)
+    elif solver == 'gd':
+        x = gradient_descent(lambda x : AHA @ x, AHb, lr=1e-2, num_iters=100, lamda_l2=lamda)
     else:
         raise NotImplementedError
     return x

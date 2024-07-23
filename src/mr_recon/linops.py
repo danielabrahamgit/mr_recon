@@ -1,10 +1,11 @@
 import gc
+from textwrap import indent
 import torch
 import torch.nn as nn
 
 from dataclasses import dataclass
 from mr_recon.fourier import fft, ifft
-from mr_recon.utils import batch_iterator
+from mr_recon.utils import batch_iterator, gen_grd
 from mr_recon.pad import PadLast
 from mr_recon.imperfections.imperfection import imperfection
 from mr_recon.fourier import (
@@ -13,6 +14,7 @@ from mr_recon.fourier import (
     torchkb_nufft,
     NUFFT
 )
+from mr_recon.multi_coil.grappa_est import train_kernels
 from mr_recon.indexing import multi_grid
 from einops import rearrange, einsum
 from typing import Optional
@@ -59,6 +61,107 @@ class linop(nn.Module):
     def normal(self, *args):
         raise NotImplementedError
 
+class multi_chan_linop(linop):
+    """
+    Linop for doing channel by channel reconstruction
+    """
+
+    def __init__(self,
+                 out_size: tuple,
+                 trj: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 nufft: Optional[NUFFT] = None,
+                 imperf_model: Optional[imperfection] = None,
+                 use_toeplitz: Optional[bool] = False,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Parameters
+        ----------
+        out_size : tuple 
+            coil and image dims as tuple of ints (nc, dim1, dim2, ...)
+        trj : torch.tensor <float> | GPU
+            The k-space trajectory with shape (*trj_size, d). 
+                we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        mps : torch.tensor <complex> | GPU
+            sensititvity maps with shape (ncoil, *im_size)
+        dcf : torch.tensor <float> | GPU
+            the density comp. functon with shape (*trj_size)
+        nufft : NUFFT
+            the nufft object, defaults to torchkbnufft
+        imperf_model : lowdim_imperfection
+            models imperfections with lowrank splitting
+        use_toeplitz : bool
+            toggles toeplitz normal operator
+        bparams : batching_params
+            contains various batch sizes
+        """
+        ishape = out_size
+        oshape = (out_size[0], *trj.shape[:-1])
+        super().__init__(ishape, oshape)
+
+        mps_dummy = torch.ones((1, *out_size[1:]), dtype=torch.complex64, device=trj.device)
+        self.A = sense_linop(out_size[1:], trj, mps_dummy, dcf, nufft, imperf_model, use_toeplitz, bparams)
+
+    def forward(self,
+                img: torch.Tensor) -> torch.Tensor:
+        """
+        Forward call of this linear model.
+
+        Parameters
+        ----------
+        img : torch.tensor <complex> | GPU
+            the multi-channel image with shape (nc, *im_size)
+        
+        Returns
+        ---------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        """
+        ksp = torch.zeros(self.oshape, dtype=torch.complex64, device=img.device)
+        for i in range(self.ishape[0]):
+            ksp[i] = self.A.forward(img[i])[0]
+        return ksp
+
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint call of this linear model.
+
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        
+        Returns
+        ---------
+        img : torch.tensor <complex> | GPU
+            the multi channel image with shape (nc, *im_size)
+        """
+        img = torch.zeros(self.ishape, dtype=torch.complex64, device=ksp.device)
+        for i in range(self.ishape[0]):
+            img[i] = self.A.adjoint(ksp[i][None,])
+        return img
+    
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+        """
+        Gram/normal call of this linear model (A.H (A (x))).
+
+        Parameters
+        ----------
+        img : torch.tensor <complex> | GPU
+            the image with shape (*im_size)
+        
+        Returns
+        ---------
+        img_hat : torch.tensor <complex> | GPU
+            the ouput image with shape (*im_size)
+        """
+        img_hat = torch.zeros(self.ishape, dtype=torch.complex64, device=img.device)
+        for i in range(self.ishape[0]):
+            img_hat[i] = self.A.normal(img[i])
+        return img_hat
+
 class sense_linop(linop):
     """
     Linop for sense models
@@ -104,7 +207,7 @@ class sense_linop(linop):
 
         # Default params
         if nufft is None:
-            nufft = torchkb_nufft(im_size, torch_dev.index)
+            nufft = sigpy_nufft(im_size)
         if dcf is None:
             dcf = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
         else:
@@ -120,11 +223,18 @@ class sense_linop(linop):
             if imperf_model is None:
                 self.toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], dcf[None,])[0]
             else:
-                # tfs = imperf_model.temporal_funcs
                 y_ones = torch.ones(trj.shape[:-1], dtype=torch.complex64, device=torch_dev)
                 tfs = imperf_model.apply_temporal_adjoint(y_ones).conj()
                 weights = einsum(tfs.conj(), tfs, 'nseg1 ... , nseg2 ... -> nseg1 nseg2 ...')
                 weights = rearrange(weights, 'n1 n2 ... -> (n1 n2) ... ') * dcf[None, ...]
+                self.toep_kerns = None
+                for b1 in range(0, weights.shape[0], bparams.toeplitz_batch_size):
+                    b2 = min(b1 + bparams.toeplitz_batch_size, weights.shape[0])
+                    toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], weights[b1:b2])
+                    if self.toep_kerns is None:
+                        self.toep_kerns = toep_kerns
+                    else:
+                        self.toep_kerns = torch.cat((self.toep_kerns, toep_kerns), dim=0)
                 self.toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], weights) 
                 self.toep_kerns = rearrange(self.toep_kerns, '(n1 n2) ... -> n1 n2 ...', n1=tfs.shape[0], n2=tfs.shape[0])
         else:
@@ -153,7 +263,7 @@ class sense_linop(linop):
 
         Parameters
         ----------
-        alphas : torch.tensor <complex> | GPU
+        img : torch.tensor <complex> | GPU
             the image with shape (*im_size)
         
         Returns
@@ -318,7 +428,244 @@ class sense_linop(linop):
                     img_hat += SRFMFBSx
         
         return img_hat
+
+class sense_linop_grog(linop):
+    """
+    Sense linop designed for grogged data.
+    """
+
+    def __init__(self,
+                 im_size: tuple,
+                 trj: torch.Tensor,
+                 mps: torch.Tensor,
+                 os_grid: float,
+                 dcf: Optional[torch.Tensor] = None,
+                 inv_noise_cov: Optional[torch.Tensor] = None,
+                 imperf_model: Optional[imperfection] = None,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Parameters
+        ----------
+        im_size : tuple 
+            image dims as tuple of ints (dim1, dim2, ...)
+        trj : torch.tensor 
+            The k-space trajectory with shape (*trj_size, d). 
+                we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        mps : torch.tensor 
+            sensititvity maps with shape (ncoil, *im_size)
+        os_grid : float
+            the grid oversampling factor for grog
+        dcf : torch.tensor 
+            the density comp. functon with shape (*trj_size)
+        inv_noise_cov : torch.tensor
+            the inverse noise covariance matrix with shape (..., nc, nc)
+        imperf_model : lowdim_imperfection
+            models imperfections with lowrank splitting
+        bparams : batching_params
+            contains various batch sizes
+        """
+        ishape = im_size
+        oshape = (mps.shape[0], *trj.shape[:-1])
+        super().__init__(ishape, oshape)
+
+        nufft = gridded_nufft(im_size, grid_oversamp=os_grid)
+        self.A = sense_linop(im_size, trj, mps, dcf, nufft, imperf_model, False, bparams)
+
+        self.inv_noise_cov = inv_noise_cov
+    
+    def set_noise_cov(self,
+                      inv_noise_cov: torch.Tensor):
+        self.inv_noise_cov = inv_noise_cov
+
+    def forward(self,
+                img: torch.Tensor) -> torch.Tensor:
+        """
+        Forward call of this linear model.
+
+        Parameters
+        ----------
+        img : torch.tensor <complex> | GPU
+            the image with shape (*im_size)
         
+        Returns
+        ---------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        """
+        ksp = self.A.forward(img)
+        return ksp 
+    
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint call of this linear model.
+
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        
+        Returns
+        ---------
+        img : torch.tensor <complex> | GPU
+            the image with shape (*im_size)
+        """
+        # Apply noise covaraince
+        if self.inv_noise_cov is not None:
+            ksp = einsum(ksp, self.inv_noise_cov, 'ci ..., ... co ci -> co ...')
+        img = self.A.adjoint(ksp)
+        return img
+    
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+          """
+          Gram/normal call of this linear model (A.H (A (x))).
+    
+          Parameters
+          ----------
+          img : torch.tensor <complex>
+                the image with shape (*im_size)
+          
+          Returns
+          ---------
+          img_hat : torch.tensor <complex>
+                the ouput image with shape (*im_size)
+          """
+          img_hat = self.adjoint(self.forward(img))
+          return img_hat
+
+class spirit_linop(linop):
+    """
+    Linops for spirit models. We will use notation from miki's paper:
+    https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2925465/
+
+    min_m ||Dm - y||_2^2 + lamda ||(G - I) m||_2^2
+
+    same as solving
+
+    (D^H D + lamda (G - I)^H (G - I)) m = D^H y
+
+    Thus:
+    self.normal = D^H D + lamda (G - I)^H (G - I)
+    self.adjoint = D^H 
+    self.forward = D
+    self.forward_grappa = G
+    """
+    
+    def __init__(self,
+                 im_size: tuple,
+                 trj: torch.Tensor,
+                 ksp_cal: torch.Tensor,
+                 kern_size: tuple,
+                 lamda: Optional[float] = 1e-5,
+                 dcf: Optional[torch.Tensor] = None,
+                 nufft: Optional[NUFFT] = None,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Parameters
+        ----------
+        im_size : tuple 
+            image dims as tuple of ints (dim1, dim2, ...)
+        trj : torch.tensor <float> | GPU
+            The k-space trajectory with shape (*trj_size, d). 
+                we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        ksp_cal : torch.tensor <complex> | GPU
+            the calibration data with shape (nc, *cal_size)
+        kern_size : tuple
+            size of the kernel for the spirit model, has shape (*kern_size)
+        lamda : float
+            the regularization parameter for the spirit model
+        dcf : torch.tensor <float> | GPU
+            the density comp. functon with shape (*trj_size)
+        nufft : NUFFT
+            the nufft object, defaults to torchkbnufft
+        imperf_model : lowdim_imperfection
+            models imperfections with lowrank splitting
+        use_toeplitz : bool
+            toggles toeplitz normal operator
+        bparams : batching_params
+            contains various batch sizes
+        """
+        ishape = (ksp_cal.shape[0], *im_size)
+        oshape = (ksp_cal.shape[0], *trj.shape[:-1])
+        super().__init__(ishape, oshape)
+
+        # Consts
+        torch_dev = trj.device
+        assert ksp_cal.device == torch_dev
+
+        # Default params
+        if nufft is None:
+            nufft = sigpy_nufft(im_size)
+        if dcf is None:
+            dcf = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
+        else:
+            assert dcf.device == torch_dev
+        
+        # Rescale and change types
+        trj = nufft.rescale_trajectory(trj).type(torch.float32)
+        dcf = dcf.type(torch.float32)
+        
+        # Save
+        self.lamda = lamda
+        self.im_size = im_size
+        self.trj = trj
+        self.dcf = dcf
+        self.nufft = nufft
+        self.bparams = bparams
+        self.torch_dev = torch_dev
+        
+class grappa_linop(linop):
+    """
+    Linop for applying cartesian grappa kernels.
+    """
+
+    def __init__(self,
+                 im_size: tuple,
+                 ksp_cal: torch.Tensor,
+                 kern_size: tuple,
+                 image_domain: Optional[bool] = True,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Parameters
+        ----------
+        im_size : tuple 
+            image dims as tuple of ints (dim1, dim2, ...)
+        ksp_cal : torch.tensor <complex> | GPU
+            the calibration data with shape (nc, *cal_size)
+        kern_size : tuple
+            size of the kernel for the spirit model, has shape (*kern_size)
+        image_domain : bool
+            If true, applies kernel to images. If false, applies to k-space.
+        bparams : batching_params
+            contains various batch sizes
+        """
+        ishape = (ksp_cal.shape[0], *im_size)
+        oshape = (ksp_cal.shape[0], *im_size)
+        super().__init__(ishape, oshape)
+
+        # Consts
+        torch_dev = ksp_cal.device
+        assert ksp_cal.device == torch_dev
+        assert len(im_size) == len(kern_size)
+
+        # Train kernels
+        img_cal = ifft(ksp_cal, dim=tuple(range(-len(im_size), 0)))
+        source_vecs = gen_grd(kern_size, kern_size).reshape((1, -1, len(kern_size))).to(torch_dev)
+        kernel = train_kernels(img_cal, source_vecs, lamda_tikonov=1e-3)[0]
+        
+        # Reshape/transform kernels
+        if image_domain:
+            device_idx = torch_dev.index
+            if 'cpu' in str(torch_dev).lower():
+                device_idx = -1
+            nfft = torchkb_nufft(im_size, device_idx)
+            kernel = nfft.adjoint(kernel[None,], source_vecs[None,])[0]
+        else:
+            kernel = kernel.reshape((*kernel.shape[:-1], *kern_size))
+        breakpoint()
+
+
 class subspace_linop(linop):
     """
     Linop for subspace models

@@ -331,7 +331,7 @@ class exponential_imperfection(imperfection):
         return spatial_funcs, temporal_funcs
                                          
     def _calc_svd_fourier_space(self,
-                               use_topeplitz: Optional[bool] = True) -> torch.Tensor:
+                                use_topeplitz: Optional[bool] = True) -> torch.Tensor:
         """
         Calculates spatial and temporal functions from SVD using the 
         Fourier and Toeplitz method in space.

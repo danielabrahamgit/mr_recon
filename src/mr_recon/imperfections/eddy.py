@@ -119,10 +119,6 @@ class eddy_imperfection(exponential_imperfection):
             X = grd[..., 0]
             Y = grd[..., 1]
             Z = grd[..., 2]
-
-            # # TODO DELTEME
-            # X = grd[..., 1]
-            # Y = grd[..., 0]
         else:
             X = coord_bases[..., 0]
             Y = coord_bases[..., 1]

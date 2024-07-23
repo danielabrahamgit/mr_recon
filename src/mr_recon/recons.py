@@ -1,8 +1,5 @@
-import os
 import torch
 import time
-import numpy as np
-import sigpy as sp
 
 from tqdm import tqdm
 from typing import Optional
@@ -14,6 +11,39 @@ from mr_recon.algs import (
     power_method_operator, 
     FISTA
 )
+
+def rsos_recon(A: linop,
+               ksp: torch.Tensor,
+               max_iter: Optional[int] = 15,
+               lamda_l2: Optional[float] = 0.0,
+               max_eigen: Optional[float] = None,
+               verbose: Optional[bool] = True) -> torch.Tensor:
+    """
+    Run CG per channel, then coil combine.
+    
+    Parameters:
+    -----------
+    A : linop
+        The linear operator (see linop)
+    ksp : torch.Tensor
+        k-space data with shape (nc, ...)
+    max_iter : int
+        max number of iterations for recon algorithm
+    lamda_l2 : float
+        l2 lamda regularization for SENSE: ||Ax - b||_2^2 + lamda_l2||x||_2^2
+    max_eigen : float
+        maximum eigenvalue of AHA
+    verbose : bool 
+        Toggles print statements
+
+    Returns:
+    --------
+    recon : torch.Tensor
+        the reconstructed image/volume
+    """
+
+    imgs = CG_SENSE_recon(A, ksp, max_iter, lamda_l2, max_eigen, verbose)
+    return coil_combine(imgs)
 
 def min_norm_recon(A: linop,
                    ksp: torch.Tensor,
@@ -72,8 +102,8 @@ def min_norm_recon(A: linop,
 
 def CG_SENSE_recon(A: linop,
                    ksp: torch.Tensor,
-                   max_iter: int = 15,
-                   lamda_l2: float = 0.0,
+                   max_iter: Optional[int] = 15,
+                   lamda_l2: Optional[float] = 0.0,
                    max_eigen: Optional[float] = None,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
@@ -85,7 +115,7 @@ def CG_SENSE_recon(A: linop,
     A : linop
         The linear operator (see linop)
     ksp : torch.Tensor
-        k-space data with shape (nc, nro, npe, ntr)
+        k-space data with shape (nc, ...)
     max_iter : int
         max number of iterations for recon algorithm
     lamda_l2 : float
@@ -117,6 +147,8 @@ def CG_SENSE_recon(A: linop,
     end = time.perf_counter()
     if verbose:
         print(f'AHb took {end-start:.3f}(s)')
+    if max_iter == 0:
+        return AHb
 
     # Clear data (we dont need it anymore)
     y = y.cpu()
@@ -134,6 +166,53 @@ def CG_SENSE_recon(A: linop,
                                verbose=verbose)
     
     return recon
+
+def coil_combine(multi_chan_img: torch.Tensor,
+                 mps: Optional[torch.Tensor] = None,
+                 walsh_kernel_size: Optional[int] = None) -> torch.Tensor:
+    """
+    Combine multi-channel images using SENSE, walsh, or SoS
+
+    Parameters:
+    -----------
+    multi_chan_img : torch.Tensor
+        multi-channel image with shape (nc, ...)
+    mps : torch.Tensor
+        coil sensitivity maps with shape (nc, ...)
+    walsh_kernel_size : int
+        size of walsh kernel for walsh coil combination
+    
+    Returns:
+    --------
+    img_comb : torch.Tensor
+        the combined image/volume with shape (...)
+    """
+
+    if mps is not None:
+        img_comb = (multi_chan_img * mps.conj()).sum(0) / mps.abs().square().sum(0)
+    elif walsh_kernel_size is not None:
+        # Reshape image into blocks 
+        raise NotImplementedError
+    else:
+        img_comb = multi_chan_img.abs().square().sum(0).sqrt()
+    
+    return img_comb
+
+def SPIRIT_recon(A: linop,
+                 ksp: torch.Tensor,
+                 ksp_cal: torch.Tensor,
+                 max_iter: Optional[int] = 15,
+                 lamda_l2: Optional[float] = 0.0,
+                 max_eigen: Optional[float] = None,
+                 verbose: Optional[bool] = True) -> torch.Tensor:
+    """
+    Run SPIRIT recon:
+    recon = (AHA + lamda_l2I)^-1 AHb
+
+
+    
+    """
+    return None
 
 def FISTA_recon(A: linop,
                 ksp: torch.Tensor,

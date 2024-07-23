@@ -104,7 +104,7 @@ def gen_grd(im_size: tuple,
     if fovs is None:
         fovs = (1,) * len(im_size)
     lins = [
-        fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2) / (im_size[i]) 
+        fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2 + (im_size[i] % 2)) / (im_size[i]) 
         for i in range(len(im_size))
         ]
     grds = torch.meshgrid(*lins, indexing='ij')
@@ -112,7 +112,36 @@ def gen_grd(im_size: tuple,
         [g[..., None] for g in grds], dim=-1)
         
     return grd
+
+def three_rotation_matrix(thetas: torch.Tensor) -> torch.Tensor:
+    """
+    Computes product rotation matrices for a set of X Y Z rotation angles
+
+    Parameters:
+    -----------
+    thetas : torch.Tensor
+        angle of rotation in radians with shape (..., 3)
     
+    Returns:
+    --------
+    R : torch.Tensor
+        rotation matrix with shape (..., 3, 3)
+    """
+    tup = (None,) * (thetas.ndim - 1) + (slice(None),)
+    Rxs = rotation_matrix(torch.tensor([1.0, 0, 0], 
+                                       device=thetas.device, 
+                                       dtype=thetas.dtype)[tup], 
+                          thetas[..., 0])
+    Rys = rotation_matrix(torch.tensor([0, 1.0, 0], 
+                                       device=thetas.device, 
+                                       dtype=thetas.dtype)[tup], 
+                          thetas[..., 1])
+    Rzs = rotation_matrix(torch.tensor([0, 0, 1.0], 
+                                       device=thetas.device, 
+                                       dtype=thetas.dtype)[tup], 
+                          thetas[..., 2])
+    return Rxs @ Rys @ Rzs
+
 def rotation_matrix(axis: torch.Tensor, 
                     theta: torch.Tensor) -> torch.Tensor:
     """
@@ -149,15 +178,15 @@ def rotation_matrix(axis: torch.Tensor,
     R[..., 2, 2] = a * a + d * d - b * b - c * c
     return R
 
-def apply_window(sig: np.ndarray, 
+def apply_window(sig: torch.Tensor, 
                  ndim: int,
-                 window_func: Optional[str] = 'hamming') -> np.ndarray:
+                 window_func: Optional[str] = 'hamming') -> torch.Tensor:
     """
     Applies windowing function to a rect-linear k-space signal
 
     Parameters:
     -----------
-    sig : np.ndarray <complex64>
+    sig : torch.Tensor <complex64>
         signal with shape (..., N_{ndim-1}, ..., N_1, N_0)
     ndim : int
         apply windowing on last ndim dimensions
@@ -166,20 +195,20 @@ def apply_window(sig: np.ndarray,
     
     Returns:
     --------
-    sig_win : np.ndarray <complex64>
+    sig_win : torch.Tensor <complex64>
         windowed signal with same shape as sig
     
     """
-    dev = sp.get_device(sig)
-    with dev:
-        win = sp.to_device(np.ones(sig.shape[-ndim:]), dev)
-        sig_win = sig.copy()
-        dim_ofs = sig.ndim - ndim
-        for i in range(win.ndim):
-            tup = i * (None,) + (slice(None),) + (None,) * (win.ndim - 1 - i)
-            win *= sp.to_device(get_window(window_func, sig.shape[dim_ofs + i]), dev)[tup]
-        tup = (None,) * (dim_ofs) + (slice(None),) * ndim
-        sig_win *= win[tup]
+    device = sig.device
+    dtype = sig.dtype
+    win = torch.ones(sig.shape[-ndim:], device=device, dtype=dtype)
+    sig_win = sig.clone()
+    dim_ofs = sig.ndim - ndim
+    for i in range(win.ndim):
+        tup = i * (None,) + (slice(None),) + (None,) * (win.ndim - 1 - i)
+        win *= np_to_torch(get_window(window_func, sig.shape[dim_ofs + i])).to(device)[tup]
+    tup = (None,) * (dim_ofs) + (slice(None),) * ndim
+    sig_win *= win[tup]
     return sig_win
 
 def np_to_torch(*args):

@@ -168,17 +168,17 @@ def fourier_resize(x, new_shape):
         oshape = X.shape[:-ndim] + new_shape
         X_rs = sp.resize(X, oshape)
 
-        # Windowing
-        X_rs = apply_window(X_rs, ndim, 'hamming')
+    # Windowing
+    X_rs = apply_window(np_to_torch(X_rs), ndim, 'hamming')
 
-        # IFFT
-        x_rs = sp.ifft(X_rs, axes=tuple(range(-ndim, 0)))
+    # IFFT
+    x_rs = ifft(X_rs, dim=tuple(range(-ndim, 0)))
 
     # Convert to original
     if torch.is_tensor(x):
-        return np_to_torch(x_rs)
-    else:
         return x_rs
+    else:
+        return torch_to_np(x_rs)
 
 def spatial_resize(x: torch.Tensor,
                    im_size: tuple, 

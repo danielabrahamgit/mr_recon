@@ -2,7 +2,6 @@ import matplotlib
 matplotlib.use('webagg')
 import matplotlib.pyplot as plt
 
-import os
 import time
 import torch
 import numpy as np
@@ -25,13 +24,16 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 # Params
+figsize = (14, 7)
 im_size = (220, 220)
 ninter = 16
 ncoil = 32
 R = 4
 lamda_l2 = 1e-3 * 0
 max_iter = 100
+max_eigen = 0.4
 device_idx = 5
+os_grid = 4
 try: 
 	torch_dev = torch.device(device_idx)
 except:
@@ -44,17 +46,14 @@ def loss(x, y):
 grid_params_grog = gridding_params(num_inputs=1,
 								   kern_width=1.0,
 								   interp_readout=True,
-								   grid=True)
+								   grid=True,
+								   oversamp_grid=os_grid)
 grid_params_igrog = gridding_params(num_inputs=5,
 									kern_width=2.0,
 									interp_readout=True,
-									# oversamp_grid=2.0,
+									oversamp_grid=os_grid,
 									grid=False)
-train_params = training_params(epochs=30,
-							   batch_size=2**10,
-							   batches_per_epoch=100,
-							  #  loss=loss,
-							   l2_reg=1e-7*0,)
+train_params = training_params(show_loss=True, l2_reg=0.0)
 
 # Gen data
 phantom = sp.shepp_logan(im_size)
@@ -86,21 +85,21 @@ dcf = np_to_torch(dcf).to(torch_dev).type(torch.float32)
 ksp = np_to_torch(ksp).to(torch_dev).type(torch.complex64)
 
 # Make imperfection model
-trj_grd = torch.round(trj * grid_params_igrog.oversamp_grid) / grid_params_igrog.oversamp_grid
+trj_grd = torch.round(trj * os_grid) / os_grid
 grid_deviations = trj - trj_grd
 L = 14
 imperf_model = off_grid_imperfection(im_size=im_size,
-										grid_deviations=grid_deviations,
-										L=L,
-										method='svd',
-										interp_type='zero',
-										verbose=True,)
+									 grid_deviations=grid_deviations,
+									 L=L,
+									 method='svd',
+									 interp_type='zero',
+									 verbose=True)
 spatial_funcs = imperf_model.spatial_funcs.clone()
 temporal_funcs = imperf_model.temporal_funcs.clone()
 
 # Make linops
 bparams = batching_params(coil_batch_size=ncoil, field_batch_size=L)
-nufft = gridded_nufft(im_size=im_size, device_idx=device_idx, grid_oversamp=grid_params_igrog.oversamp_grid)
+nufft = gridded_nufft(im_size=im_size, device_idx=device_idx, grid_oversamp=os_grid)
 # nufft_nc = torchkb_nufft(im_size=im_size, device_idx=device_idx)
 nufft_nc = sigpy_nufft(im_size=im_size, device_idx=device_idx)
 A_nc = sense_linop(im_size=im_size,
@@ -121,9 +120,10 @@ A = sense_linop(im_size=im_size,
 
 # NUFFT Recon
 start = time.perf_counter()
-img_nufft = CG_SENSE_recon(A=A_nc, ksp=np_to_torch(ksp).to(torch_dev),
+img_nufft = CG_SENSE_recon(A=A_nc, ksp=ksp,
 							lamda_l2=lamda_l2,
-							max_iter=max_iter)
+							max_iter=max_iter,
+							max_eigen=max_eigen)
 torch.cuda.synchronize()
 end = time.perf_counter()
 img_nufft = normalize(img_nufft.cpu().numpy(), phantom)
@@ -131,13 +131,14 @@ nrmse_nufft = np.linalg.norm(img_nufft - phantom) / np.linalg.norm(phantom)
 t_nufft = (end - start)
 
 start = time.perf_counter()
-img_nufft = CG_SENSE_recon(A=A_nc, ksp=np_to_torch(ksp).to(torch_dev),
+img_nufft = CG_SENSE_recon(A=A_nc, ksp=ksp,
 						lamda_l2=lamda_l2,
-						max_iter=max_iter)
+						max_iter=max_iter,
+						max_eigen=max_eigen)
 torch.cuda.synchronize()
 end = time.perf_counter()
 img_nufft = normalize(img_nufft.cpu().numpy(), phantom)
-nrmse_nufft = np.linalg.norm(img_nufft - phantom) / np.linalg.norm(phantom)
+nrmse_nufft = 100 * np.linalg.norm(img_nufft - phantom) / np.linalg.norm(phantom)
 t_nufft = (end - start)
 
 # Imperfect Recons
@@ -145,6 +146,7 @@ imgs_imperf = []
 rmses = []
 Ls = []
 ts = []
+plt.figure(figsize=figsize)
 for l_iter in range(1, L):
 	imperf_model.L = l_iter
 	imperf_model.spatial_funcs = spatial_funcs[:l_iter]
@@ -155,28 +157,42 @@ for l_iter in range(1, L):
 	start = time.perf_counter()
 	img = CG_SENSE_recon(A=A, ksp=np_to_torch(ksp).to(torch_dev), 
 							lamda_l2=lamda_l2,
-							max_iter=max_iter)
+							max_iter=max_iter,
+							max_eigen=max_eigen)
 	torch.cuda.synchronize()
 	end = time.perf_counter()
 	t_imperf = (end - start)
 
 	img = normalize(img.cpu().numpy(), phantom)
 	imgs_imperf.append(img)
-	nrmse = np.linalg.norm(img - phantom) / np.linalg.norm(phantom)
+	nrmse = 100 * np.linalg.norm(img - phantom) / np.linalg.norm(phantom)
 	rmses.append(nrmse)
 	Ls.append(imperf_model.L)
 	ts.append(t_imperf)
 
-	plt.figure()
-	plt.title(f'L = {imperf_model.L} NRMSE = {nrmse:.2e} T = {t_imperf:.2f} s')
+	plt.subplot(3, 5, l_iter)
+	plt.title(f'L = {imperf_model.L} NRMSE = {nrmse:.2f} T = {t_imperf:.2f} s')
 	img = np.abs(img)
 	vmax = np.median(img) + 3 * np.std(img)
 	plt.imshow(img, cmap='gray', vmin=0, vmax=vmax)
 	plt.axis('off')
-	plt.tight_layout()
+plt.tight_layout()
 
 
-plt.figure()
+plt.figure(figsize=figsize)
+plt.plot(Ls, rmses)
+plt.xlabel('L')
+plt.ylabel('% NRMSE')
+plt.axhline(nrmse_nufft, color='r', linestyle='--')
+
+plt.figure(figsize=figsize)
+plt.scatter(ts, rmses, color='blue', label='SVD')
+plt.scatter([t_nufft], [nrmse_nufft], color='red', label='NUFFT')
+plt.xlabel('Time (s)')
+plt.ylabel('% NRMSE')
+plt.legend()
+
+plt.figure(figsize=figsize)
 plt.title(f'Nufft Recon T = {t_nufft:.2f} s')
 img = np.abs(img_nufft)
 vmax = np.median(img) + 3 * np.std(img)

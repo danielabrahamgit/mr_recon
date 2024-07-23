@@ -9,7 +9,7 @@ import sigpy.mri as mri
 from mr_recon.linops import sense_linop, batching_params
 from mr_recon.utils import np_to_torch
 from mr_recon.recons import CG_SENSE_recon, min_norm_recon
-from mr_recon.fourier import sigpy_nufft, gridded_nufft, torchkb_nufft
+from mr_recon.fourier import sigpy_nufft, gridded_nufft, torchkb_nufft, chebyshev_nufft
 
 # Params
 im_size = (220, 220)
@@ -42,9 +42,8 @@ ksp = sp.nufft(phantom * mps, trj, oversamp=2.0, width=6)
 
 # Recon with mr_recon
 bparams = batching_params(coil_batch_size=ncoil)
-nufft = sigpy_nufft(im_size=im_size, device_idx=device_idx)
-# nufft = torchkb_nufft(im_size=im_size, device_idx=device_idx)
-# nufft = gridded_nufft(im_size=im_size, device_idx=device_idx)
+# nufft = sigpy_nufft(im_size=im_size)
+nufft = chebyshev_nufft(im_size, 5, grid_oversamp=1.0)
 A = sense_linop(im_size=im_size,
                 trj=np_to_torch(trj).to(torch_dev),
                 mps=np_to_torch(mps).to(torch_dev),

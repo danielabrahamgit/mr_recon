@@ -8,7 +8,7 @@ import sigpy as sp
 import sigpy.mri as mri
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.linops import subspace_linop
-from mr_recon.fourier import sigpy_nufft, torchkb_nufft, gridded_nufft
+from mr_recon.fourier import sigpy_nufft, torchkb_nufft, gridded_nufft, chebyshev_nufft
 from mr_recon.utils import np_to_torch, torch_to_np
 from einops import rearrange
 

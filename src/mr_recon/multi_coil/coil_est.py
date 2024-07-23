@@ -5,10 +5,10 @@ import sigpy as sp
 from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
-from torchkbnufft import KbNufftAdjoint
 from mr_recon.algs import power_method_matrix
-from mr_recon.fourier import ifft
 from mr_recon.utils import torch_to_np, np_to_torch
+from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
+from mr_recon.multi_coil.grappa_est import gen_source_vectors_rand, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels
 
 # TODO give batch dims (useful for multi-slice)
 def csm_from_espirit(ksp_cal: torch.Tensor,
@@ -95,10 +95,69 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter, verbose=verbose)
     
     # Phase relative to first map
-    mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-8))
+    mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-12))
     mps *= eigen_vals > crp
 
     return mps, eigen_vals
+
+def csm_from_grappa(ksp_cal: torch.Tensor,
+                    im_size: tuple,
+                    num_kerns: Optional[int] = 100,
+                    num_src: Optional[int] = 25,
+                    kernel_width: Optional[int] = 6,
+                    crp: Optional[float] = 0.95,
+                    max_iter: Optional[int] = 100,
+                    verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Copy of sigpy implementation of ESPIRiT calibration, but in torch:
+    Martin Uecker, ... ESPIRIT - An Eigenvalue Approach to Autocalibrating Parallel MRI
+
+    Parameters:
+    -----------
+    ksp_cal : torch.Tensor
+        Calibration k-space data with shape (ncoil, *cal_size)
+    im_size : tuple
+        output image size
+    num_kerns : int
+        number of kernels to train
+    num_src : int
+        number of source points to use in training
+    kernel_width : int
+        width of calibration kernel
+    crp : float
+        output mask based on copping eignevalues
+    max_iter : int
+        number of iterations to run power method
+    verbose : bool
+        toggles progress bar
+
+    Returns:
+    --------
+    mps : torch.Tensor
+        coil sensitivity maps with shape (ncoil, *im_size)
+    eigen_vals : torch.Tensor
+        eigenvalues with shape (*im_size)
+    """
+    # Consts
+    torch_dev = ksp_cal.device
+    img_cal = ifft(ksp_cal, dim=list(range(-len(im_size), 0)))
+
+    # Generate random source vectors
+    # src_vecs = gen_source_vectors_rand(num_kerns=num_kerns, 
+    #                                    num_inputs=num_src, 
+    #                                    ndim=len(im_size), 
+    #                                    kern_width=kernel_width)
+    src_vecs = gen_source_vectors_rot(num_kerns=num_kerns, 
+                                      num_inputs=num_src, 
+                                      ndim=len(im_size), 
+                                      line_width=kernel_width)
+    src_vecs = src_vecs.to(torch_dev).type(torch.float32)
+    kerns = train_kernels(img_cal, src_vecs, 
+                          fast_method=True, 
+                          solver='pinv', 
+                          lamda_tikonov=0.0)
+
+    return csm_from_kernels(kerns, src_vecs, im_size, crp, max_iter, verbose)
 
 def csm_from_kernels(grappa_kernels: torch.Tensor,
                      source_vectors: torch.Tensor,
@@ -133,21 +192,27 @@ def csm_from_kernels(grappa_kernels: torch.Tensor,
         eigenvalues with shape (*im_size)
     """
 
-    # Compute image covariance and do power method
+    # Compute image covariance kernels
     BHB = calc_image_covariance_kernels(grappa_kernels, source_vectors, im_size, verbose=verbose)
+    BHB += torch.eye(BHB.shape[-1], device=BHB.device, dtype=BHB.dtype) 
+
+    # Min eigen from max
+    _, eig_vals_max = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
+    BHB = eig_vals_max[..., None, None] * torch.eye(BHB.shape[-1], device=BHB.device, dtype=BHB.dtype) - BHB
     mps, eigen_vals = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
+    eigen_vals = eig_vals_max - eigen_vals
 
     # Phase relative to first map
     mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-8))
-    mps *= eigen_vals > crp
+    mps *= eigen_vals < crp
 
     return mps, eigen_vals
 
 def calc_image_covariance_kernels(grappa_kernels: torch.Tensor,
                                   source_vectors: torch.Tensor,
                                   im_size: tuple,
+                                  nufft: Optional[NUFFT] = None,
                                   coil_batch: Optional[int] = None,
-                                  sigpy_nufft: Optional[bool] = True,
                                   verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Calculates B^HB matrix -- see writeup for details
@@ -161,6 +226,8 @@ def calc_image_covariance_kernels(grappa_kernels: torch.Tensor,
         vectors describing position of source relative to target with shape (nkerns, num_inputs, d)
     im_size : tuple
         output image size
+    nufft : NUFFT
+        nufft object
     coil_batch : int
         number of coils to process at once
     sigpy_nufft : bool
@@ -171,18 +238,27 @@ def calc_image_covariance_kernels(grappa_kernels: torch.Tensor,
     Returns:
     --------
     BHB : torch.Tensor
-        image covariance kernels with shape (ncoil, ncoil, *im_size)
+        image covariance kernels with shape (*im_size, ncoil, ncoil)
     """
 
     # Consts
     device = grappa_kernels.device
     nkerns, ncoil, _, num_inputs = grappa_kernels.shape
-    d = source_vectors.shape[-1]
     assert nkerns == source_vectors.shape[0]
     assert num_inputs == source_vectors.shape[1]
     assert device == source_vectors.device
     if coil_batch is None or coil_batch > ncoil ** 2:
         coil_batch = ncoil
+
+    # Default nufft
+    if nufft is None:
+        if 'cpu' in str(device).lower():
+            device_idx = -1
+        else:
+            device_idx = device.index
+        # nufft = torchkb_nufft(im_size, device_idx)
+        nufft = sigpy_nufft(im_size, device_idx)
+    source_vectors = nufft.rescale_trajectory(source_vectors)
 
     # Make cross terms
     grappa_kerns_rs = rearrange(grappa_kernels, 'N nco nci ninp -> nco nci N ninp')
@@ -201,48 +277,20 @@ def calc_image_covariance_kernels(grappa_kernels: torch.Tensor,
     grappa_kerns_cross = rearrange(grappa_kerns_cross, 'nci nci2 N ninp ninp2 -> (nci nci2) N ninp ninp2')
     grappa_kerns_cross *= scale
 
-    # Using sigpy for adjoint nufft
-    if sigpy_nufft:
-        grappa_kerns_cross_sp = torch_to_np(grappa_kerns_cross)
-        grappa_kerns_rs_sp = torch_to_np(grappa_kerns_rs)
-        grappa_kerns_rs_conj_sp = torch_to_np(grappa_kerns_rs_conj)
-        source_vectors_cross_sp = torch_to_np(source_vectors_cross)
-        source_vectors_sp = torch_to_np(source_vectors)
-        dev = sp.get_device(grappa_kerns_cross_sp)
-        xp = dev.xp
-
-        # Build BHB matrix
-        with dev:
-            BHB = xp.zeros((ncoil ** 2, *im_size), dtype=grappa_kerns_rs_sp.dtype)
-            for c1 in tqdm(range(0, ncoil ** 2, coil_batch), 'Computing Covariance Matrix', disable=not verbose):
-                c2 = min(ncoil ** 2, c1 + coil_batch)
-                oshape = (c2 - c1, *im_size)
-                BHB[c1:c2] += sp.nufft_adjoint(grappa_kerns_cross_sp[c1:c2], source_vectors_cross_sp, oshape, width=6)
-                BHB[c1:c2] += -sp.nufft_adjoint(grappa_kerns_rs_sp[c1:c2], -source_vectors_sp, oshape, width=6)
-                BHB[c1:c2] += -sp.nufft_adjoint(grappa_kerns_rs_conj_sp[c1:c2], source_vectors_sp, oshape, width=6)
-            BHB = rearrange(BHB, '(nc nci) ... -> ... nc nci',
-                            nc=ncoil, nci=ncoil)
-            BHB = np_to_torch(BHB)
-    # TorchKBNUFFT for adjoint
-    else:
-        im_size_arr = torch.tensor(im_size).to(device)
-        source_vectors = torch.pi * source_vectors / (im_size_arr / 2)
-        source_vectors_cross = torch.pi * source_vectors_cross / (im_size_arr / 2)
-
-        # Build BHB matrix
-        BHB = torch.zeros((ncoil * ncoil, *im_size), dtype=grappa_kerns_rs.dtype, device=device)
-        kbn = KbNufftAdjoint(im_size, dtype=grappa_kerns_rs.dtype, device=device)
-        source_vectors = rearrange(source_vectors, 'N ninp d -> d (N ninp)')
-        source_vectors_cross = rearrange(source_vectors_cross, 'N ninp ninp2 d -> d (N ninp ninp2)')
-        grappa_kerns_rs = rearrange(grappa_kerns_rs, 'C N ninp -> 1 C (N ninp)')
-        grappa_kerns_rs_conj = rearrange(grappa_kerns_rs_conj, 'C N ninp -> 1 C (N ninp)')
-        grappa_kerns_cross = rearrange(grappa_kerns_cross, 'C N ninp ninp2 -> 1 C (N ninp ninp2)')
-        for c1 in tqdm(range(0, ncoil ** 2, coil_batch), 'Computing Covariance Matrix', disable=not verbose):
-            c2 = min(ncoil ** 2, c1 + coil_batch)
-            BHB[c1:c2] += kbn(grappa_kerns_cross[:, c1:c2], source_vectors_cross)[0]
-            BHB[c1:c2] += -kbn(grappa_kerns_rs[:, c1:c2], -source_vectors)[0]
-            BHB[c1:c2] += -kbn(grappa_kerns_rs_conj[:, c1:c2], source_vectors)[0]
-        BHB = rearrange(BHB, '(nc nci) ... -> ... nc nci',
-                        nc=ncoil, nci=ncoil)
+    # Build BHB matrix
+    BHB = torch.zeros((ncoil * ncoil, *im_size), dtype=grappa_kerns_rs.dtype, device=device)
+    kbn = nufft.adjoint
+    source_vectors = rearrange(source_vectors, 'N ninp d -> 1 (N ninp) d')
+    source_vectors_cross = rearrange(source_vectors_cross, 'N ninp ninp2 d -> 1 (N ninp ninp2) d')
+    grappa_kerns_rs = rearrange(grappa_kerns_rs, 'C N ninp -> 1 C (N ninp)')
+    grappa_kerns_rs_conj = rearrange(grappa_kerns_rs_conj, 'C N ninp -> 1 C (N ninp)')
+    grappa_kerns_cross = rearrange(grappa_kerns_cross, 'C N ninp ninp2 -> 1 C (N ninp ninp2)')
+    for c1 in tqdm(range(0, ncoil ** 2, coil_batch), 'Computing Covariance Matrix', disable=not verbose):
+        c2 = min(ncoil ** 2, c1 + coil_batch)
+        BHB[c1:c2] += kbn(grappa_kerns_cross[:, c1:c2], source_vectors_cross)[0]
+        BHB[c1:c2] += -kbn(grappa_kerns_rs[:, c1:c2], -source_vectors)[0]
+        BHB[c1:c2] += -kbn(grappa_kerns_rs_conj[:, c1:c2], source_vectors)[0]
+    BHB = rearrange(BHB, '(nc nci) ... -> ... nc nci',
+                    nc=ncoil, nci=ncoil)
 
     return BHB

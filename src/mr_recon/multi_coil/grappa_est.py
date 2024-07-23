@@ -2,11 +2,11 @@ import torch
 import sigpy as sp
 
 from typing import Optional, Tuple
+from mr_recon.algs import lin_solve
 from einops import rearrange, einsum
 from mr_recon.fourier import fft, ifft
-from mr_recon.utils import np_to_torch, torch_to_np, rotation_matrix
-from mr_recon.algs import lin_solve
 from sigpy.fourier import _get_oversamp_shape, _apodize, _scale_coord
+from mr_recon.utils import gen_grd, np_to_torch, torch_to_np, rotation_matrix
 
 def gen_source_vectors_rot(num_kerns: int,
                            num_inputs: int,
@@ -66,6 +66,59 @@ def gen_source_vectors_rot(num_kerns: int,
         raise NotImplementedError
     
     return source_vectors
+
+def gen_source_vectors_rand(num_kerns: int,
+                            num_inputs: int,
+                            ndim: int,
+                            kern_width: Optional[float] = 5.0) -> torch.Tensor:
+    """
+    Generates random kernels 
+
+    Parameters:
+    -----------
+    num_kerns : int
+        number of grappa kernels
+    num_inputs : int
+        number of source point inputs
+    ndim : int  
+        number of dimensions (2 or 3 usually)
+    kern_width : float
+        size of kernel
+    
+    Returns:
+    --------
+    source_vectors : torch.Tensor
+        Coordinates of source relative to target with shape (nkerns, ninputs, d)
+    """
+
+    source_vectors = torch.rand(num_kerns, num_inputs, ndim) * kern_width - kern_width / 2
+    return source_vectors
+
+def gen_source_vectors_circ(num_kerns: int,
+                            num_inputs: int,
+                            ndim: int,
+                            diameter: Optional[float] = 5.0) -> torch.Tensor:
+    """
+    Generates random kernels 
+
+    Parameters:
+    -----------
+    num_kerns : int
+        number of grappa kernels
+    num_inputs : int
+        number of source point inputs
+    ndim : int  
+        number of dimensions (2 or 3 usually)
+    diameter : float
+        diameter of circles
+    
+    Returns:
+    --------
+    source_vectors : torch.Tensor
+        Coordinates of source relative to target with shape (nkerns, ninputs, d)
+    """
+    raise not NotImplementedError
+    return None
 
 def rect_trj(cal_shape: tuple, 
              dk_buffer: Optional[int] = 2) -> torch.Tensor:
@@ -135,8 +188,10 @@ def grappa_AHA_AHb(img_cal: torch.Tensor,
 
     # Move to cupy
     img_cal_cp = torch_to_np(img_cal)
+    kern_widths = 2 * source_vectors.cpu().reshape((-1, d)).abs().max(dim=0)[0]
+    cal_size = (torch.tensor(img_cal.shape[1:]) - kern_widths).type(torch.int)
+    target_vectors_cp = torch_to_np(gen_grd(cal_size, cal_size).reshape((-1, d)).to(device))
     source_vectors_cp = torch_to_np(source_vectors)
-    target_vectors_cp = torch_to_np(rect_trj(img_cal.shape[1:]).to(device))
     dev = sp.get_device(img_cal_cp)
 
     # Prepare for KB interp
