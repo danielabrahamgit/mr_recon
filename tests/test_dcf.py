@@ -11,7 +11,7 @@ from mr_recon.utils import np_to_torch
 from mr_recon.recons import CG_SENSE_recon, min_norm_recon
 from mr_recon.fourier import sigpy_nufft, gridded_nufft, torchkb_nufft
 from mr_recon.algs import density_compensation
-from mr_sim.phantom import shepp_logan
+from mr_sim.phantoms import shepp_logan
 
 # Params
 im_size = (220, 220)

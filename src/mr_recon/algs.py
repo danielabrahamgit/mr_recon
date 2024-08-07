@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
 from sigpy.mri import pipe_menon_dcf
-from mr_recon.fourier import sigpy_nufft
+# from mr_recon.fourier import sigpy_nufft
 
 def density_compensation(trj: torch.Tensor,
                          im_size: tuple,
@@ -55,71 +55,45 @@ def density_compensation(trj: torch.Tensor,
                             max_iter=num_iters)    
         dcf = np_to_torch(dcf)
     
-    # CG in k-space
-    elif method == 'cg_ksp':
-        # Define Gridding normal operator
-        # trj_sp = torch_to_np(trj)
-        # G = sp.linop.Gridding(im_size_os, trj, param=8,
-        #                       width=4, kernel='kaiser_bessel') 
-        # def GHG(x):
-        #     with sp.get_device(trj_sp):
-        #         psf = G.H * G * torch_to_np(x)
-        #         return np_to_torch(psf)
-        nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=1.0, width=4, beta=8, apodize=False)
-        def GHG(x):
-            adj = nft.adjoint(x[None,], trj[None,])
-            fwd = nft.forward(adj, trj[None,])[0].real
-            return fwd
+    # # CG in k-space
+    # elif method == 'cg_ksp':
+    #     nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=1.0, width=4, beta=8, apodize=False)
+    #     def GHG(x):
+    #         adj = nft.adjoint(x[None,], trj[None,])
+    #         fwd = nft.forward(adj, trj[None,])[0].real
+    #         return fwd
         
-        # Fix scaling factor and run CG
-        ones = torch.ones(trj.shape[:-1], device=torch_dev, dtype=torch.float32)
-        delta = ones.flatten() * 0
-        delta[0] = 1
-        scale = GHG(delta.reshape(ones.shape)).abs().max()
-        AHA = lambda x : GHG(x) / scale
-        dcf = conjugate_gradient(AHA, ones, num_iters=num_iters, lamda_l2=1e0 * 0, verbose=True).abs()
+    #     # Fix scaling factor and run CG
+    #     ones = torch.ones(trj.shape[:-1], device=torch_dev, dtype=torch.float32)
+    #     delta = ones.flatten() * 0
+    #     delta[0] = 1
+    #     scale = GHG(delta.reshape(ones.shape)).abs().max()
+    #     AHA = lambda x : GHG(x) / scale
+    #     dcf = conjugate_gradient(AHA, ones, num_iters=num_iters, lamda_l2=1e0 * 0, verbose=True).abs()
 
-    elif method == 'cg_img':
-        delta = torch.zeros(im_size_os, device=torch_dev, dtype=torch.complex64)
-        slc = tuple([im_size_os[i] // 2 for i in range(len(im_size_os))])
-        delta[slc] = 1
+    # elif method == 'cg_img':
+    #     delta = torch.zeros(im_size_os, device=torch_dev, dtype=torch.complex64)
+    #     slc = tuple([im_size_os[i] // 2 for i in range(len(im_size_os))])
+    #     delta[slc] = 1
 
-        nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=os, width=4, beta=8, apodize=False)
-        kerns = nft.calc_teoplitz_kernels(trj[None,], os_factor=2.0)
-        # def FHF(x):
-        #     fwd = nft.forward(x[None,], trj[None,])
-        #     adj = nft.adjoint(fwd, trj[None,])[0]
-        #     return adj
-        def FHF(x):
-            adj = nft.normal_toeplitz(x[None,None], kerns)[0,0]
-            return adj
-        def FHF_inv(x):
-            adj = nft.normal_toeplitz(x[None,None], 1 / (kerns + 1e1))[0,0]
-            return adj
-        scale = FHF(delta).abs().max()
-        AHA = lambda x : FHF(x) / scale
-        print(scale)
-        # dcf_img = conjugate_gradient(AHA, delta, num_iters=num_iters*0 + 20, lamda_l2=1e1, verbose=True)
-        dcf_img = FHF_inv(delta)
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(14, 7))
-        # plt.subplot(221)
-        # plt.title('inv PSF')
-        # plt.imshow(dcf_img.abs().log().cpu())
-        # plt.axis('off')
-        # plt.subplot(223)
-        # plt.plot(dcf_img[:, im_size_os[1] // 2].abs().cpu())
-        # plt.axis('off')
-        # plt.subplot(222)
-        # plt.title('AHA(inv PSF)')
-        # plt.imshow(AHA(dcf_img).abs().log().cpu())
-        # plt.axis('off')
-        # plt.subplot(224)
-        # plt.plot(AHA(dcf_img)[:, im_size_os[1] // 2].abs().cpu())
-        # plt.axis('off')
-        # plt.show()
-        # quit()
-        dcf = nft.forward(dcf_img[None,], trj[None,])[0].abs()
+    #     nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=os, width=4, beta=8, apodize=False)
+    #     kerns = nft.calc_teoplitz_kernels(trj[None,], os_factor=2.0)
+    #     # def FHF(x):
+    #     #     fwd = nft.forward(x[None,], trj[None,])
+    #     #     adj = nft.adjoint(fwd, trj[None,])[0]
+    #     #     return adj
+    #     def FHF(x):
+    #         adj = nft.normal_toeplitz(x[None,None], kerns)[0,0]
+    #         return adj
+    #     def FHF_inv(x):
+    #         adj = nft.normal_toeplitz(x[None,None], 1 / (kerns + 1e1))[0,0]
+    #         return adj
+    #     scale = FHF(delta).abs().max()
+    #     AHA = lambda x : FHF(x) / scale
+    #     print(scale)
+    #     # dcf_img = conjugate_gradient(AHA, delta, num_iters=num_iters*0 + 20, lamda_l2=1e1, verbose=True)
+    #     dcf_img = FHF_inv(delta)
+    #     dcf = nft.forward(dcf_img[None,], trj[None,])[0].abs()
         
     dcf /= dcf.max()
     return dcf

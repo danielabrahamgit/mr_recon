@@ -11,8 +11,7 @@ import sigpy.mri as mri
 from mr_recon.linops import sense_linop, batching_params
 from mr_recon.utils import np_to_torch, normalize
 from mr_recon.recons import CG_SENSE_recon
-from mr_recon.fourier import gridded_nufft, torchkb_nufft, sigpy_nufft
-from mr_recon.imperfections.off_grid import off_grid_imperfection
+from mr_recon.fourier import gridded_nufft, torchkb_nufft, sigpy_nufft, svd_nufft
 from mr_sim.trj_lib import trj_lib
 
 from igrog.grogify import imperfection_implicit_grogify, gridding_implicit_grogify, gridding_grogify
@@ -29,37 +28,22 @@ im_size = (220, 220)
 ninter = 16
 ncoil = 32
 R = 4
+L = 14
 lamda_l2 = 1e-3 * 0
-max_iter = 100
+max_iter = 500
 max_eigen = 0.4
 device_idx = 5
-os_grid = 4
+os_grid = 1.2
 try: 
 	torch_dev = torch.device(device_idx)
 except:
 	torch_dev = torch.device('cpu')
 
-def loss(x, y):
-	err = x - y
-	return torch.mean(torch.abs(err) ** 2)
-
-grid_params_grog = gridding_params(num_inputs=1,
-								   kern_width=1.0,
-								   interp_readout=True,
-								   grid=True,
-								   oversamp_grid=os_grid)
-grid_params_igrog = gridding_params(num_inputs=5,
-									kern_width=2.0,
-									interp_readout=True,
-									oversamp_grid=os_grid,
-									grid=False)
-train_params = training_params(show_loss=True, l2_reg=0.0)
-
 # Gen data
 phantom = sp.shepp_logan(im_size)
 trj = mri.spiral(fov=1,
 				 N=220,
-				 f_sampling=.25,
+				 f_sampling=.05,
 				 R=1.0,
 				 ninterleaves=ninter,
 				 alpha=1.0,
@@ -84,24 +68,10 @@ mps = np_to_torch(mps).to(torch_dev).type(torch.complex64)
 dcf = np_to_torch(dcf).to(torch_dev).type(torch.float32)
 ksp = np_to_torch(ksp).to(torch_dev).type(torch.complex64)
 
-# Make imperfection model
-trj_grd = torch.round(trj * os_grid) / os_grid
-grid_deviations = trj - trj_grd
-L = 14
-imperf_model = off_grid_imperfection(im_size=im_size,
-									 grid_deviations=grid_deviations,
-									 L=L,
-									 method='svd',
-									 interp_type='zero',
-									 verbose=True)
-spatial_funcs = imperf_model.spatial_funcs.clone()
-temporal_funcs = imperf_model.temporal_funcs.clone()
-
-# Make linops
-bparams = batching_params(coil_batch_size=ncoil, field_batch_size=L)
-nufft = gridded_nufft(im_size=im_size, device_idx=device_idx, grid_oversamp=os_grid)
-# nufft_nc = torchkb_nufft(im_size=im_size, device_idx=device_idx)
-nufft_nc = sigpy_nufft(im_size=im_size, device_idx=device_idx)
+# Make nufft linops
+bparams = batching_params(coil_batch_size=ncoil)
+# nufft_nc = torchkb_nufft(im_size=im_size, torch_dev)
+nufft_nc = sigpy_nufft(im_size=im_size)
 A_nc = sense_linop(im_size=im_size,
 					trj=trj,
 					mps=mps,
@@ -109,14 +79,6 @@ A_nc = sense_linop(im_size=im_size,
 					bparams=bparams,
 					nufft=nufft_nc,
 					use_toeplitz=False,)
-A = sense_linop(im_size=im_size,
-				trj=trj_grd,
-				mps=mps,
-				dcf=dcf,
-				bparams=bparams,
-				nufft=nufft,
-				imperf_model=imperf_model,
-				use_toeplitz=False,)
 
 # NUFFT Recon
 start = time.perf_counter()
@@ -141,19 +103,21 @@ img_nufft = normalize(img_nufft.cpu().numpy(), phantom)
 nrmse_nufft = 100 * np.linalg.norm(img_nufft - phantom) / np.linalg.norm(phantom)
 t_nufft = (end - start)
 
-# Imperfect Recons
+# SVD NUFFT Recons
 imgs_imperf = []
 rmses = []
 Ls = []
 ts = []
 plt.figure(figsize=figsize)
+nufft = svd_nufft(im_size, os_grid, L)
+A = sense_linop(im_size=im_size, trj=trj, mps=mps, dcf=dcf,
+				nufft=nufft,
+				use_toeplitz=False,
+				bparams=bparams)
 for l_iter in range(1, L):
-	imperf_model.L = l_iter
-	imperf_model.spatial_funcs = spatial_funcs[:l_iter]
-	imperf_model.temporal_funcs = temporal_funcs[:l_iter]
-	A.imperf_rank = l_iter
-	A.bparams.field_batch_size = l_iter
+	nufft.n_svd = l_iter
 	
+	print(f'\nRunning L = {l_iter}')
 	start = time.perf_counter()
 	img = CG_SENSE_recon(A=A, ksp=np_to_torch(ksp).to(torch_dev), 
 							lamda_l2=lamda_l2,
@@ -167,11 +131,11 @@ for l_iter in range(1, L):
 	imgs_imperf.append(img)
 	nrmse = 100 * np.linalg.norm(img - phantom) / np.linalg.norm(phantom)
 	rmses.append(nrmse)
-	Ls.append(imperf_model.L)
+	Ls.append(l_iter)
 	ts.append(t_imperf)
 
 	plt.subplot(3, 5, l_iter)
-	plt.title(f'L = {imperf_model.L} NRMSE = {nrmse:.2f} T = {t_imperf:.2f} s')
+	plt.title(f'L = {l_iter} NRMSE = {nrmse:.2f} T = {t_imperf:.2f} s')
 	img = np.abs(img)
 	vmax = np.median(img) + 3 * np.std(img)
 	plt.imshow(img, cmap='gray', vmin=0, vmax=vmax)

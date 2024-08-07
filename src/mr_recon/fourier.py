@@ -6,9 +6,10 @@ import torch.fft as fft_torch
 
 from typing import Optional
 from torchkbnufft import KbNufft, KbNufftAdjoint
-from einops import einsum
+from einops import einsum, rearrange
 from scipy.special import jv
 from mr_recon.pad import PadLast
+from mr_recon.algs import svd_power_method_tall
 from mr_recon.indexing import (
     multi_grid,
     multi_index
@@ -602,6 +603,167 @@ class gridded_nufft(NUFFT):
 
         return calc_toep_kernel_helper(nufft_os.adjoint, (trj * os_factor).type(torch.int32), weights) * (os_factor ** len(self.im_size))
 
+class svd_nufft(NUFFT):
+    """
+    Models deviations from regular grid with SVD low rank model
+    """
+    # TODO impliment batching?
+    def __init__(self,
+                 im_size: tuple,
+                 grid_oversamp: Optional[float] = 1.0,
+                 n_svd: Optional[int] = 5,
+                 n_batch_size: Optional[int] = None):
+        super().__init__(im_size)
+        grog_os_size = tuple([round(i * grid_oversamp) for i in self.im_size])
+        self.grid_oversamp = grid_oversamp
+        self.grog_padder = PadLast(grog_os_size, im_size)
+        self.n_svd = n_svd
+        self.n_batch_size = n_svd if n_batch_size is None else n_batch_size
+
+    def compute_svd_funcs(self,
+                          trj: torch.Tensor,
+                          use_toeplitz: Optional[bool] = True) -> torch.Tensor:
+        """
+        Computes the SVD functions for the deviations from 
+        """
+        # Consts
+        im_size = self.im_size
+        im_size_os = self.grog_padder.pad_im_size
+        os_grid = self.grid_oversamp
+
+        # Deviations from regular grid
+        trj_dev = trj - torch.round(trj * os_grid) / os_grid
+
+        # Use other NUFFT to compute SVD quickly
+        sp_nufft = sigpy_nufft(im_size)
+        trj_dev = -sp_nufft.rescale_trajectory(trj_dev)
+        nvox = torch.prod(torch.tensor(im_size_os)).item()
+
+        # Define forward, adjoint, graham operators
+        def A(x):
+            return sp_nufft.adjoint(x[None,], trj_dev[None,])[0] * nvox ** 0.5
+        def AH(y):
+            return sp_nufft(y[None,], trj_dev[None,])[0] * nvox ** 0.5
+        if use_toeplitz:
+            kerns = sp_nufft.calc_teoplitz_kernels(trj_dev[None])
+            def AAH(y):
+                return sp_nufft.normal_toeplitz(y[None,None,], kerns)[0,0] * nvox
+        else:
+            def AAH(y):
+                return A(AH(y))
+            
+        # Compute SVD
+        U, S, Vh = svd_power_method_tall(A=AH,
+                                         AHA=AAH,
+                                         niter=100,
+                                         inp_dims=self.im_size,
+                                         rank=self.n_svd,
+                                         device=trj.device)
+        temporal_funcs = rearrange(U * S, '... nseg -> nseg ...').conj()
+        spatial_funcs = Vh.conj()
+
+        return temporal_funcs, spatial_funcs
+    
+    def rescale_trajectory(self,
+                           trj: torch.Tensor) -> torch.Tensor:
+        
+        # Compute basis functions
+        self.temporal_funcs, self.spatial_funcs = self.compute_svd_funcs(trj)
+        
+        # Clamp each dimension
+        trj_rs = trj * self.grid_oversamp
+        grid_os_size = self.grog_padder.pad_im_size
+        for i in range(trj_rs.shape[-1]):
+            n_over_2 = grid_os_size[i]/2
+            trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, grid_os_size[i]-1)
+        trj_rs = torch.round(trj_rs).type(torch.int32)
+
+        return trj_rs
+
+    def forward(self, 
+                img: torch.Tensor, 
+                trj: torch.Tensor) -> torch.Tensor:
+        
+        # To torch
+        img_torch, trj_torch = np_to_torch(img, trj)
+
+        # Consts
+        d = trj.shape[-1]
+        N = trj.shape[0]
+        n_svd = self.n_svd
+
+        # Multiplied by spatial functions
+        empty_dims = img_torch.ndim - self.spatial_funcs.ndim
+        tup = (None, slice(0, n_svd)) + (None,) * empty_dims + (slice(None),) * (self.spatial_funcs.ndim - 1)
+        img_torch = img_torch[:, None, ...] * self.spatial_funcs[tup]
+
+        # Oversampled FFT
+        img_os = self.grog_padder.forward(img_torch)
+        ksp_os = fft(img_os, dim=tuple(range(-d, 0)))
+        
+        # Return k-space
+        ksp = torch.zeros((*img_torch.shape[:-d], *trj.shape[1:-1]), 
+                          dtype=torch.complex64, device=img_torch.device)
+        for i in range(N):
+            ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
+
+        empty_dims = ksp.ndim - self.temporal_funcs.ndim - 1
+        tup = (None, slice(0, n_svd)) + (None,) * empty_dims + (slice(None),) * (self.temporal_funcs.ndim - 1)
+        ksp = (ksp * self.temporal_funcs[tup]).sum(1)
+        
+        return ksp * self.grid_oversamp
+                    
+    def adjoint(self, 
+                ksp: torch.Tensor, 
+                trj: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint non-uniform fourier transform
+
+        Parameters:
+        -----------
+        ksp : torch.Tensor <complex64>
+            input k-space with shape (N, *ksp_batch, *trj_batch)
+        trj : torch.Tensor <float32>
+            input trajectory with shape (N, *trj_batch, len(im_size))
+        
+        Returns:
+        --------
+        img : torch.Tensor <complex64>
+            output image with shape (N, *ksp_batch, *im_size)
+        
+        Note:
+        -----
+        N is the batch dim, must pass in 1 if no batching!
+        """
+
+        # To torch
+        ksp_torch, trj_torch = np_to_torch(ksp, trj)
+        
+        # Consts
+        d = trj.shape[-1]
+        N = trj.shape[0]
+        n_svd = self.n_svd
+        grid_os_size = self.grog_padder.pad_im_size
+
+        # Multiply by temporal functions
+        empty_dims = ksp.ndim - self.temporal_funcs.ndim
+        tup = (None, slice(0, n_svd)) + (None,) * empty_dims + (slice(None),) * (self.temporal_funcs.ndim - 1)
+        ksp_torch = ksp_torch[:, None, ...] * self.temporal_funcs.conj()[tup]
+
+        # Adjoint NUFFT
+        ksp_os = torch.zeros((*ksp_torch.shape[:-(trj.ndim - 2)], *grid_os_size), 
+                             dtype=torch.complex64, device=ksp_torch.device)
+        for i in range(N):
+            ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), grid_os_size)
+        img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
+        img = self.grog_padder.adjoint(img_os)
+
+        empty_dims = img.ndim - self.spatial_funcs.ndim - 1
+        tup = (None, slice(0, n_svd)) + (None,) * empty_dims + (slice(None),) * (self.spatial_funcs.ndim - 1)
+        img = (img * self.spatial_funcs.conj()[tup]).sum(1)
+
+        return img * self.grid_oversamp
+    
 class chebyshev_nufft(NUFFT):
     """
     NUFFT based on https://arxiv.org/pdf/1701.04492
@@ -803,4 +965,4 @@ class chebyshev_nufft(NUFFT):
             img += (img_os_crp * self.b[l1:l2].conj()).sum(-self.b.ndim)
 
         return img * self.grid_oversamp
-    
+   

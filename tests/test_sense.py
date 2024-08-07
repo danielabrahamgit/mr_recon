@@ -11,12 +11,16 @@ from mr_recon.utils import np_to_torch
 from mr_recon.recons import CG_SENSE_recon, min_norm_recon
 from mr_recon.fourier import sigpy_nufft, gridded_nufft, torchkb_nufft, chebyshev_nufft
 
+# Set seed
+np.random.seed(0)
+torch.manual_seed(0)
+
 # Params
 im_size = (220, 220)
 ninter = 16
 ncoil = 32
 R = 4
-lamda_l2 = 1e-5 * 0
+lamda_l2 = 1e-5
 max_iter = 100
 device_idx = 4
 torch_dev = torch.device(device_idx)
@@ -25,10 +29,10 @@ torch_dev = torch.device(device_idx)
 phantom = sp.shepp_logan(im_size)
 trj = mri.spiral(fov=1,
                  N=220,
-                 f_sampling=1.0,
+                 f_sampling=0.3,
                  R=1.0,
                  ninterleaves=ninter,
-                 alpha=1.0,
+                 alpha=1.5,
                  gm=40e-3,
                  sm=100)
 trj = trj.reshape((-1, ninter, 2), order='F')[:, ::round(R), :]
@@ -39,6 +43,10 @@ dcf /= dcf.max()
 
 # Simulate with sigpy 
 ksp = sp.nufft(phantom * mps, trj, oversamp=2.0, width=6)
+
+# Add noise
+sigma = 4e-3
+ksp += np.random.normal(0, sigma, ksp.shape) + 1j * np.random.normal(0, sigma, ksp.shape)
 
 # Recon with mr_recon
 bparams = batching_params(coil_batch_size=ncoil)

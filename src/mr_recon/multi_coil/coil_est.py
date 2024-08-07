@@ -143,14 +143,14 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
     img_cal = ifft(ksp_cal, dim=list(range(-len(im_size), 0)))
 
     # Generate random source vectors
-    # src_vecs = gen_source_vectors_rand(num_kerns=num_kerns, 
-    #                                    num_inputs=num_src, 
-    #                                    ndim=len(im_size), 
-    #                                    kern_width=kernel_width)
-    src_vecs = gen_source_vectors_rot(num_kerns=num_kerns, 
-                                      num_inputs=num_src, 
-                                      ndim=len(im_size), 
-                                      line_width=kernel_width)
+    src_vecs = gen_source_vectors_rand(num_kerns=num_kerns, 
+                                       num_inputs=num_src, 
+                                       ndim=len(im_size), 
+                                       kern_width=kernel_width)
+    # src_vecs = gen_source_vectors_rot(num_kerns=num_kerns, 
+    #                                   num_inputs=num_src, 
+    #                                   ndim=len(im_size), 
+    #                                   line_width=kernel_width)
     src_vecs = src_vecs.to(torch_dev).type(torch.float32)
     kerns = train_kernels(img_cal, src_vecs, 
                           fast_method=True, 
@@ -294,3 +294,68 @@ def calc_image_covariance_kernels(grappa_kernels: torch.Tensor,
                     nc=ncoil, nci=ncoil)
 
     return BHB
+
+def calc_espirit_kernels(ksp_cal: torch.Tensor,
+                         im_size: tuple,
+                         thresh: Optional[float] = 0.02,
+                         kernel_width: Optional[int] = 6,
+                         verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Copy of sigpy implementation of ESPIRiT calibration, but in torch:
+    Martin Uecker, ... ESPIRIT - An Eigenvalue Approach to Autocalibrating Parallel MRI
+
+    Parameters:
+    -----------
+    ksp_cal : torch.Tensor
+        Calibration k-space data with shape (ncoil, *cal_size)
+    im_size : tuple
+        output image size
+    thresh : float
+        threshold for SVD nullspace
+    kernel_width : int
+        width of calibration kernel
+    verbose : bool
+        toggles progress bar
+
+    Returns:
+    --------
+    mps : torch.Tensor
+        coil sensitivity maps with shape (ncoil, *im_size)
+    eigen_vals : torch.Tensor
+        eigenvalues with shape (*im_size)
+    """
+
+    # Consts
+    img_ndim = len(im_size)
+    num_coils = ksp_cal.shape[0]
+
+    # TODO torch this part
+    # Get calibration matrix.
+    # Shape [num_coils] + num_blks + [kernel_width] * img_ndim
+    ksp_cal_sp = torch_to_np(ksp_cal)
+    dev = sp.get_device(ksp_cal_sp)
+    with dev:
+        mat = sp.array_to_blocks(
+            ksp_cal_sp, [kernel_width] * img_ndim, [1] * img_ndim)
+        calib_mat = mat.reshape((num_coils, -1, *((kernel_width,)*img_ndim))) # For debug
+        mat = mat.reshape([num_coils, -1, kernel_width**img_ndim])
+        mat = mat.transpose([1, 0, 2])
+        mat = mat.reshape([-1, num_coils * kernel_width**img_ndim])
+    mat = np_to_torch(mat)
+
+    # Perform SVD on calibration matrix
+    if verbose:
+        print('Computing SVD on calibration matrix: ', end='')
+        start = time.perf_counter()
+    _, S, VH = torch.linalg.svd(mat, full_matrices=False)
+    VH = VH[S < thresh * S.max(), :]
+    if verbose:
+        end = time.perf_counter()
+        print(f'{end - start:.3f}s')
+
+    # Get kernels
+    num_kernels = len(VH)
+    kernels = VH.reshape(
+        [num_kernels, num_coils] + [kernel_width] * img_ndim)
+    
+    return kernels, np_to_torch(rearrange(calib_mat, 'C N ... -> N C ...'))

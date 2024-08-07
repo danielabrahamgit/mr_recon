@@ -8,9 +8,9 @@ import matplotlib.pyplot as plt
 
 from scipy.special import lambertw
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
-from mr_sim.phantom import shepp_logan
+from mr_sim.phantoms import shepp_logan
 from math import ceil
-from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, gridded_nufft, ifft
+from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, gridded_nufft, svd_nufft, ifft
 from einops import einsum
 
 
@@ -50,7 +50,8 @@ trj_rs_sp = nufft_sp.rescale_trajectory(trj)
 ksp_sp = nufft_sp(img[None,], trj_rs_sp[None,])[0] 
 
 # Apply with lowrank nufft
-nufft = chebyshev_nufft(im_size, L)
+# nufft = chebyshev_nufft(im_size, L)
+nufft = svd_nufft(im_size, 1.0, L)
 trj_rs = nufft.rescale_trajectory(trj)
 ksp_cheby = nufft(img[None,], trj_rs[None,])[0] 
 

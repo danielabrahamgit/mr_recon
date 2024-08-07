@@ -324,7 +324,7 @@ def grappa_AHA_AHb_fast(img_cal: torch.Tensor,
 def train_kernels(img_cal: torch.Tensor,
                   source_vectors: torch.Tensor,
                   lamda_tikonov: Optional[float] = 1e-3,
-                  solver: Optional[str] = 'lstsq_torch',
+                  solver: Optional[str] = 'pinv',
                   fast_method: Optional[bool] = False) -> torch.Tensor:
     """
     Trains grappa kernels given calib image and source vectors

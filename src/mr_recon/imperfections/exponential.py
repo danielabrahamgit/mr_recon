@@ -13,7 +13,7 @@ from mr_recon.utils import (
 
 class exponential_imperfection(imperfection):
     """
-    Broadly represents class of exponential imperfections. These will have the form:
+    Broadly represents class of complex exponential imperfections. These will have the form:
     b(t) = int_r m(r) T(t){s(r)} e^{-j 2pi k(t) r} dr
     
     Where T(t){s(r)} = s(r) e^{-j 2pi phi(r) @ alpha(t)}
@@ -28,7 +28,8 @@ class exponential_imperfection(imperfection):
                  L: int,
                  method: Optional[str] = 'ts',
                  interp_type: Optional[str] = 'zero',
-                 verbose: Optional[bool] = True):
+                 verbose: Optional[bool] = True,
+                 complex_exp: Optional[bool] = True):
         """
         Parameters:
         -----------
@@ -47,6 +48,9 @@ class exponential_imperfection(imperfection):
             'lstsq' - least squares interpolator
         verbose : bool
             toggles print statements
+        complex_exp : bool
+            if True, uses complex exponential model e^{-j2pi alphas * phis}
+            if False uses real exponential model e^{-alphas * phis}
         """
         self.alphas = alphas
         self.phis = phis
@@ -54,6 +58,10 @@ class exponential_imperfection(imperfection):
         self.im_size = phis.shape[1:]
         self.trj_size = alphas.shape[1:]
         self.torch_dev = phis.device
+        if complex_exp:
+            self.exp_scale = 2j * torch.pi
+        else:
+            self.exp_scale = 1
 
         assert alphas.device == self.torch_dev, 'alphas and phis must be on same device'
         assert alphas.dtype == torch.float32, 'alphas must be float32'
@@ -121,7 +129,7 @@ class exponential_imperfection(imperfection):
             for n1, n2 in batch_iterator(N, spatial_batch_size):
                 n2 = min(n1 + spatial_batch_size, N)
                 A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
-                A_batch = torch.exp(-2j * torch.pi * A_batch)
+                A_batch = torch.exp(-self.exp_scale * A_batch)
                 AHA += A_batch.H @ A_batch / N
             # AHA_inv = torch.linalg.inv(AHA)
 
@@ -142,9 +150,9 @@ class exponential_imperfection(imperfection):
                     for n1, n2 in batch_iterator(N, spatial_batch_size):
                         n2 = min(n1 + spatial_batch_size, N)
                         A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
-                        A_batch = torch.exp(-2j * torch.pi * A_batch)
+                        A_batch = torch.exp(-self.exp_scale * A_batch)
                         B_batch = phis_flt[n1:n2, :] @ alphas_flt[t1:t2].T
-                        B_batch = torch.exp(-2j * torch.pi * B_batch)
+                        B_batch = torch.exp(-self.exp_scale * B_batch)
                         AHb += A_batch.H @ B_batch / N
 
                 # Solve for ls = (AHA)^{-1} AHb
@@ -295,7 +303,7 @@ class exponential_imperfection(imperfection):
         
         # Use NUFFT to evaluate A : int_t x(t) e^{-j 2pi t phi(r)} dt
         # And its adjoint/normal operator
-        nufft = sigpy_nufft(im_size=(nro,), device_idx=self.torch_dev.index)
+        nufft = sigpy_nufft(im_size=(nro,))
         freqs = nufft.rescale_trajectory(phis * nro)[0, ..., None]
 
         # Compute phase_0 to make sure that no phase is applied at first time point
@@ -355,7 +363,7 @@ class exponential_imperfection(imperfection):
         assert self.B == len(self.im_size)
 
         # Build operators via fourier method
-        nufft = sigpy_nufft(im_size=self.im_size, device_idx=self.torch_dev.index)
+        nufft = sigpy_nufft(im_size=self.im_size)
         trj = -rearrange(self.alphas, 'B ... -> ... B')
         trj = nufft.rescale_trajectory(trj)
         nvox = torch.prod(torch.tensor(self.im_size)).item()
@@ -453,7 +461,7 @@ class exponential_imperfection(imperfection):
                 else:
                     st_matrix += phi[tup_p] * alpha[tup_a]
             
-            st_matrix = torch.exp(-2j * torch.pi * st_matrix)
+            st_matrix = torch.exp(-self.exp_scale * st_matrix)
 
         return st_matrix 
     
@@ -511,7 +519,7 @@ class exponential_imperfection(imperfection):
         else:
             alphas = self.alphas.reshape((self.B, -1))[:, t_inds]
             phis = self.phis.reshape((self.B, -1))[:, r_inds]
-            xt = torch.exp(-2j * torch.pi * torch.sum(alphas * phis, dim=0)) * x
+            xt = torch.exp(-self.exp_scale * torch.sum(alphas * phis, dim=0)) * x
         return xt
     
     def apply_spatial(self, 
@@ -519,7 +527,7 @@ class exponential_imperfection(imperfection):
                       ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
         if self.method == 'ts':
             exp_term = einsum(self.phis, self.alpha_clusters[ls], 'B ..., L B -> L ...')
-            bs = torch.exp(-2j * torch.pi * exp_term)
+            bs = torch.exp(-self.exp_scale * exp_term)
         elif self.method == 'svd':
             bs = self.spatial_funcs[ls]
         if x is None:
@@ -532,7 +540,7 @@ class exponential_imperfection(imperfection):
                               ls: Optional[torch.Tensor] = slice(None)) -> torch.Tensor:
         if self.method == 'ts':
             exp_term = einsum(self.phis, self.alpha_clusters[ls], 'B ..., L B -> L ...')
-            bs = torch.exp(-2j * torch.pi * exp_term)
+            bs = torch.exp(-self.exp_scale * exp_term)
         elif self.method == 'svd':
             bs = self.spatial_funcs[ls]
         return (bs.conj() * y).sum(dim=-len(self.im_size)-1)

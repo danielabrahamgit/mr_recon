@@ -1,7 +1,6 @@
 import torch
 
 from typing import Optional
-from einops import rearrange
 from mr_recon.imperfections.exponential import exponential_imperfection
 
 class main_field_imperfection(exponential_imperfection):
@@ -18,8 +17,9 @@ class main_field_imperfection(exponential_imperfection):
         """
         Parameters:
         -----------
-        b0_map : torch.Tensor
+        b0_map : torch.Tensor (real)
             B0 map in Hz with shape (*im_size)
+            if imaginary, toggles R2* model instead.
         trj_size : tuple
             The size of the trajectory
         ro_dim : int
@@ -38,15 +38,20 @@ class main_field_imperfection(exponential_imperfection):
         verbose : bool
             toggles print statements
         """
+        if torch.is_complex(b0_map):
+            b0_map = b0_map.abs().type(torch.float32)
+            complex_exp = False
+        else:
+            complex_exp = True
         phis = b0_map[None, ...] * dt
         nro = trj_size[ro_dim]
         tup = (None,) * ro_dim + (slice(None),) + (None,) * (len(trj_size) - ro_dim - 1)
-        alphas = torch.arange(nro, device=b0_map.device, dtype=phis.dtype)[tup]
+        alphas = torch.arange(nro, device=b0_map.device, dtype=torch.float32)[tup]
         alphas = alphas[None,]
         self.prod1 = torch.prod(torch.tensor(trj_size)[ro_dim:]).item()
         self.prod2 = torch.prod(torch.tensor(trj_size)[ro_dim+1:]).item()
         self.orig_trj_size = trj_size
-        super(main_field_imperfection, self).__init__(phis, alphas, L, method, interp_type, verbose)
+        super(main_field_imperfection, self).__init__(phis, alphas, L, method, interp_type, verbose, complex_exp)
 
     def apply_spatio_temporal(self,
                               x: torch.Tensor,

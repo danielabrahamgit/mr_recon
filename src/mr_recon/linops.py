@@ -469,7 +469,8 @@ class sense_linop_grog(linop):
         super().__init__(ishape, oshape)
 
         nufft = gridded_nufft(im_size, grid_oversamp=os_grid)
-        self.A = sense_linop(im_size, trj, mps, dcf, nufft, imperf_model, False, bparams)
+        trj_grd = (trj * os_grid).round()/os_grid
+        self.A = sense_linop(im_size, trj_grd, mps, dcf, nufft, imperf_model, False, bparams)
 
         self.inv_noise_cov = inv_noise_cov
     
