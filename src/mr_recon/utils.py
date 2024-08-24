@@ -20,8 +20,7 @@ def quantize_data(data: torch.Tensor,
     K : int
         number of clusters/quantization centers
     method : str
-        selects the quantization method
-        'cluster' - uses k-means to optimally find centers
+        'cluster' - uses k-means to optimally find centers\n
         'uniform' - uniformly spaced bins
     
     Returns:

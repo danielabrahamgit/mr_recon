@@ -84,9 +84,9 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     AHA = torch.zeros(im_size + (num_coils, num_coils), 
                         dtype=ksp_cal.dtype, device=device)
     for kernel in tqdm(kernels, 'Computing covariance matrix', disable=not verbose):
-        img_kernel = ifft(kernel, oshape=(num_coils, *im_size),
+        aH = ifft(kernel, oshape=(num_coils, *im_size),
                                 dim=tuple(range(-img_ndim, 0)))
-        aH = rearrange(img_kernel, 'nc ... -> ... nc 1')
+        aH = rearrange(aH, 'nc ... -> ... nc 1')
         a = aH.swapaxes(-1, -2).conj()
         AHA += aH @ a
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)

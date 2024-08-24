@@ -10,7 +10,6 @@ from mr_recon.linops import subspace_linop, sense_linop, batching_params
 from mr_recon.recons import CG_SENSE_recon, FISTA_recon
 from mr_recon.prox import L1Wav
 from mr_recon.fourier import gridded_nufft
-from mr_recon.imperfections.field import field_handler
 from mr_recon.imperfections.main_field import main_field_imperfection
 
 # Set seed 

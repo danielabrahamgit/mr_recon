@@ -857,7 +857,7 @@ class subspace_linop(linop):
 
         # Result subspace coefficients
         alphas = torch.zeros((nsub, *self.im_size), dtype=torch.complex64, device=self.torch_dev)
-            
+        
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
             mps = self.mps[c:d]

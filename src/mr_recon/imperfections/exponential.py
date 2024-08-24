@@ -154,7 +154,7 @@ class exponential_imperfection(imperfection):
                         B_batch = phis_flt[n1:n2, :] @ alphas_flt[t1:t2].T
                         B_batch = torch.exp(-self.exp_scale * B_batch)
                         AHb += A_batch.H @ B_batch / N
-
+                        
                 # Solve for ls = (AHA)^{-1} AHb
                 ls = lin_solve(AHA, AHb, solver='pinv')
                 # ls = AHA_inv @ AHb

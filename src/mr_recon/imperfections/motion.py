@@ -1,6 +1,6 @@
 # TODO work in progress
-
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Optional
@@ -351,7 +351,7 @@ class motion_imperfection(imperfection):
 
         return trj_rot, ksp_rot
 
-class motion_op(torch.nn.Module):
+class motion_op(nn.Module):
     
     def __init__(self,
                  im_size: tuple,
@@ -371,10 +371,10 @@ class motion_op(torch.nn.Module):
 
         # Consts
         d = len(im_size)
-        assert d == len(fovs)
         assert d == 2 or d == 3
         if fovs is None:
             fovs = (1,) * d
+        assert d == len(fovs)
     
         # Gen grid
         fovsk = tuple([im_size[i] / fovs[i] for i in range(d)])
@@ -383,10 +383,13 @@ class motion_op(torch.nn.Module):
         if d == 2:
             rgrid = torch.cat((rgrid, rgrid[..., :1] * 0), dim=-1) # ... 3
             kgrid = torch.cat((kgrid, kgrid[..., :1] * 0), dim=-1) # ... 3
+
         # Save
         self.im_size = im_size
-        self.rgrid = rgrid.type(torch.float32)
-        self.kgrid = kgrid.type(torch.float32)
+        self.kgrid = nn.Parameter(kgrid.type(torch.float32), requires_grad=False)
+        self.rgrid = nn.Parameter(rgrid.type(torch.float32), requires_grad=False)
+        # self.rgrid = rgrid.type(torch.float32)
+        # self.kgrid = kgrid.type(torch.float32)
         self.U = None
         self.V = None
         self.reuse_UV = reuse_UV
@@ -406,7 +409,6 @@ class motion_op(torch.nn.Module):
         U : torch.Tensor
             The U terms with shape (N, *im_size)
         """
-
         return torch.exp(-1j * einsum(self.kgrid, translations.type(torch.float32), 
                                       '... out, N out -> N ...'))
     
