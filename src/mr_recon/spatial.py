@@ -152,7 +152,7 @@ def laplacian(u: torch.Tensor,
     # Restore batch dim
     return lap.reshape(u.shape)
 
-def fourier_resize(x, new_shape):
+def fourier_resize(x, new_shape, window='hamming'):
 
     # Get GPU dev
     x_np = torch_to_np(x)
@@ -169,7 +169,7 @@ def fourier_resize(x, new_shape):
         X_rs = sp.resize(X, oshape)
 
     # Windowing
-    X_rs = apply_window(np_to_torch(X_rs), ndim, 'hamming')
+    X_rs = apply_window(np_to_torch(X_rs), ndim, window)
 
     # IFFT
     x_rs = ifft(X_rs, dim=tuple(range(-ndim, 0)))

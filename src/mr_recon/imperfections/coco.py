@@ -4,6 +4,21 @@ from typing import Optional
 from mr_recon.utils import gen_grd
 from mr_recon.imperfections.exponential import exponential_imperfection
 
+def coco_bases(x, y, z):
+    assert x.shape == y.shape
+    assert z.shape == x.shape
+    tup = (None,) + (slice(None),) * x.ndim
+    x = x[tup]
+    y = y[tup]
+    z = z[tup]
+    return torch.cat([
+        z * z,
+        x * x + y * y,
+        x * z,
+        y * z
+    ], dim=0)
+   
+
 class coco_imperfection(exponential_imperfection):
 
     def __init__(self, 

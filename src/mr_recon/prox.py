@@ -180,8 +180,6 @@ class TV(nn.Module):
 
         return input # TODO
 
-
-
 class LocallyLowRank(nn.Module):
     """Version of LLR mimicking Sid's version in Sigpy
 

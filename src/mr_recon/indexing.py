@@ -35,6 +35,10 @@ def multi_index(x: torch.Tensor, ndims: int, idx: torch.Tensor, raveled: bool = 
     Returns:
     Tensor with shape [N... I...] (the shape of the raveled index)
     """
+    assert ndims == idx.shape[-1]
+    tup = (slice(None),) * (x.ndim - ndims) + tuple(idx.moveaxis(-1, 0))
+    return x[tup]
+    
     x_flat = torch.flatten(x, start_dim=-ndims, end_dim=-1)
     if not raveled:
         assert ndims == idx.shape[-1], 'idx must have same last dimension as number of indexed dimensions'

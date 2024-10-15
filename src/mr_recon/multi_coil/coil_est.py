@@ -1,4 +1,5 @@
 import time
+from igrog import kernel_models
 import torch
 import sigpy as sp
 
@@ -8,14 +9,14 @@ from einops import rearrange, einsum
 from mr_recon.algs import power_method_matrix
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
-from mr_recon.multi_coil.grappa_est import gen_source_vectors_rand, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels
+from mr_recon.multi_coil.grappa_est import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
 
-# TODO give batch dims (useful for multi-slice)
 def csm_from_espirit(ksp_cal: torch.Tensor,
                      im_size: tuple,
                      thresh: Optional[float] = 0.02,
                      kernel_width: Optional[int] = 6,
-                     crp: Optional[float] = 0.95,
+                     crp: Optional[float] = None,
+                     sets_of_maps: Optional[int] = 1,
                      max_iter: Optional[int] = 100,
                      verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -34,6 +35,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         width of calibration kernel
     crp : float
         output mask based on copping eignevalues
+    sets_of_maps : int
+        number of sets of maps to compute
     max_iter : int
         number of iterations to run power method
     verbose : bool
@@ -92,11 +95,29 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
     # Get eigenvalues and eigenvectors
-    mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter, verbose=verbose)
-    
-    # Phase relative to first map
-    mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-12))
-    mps *= eigen_vals > crp
+    mps_all = []
+    evals_all = []
+    for i in range(sets_of_maps):
+        
+        # power iterations
+        mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter, verbose=verbose)
+        
+        # Phase relative to first map and crop
+        mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-12))
+        if crp:
+            mps *= eigen_vals > crp
+        
+        # Update AHA
+        AHA -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
+        mps_all.append(mps)
+        evals_all.append(eigen_vals)
+        
+    if sets_of_maps == 1:
+        mps = mps_all[0]
+        eigen_vals = evals_all[0]
+    else:
+        mps = torch.stack(mps_all, dim=0)
+        eigen_vals = torch.stack(evals_all, dim=0)
 
     return mps, eigen_vals
 
@@ -105,12 +126,14 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
                     num_kerns: Optional[int] = 100,
                     num_src: Optional[int] = 25,
                     kernel_width: Optional[int] = 6,
-                    crp: Optional[float] = 0.95,
+                    lamda_tikonov: Optional[float] = 0.0,
+                    sets_of_maps: Optional[int] = 1,
+                    crp: Optional[float] = None,
                     max_iter: Optional[int] = 100,
+                    min_eigen_value: Optional[bool] = True,
                     verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Copy of sigpy implementation of ESPIRiT calibration, but in torch:
-    Martin Uecker, ... ESPIRIT - An Eigenvalue Approach to Autocalibrating Parallel MRI
+    Trains grappa kernels and then calls csm_from_kernels.
 
     Parameters:
     -----------
@@ -124,6 +147,8 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
         number of source points to use in training
     kernel_width : int
         width of calibration kernel
+    sets_of_maps : int
+        number of sets of maps to compute
     crp : float
         output mask based on copping eignevalues
     max_iter : int
@@ -143,30 +168,60 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
     img_cal = ifft(ksp_cal, dim=list(range(-len(im_size), 0)))
 
     # Generate random source vectors
-    src_vecs = gen_source_vectors_rand(num_kerns=num_kerns, 
-                                       num_inputs=num_src, 
-                                       ndim=len(im_size), 
-                                       kern_width=kernel_width)
-    # src_vecs = gen_source_vectors_rot(num_kerns=num_kerns, 
-    #                                   num_inputs=num_src, 
-    #                                   ndim=len(im_size), 
-    #                                   line_width=kernel_width)
-    src_vecs = src_vecs.to(torch_dev).type(torch.float32)
-    kerns = train_kernels(img_cal, src_vecs, 
-                          fast_method=True, 
-                          solver='pinv', 
-                          lamda_tikonov=0.0)
+    # src_vecs = gen_source_vectors_min_dist(num_kerns=num_kerns, 
+    #                                        num_inputs=num_src, 
+    #                                        ndim=len(im_size), 
+    #                                        min_dist=0.2,
+    #                                        kern_width=kernel_width)
+    if type(kernel_width) == tuple:
+        src_vecs = gen_source_vectors_rot_square(num_kerns=num_kerns,
+                                                kern_size=kernel_width,
+                                                dks=(1.0,)*2)
+    else:
+        src_vecs = gen_source_vectors_rand(num_kerns=num_kerns, 
+                                        num_inputs=num_src, 
+                                        ndim=len(im_size), 
+                                        kern_width=kernel_width)
+        # src_vecs = gen_source_vectors_rot(num_kerns=num_kerns, 
+        #                                 num_inputs=num_src, 
+        #                                 ndim=len(im_size), 
+        #                                 ofs=0.15, 
+        #                                 line_width=kernel_width)
+    
+    # import matplotlib.pyplot as plt
+    # for i in range(src_vecs.shape[0] * 0 + 1):
+    #     plt.scatter(*src_vecs[i].T)
+    # plt.xlim(-5, 5)
+    # plt.ylim(-5, 5)
+    # plt.show()
+    # quit()
 
-    return csm_from_kernels(kerns, src_vecs, im_size, crp, max_iter, verbose)
+    src_vecs = src_vecs.to(torch_dev)
+    batch_size = 50
+    kerns = None
+    for n1 in tqdm(range(0, num_kerns, batch_size), 'Training Kernels'):
+        n2 = min(num_kerns, n1 + batch_size)
+        kerns_batch = train_kernels(img_cal, src_vecs[n1:n2], 
+                                    fast_method=False, 
+                                    solver='solve',
+                                    lamda_tikonov=lamda_tikonov).type(torch.complex64)
+        if kerns is None:
+            kerns = kerns_batch
+        else:
+            kerns = torch.cat((kerns, kerns_batch), dim=0)
+
+    return csm_from_kernels(kerns, src_vecs, im_size, crp, max_iter, sets_of_maps, min_eigen_value, verbose)
 
 def csm_from_kernels(grappa_kernels: torch.Tensor,
                      source_vectors: torch.Tensor,
                      im_size: tuple,
-                     crp: Optional[float] = 0.95,
+                     crp: Optional[float] = None,
                      max_iter: Optional[int] = 100,
+                     sets_of_maps: Optional[int] = 1,
+                     min_eigen_value: Optional[bool] = True,
                      verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Estimates coil sensitivty maps from grappa kernels
+    Estimates coil sensitivty maps from trained grappa kernels
 
     Parameters:
     -----------
@@ -181,6 +236,8 @@ def csm_from_kernels(grappa_kernels: torch.Tensor,
         crops based on eignevalues
     num_iter : int
         number of iterations to run power method
+    sets_of_maps : int
+        number of sets of maps to compute
     verbose : bool
         toggles progress bar
 
@@ -194,17 +251,44 @@ def csm_from_kernels(grappa_kernels: torch.Tensor,
 
     # Compute image covariance kernels
     BHB = calc_image_covariance_kernels(grappa_kernels, source_vectors, im_size, verbose=verbose)
-    BHB += torch.eye(BHB.shape[-1], device=BHB.device, dtype=BHB.dtype) 
+    if min_eigen_value:
+        BHB += torch.eye(BHB.shape[-1], device=BHB.device, dtype=BHB.dtype) 
 
-    # Min eigen from max
-    _, eig_vals_max = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
-    BHB = eig_vals_max[..., None, None] * torch.eye(BHB.shape[-1], device=BHB.device, dtype=BHB.dtype) - BHB
-    mps, eigen_vals = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
-    eigen_vals = eig_vals_max - eigen_vals
+        # Min eigen from max
+        _, eig_vals_max = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
+        BHB = eig_vals_max[..., None, None] * torch.eye(BHB.shape[-1], device=BHB.device, dtype=BHB.dtype) - BHB
+        mps, eigen_vals = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
+        eigen_vals = eig_vals_max - eigen_vals
 
-    # Phase relative to first map
-    mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-8))
-    mps *= eigen_vals < crp
+        # Phase relative to first map
+        mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-8))
+        if crp:
+            mps *= eigen_vals < crp
+    else:
+        BHB = -BHB
+        mps_all = []
+        evals_all = []
+        for i in range(sets_of_maps):
+            
+            # Power iterations
+            mps, eigen_vals = power_method_matrix(BHB, num_iter=max_iter, verbose=verbose)
+            
+            # Phase relative to first map and crop
+            mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-8))
+            if crp:
+                mps *= eigen_vals > crp
+                
+            # Update
+            mps_all.append(mps)
+            evals_all.append(eigen_vals)
+            BHB -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
+            
+        if sets_of_maps == 1:
+            mps = mps_all[0]
+            eigen_vals = evals_all[0]
+        else:
+            mps = torch.stack(mps_all, dim=0)
+            eigen_vals = torch.stack(evals_all, dim=0)
 
     return mps, eigen_vals
 
@@ -252,12 +336,7 @@ def calc_image_covariance_kernels(grappa_kernels: torch.Tensor,
 
     # Default nufft
     if nufft is None:
-        if 'cpu' in str(device).lower():
-            device_idx = -1
-        else:
-            device_idx = device.index
-        # nufft = torchkb_nufft(im_size, device_idx)
-        nufft = sigpy_nufft(im_size, device_idx)
+        nufft = sigpy_nufft(im_size)
     source_vectors = nufft.rescale_trajectory(source_vectors)
 
     # Make cross terms

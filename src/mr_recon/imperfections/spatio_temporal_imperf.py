@@ -2,9 +2,10 @@ import torch
 
 from typing import Optional, Union
 from einops import rearrange, einsum
-from mr_recon.fourier import sigpy_nufft
+from mr_recon.pad import PadLast
+from mr_recon.fourier import sigpy_nufft, fft, ifft
 from mr_recon.utils import gen_grd, quantize_data, batch_iterator
-from mr_recon.spatial import fourier_resize
+from mr_recon.spatial import spatial_resize
 
 class spatio_temporal:
     """
@@ -133,12 +134,12 @@ class spatio_temporal:
         Parameters:
         -----------
         temporal_input
-            the input temporal vector with shape (*trj_size)
+            the input temporal vector with shape (N, *trj_size)
         
         Returns:
         --------
         torch.Tensor
-            the spatial output vector with shape (*im_size)
+            the spatial output vector with shape (N, *im_size)
         """
         raise NotImplementedError
 
@@ -154,14 +155,14 @@ class spatio_temporal:
         Parameters:
         -----------
         spatial_input: torch.Tensor
-            the spatial input vector with shape (*im_size)
+            the spatial input vector with shape (N, *im_size)
         
         Returns:
         --------
         torch.Tensor
-            the spatial output vector with shape (*im_size)
+            the spatial output vector with shape (N, *im_size)
         """
-        raise NotImplementedError
+        return self.adjoint_matrix_prod(self.forward_matrix_prod(spatial_input))
     
     def adjoint_forward_matrix_prod(self,
                                     temporal_input: torch.Tensor) -> torch.Tensor:
@@ -175,14 +176,14 @@ class spatio_temporal:
         Parameters:
         -----------
         temporal_input: torch.Tensor
-            the temporal input vector with shape (*trj_size)
+            the temporal input vector with shape (N, *trj_size)
         
         Returns:
         --------
         torch.Tensor
-            the temporal output vector with shape (*trj_size)
+            the temporal output vector with shape (N, *trj_size)
         """
-        raise NotImplementedError
+        return self.forward_matrix_prod(self.adjoint_matrix_prod(temporal_input))
     
     def test_matrix_prods(self,
                           spatial_batch_size: Optional[int] = 2**12,
@@ -275,7 +276,8 @@ class B0(spatio_temporal):
                  im_size: tuple, 
                  trj_size: tuple,
                  readout_dim: int,
-                 b0_map: torch.Tensor):
+                 b0_map: torch.Tensor,
+                 coil_maps: Optional[torch.Tensor] = None):
         """
         Parameters:
         -----------
@@ -286,6 +288,10 @@ class B0(spatio_temporal):
         """
         trj_size = [1 if i != readout_dim else trj_size[i] for i in range(len(trj_size))]
         super(B0, self).__init__(im_size, trj_size, device=b0_map.device)
+
+        if coil_maps is None:
+            coil_maps = torch.ones((1, *im_size), device=b0_map.device, dtype=torch.complex64)
+        assert coil_maps.shape[1:] == im_size, 'Coil maps must have same size as image'
 
         # Store the B0 map and readout dimension
         self.b0_map = b0_map
@@ -303,11 +309,19 @@ class B0(spatio_temporal):
 
         # Compute phase_0 to make sure that no phase is applied at first time point
         self.phase_0 = torch.exp(2j * torch.pi * b0_map * num_readout/2) * (num_readout ** 0.5)
-
+    
         # Toeplitz kernels for temporal gram operator
         weights = self.phase_0 * self.phase_0.conj()
-        self.toeplitz_kerns = self.nufft.calc_teoplitz_kernels((-b0_map * num_readout)[None, ..., None], weights[None,])
-
+        # self.toeplitz_kerns = self.nufft.calc_teoplitz_kernels((-b0_map * num_readout)[None, ..., None], weights[None,])
+        C = coil_maps.shape[0]
+        trj = (-b0_map * num_readout)[..., None]
+        self.toeplitz_kerns = torch.zeros((C, C, num_readout * 2), device=b0_map.device, dtype=torch.complex64)
+        for c1 in range(C):
+            weights_c1c2 = weights * coil_maps * coil_maps[c1].conj()
+            kern = self.nufft.calc_teoplitz_kernels(trj[None,], weights_c1c2)
+            self.toeplitz_kerns[c1, :, ...] = kern
+        self.mps = coil_maps
+                    
     def temporal_features(self,
                           temporal_inds: torch.Tensor) -> torch.Tensor:
             return self.samps[temporal_inds[self.readout_dim]][..., None] # single feature
@@ -328,18 +342,21 @@ class B0(spatio_temporal):
                       spatial_inds: torch.Tensor,
                       temporal_features: torch.Tensor) -> torch.Tensor:
         b0 = self.b0_map[tuple(spatial_inds)]
-        return torch.exp(-2j * torch.pi * b0 * temporal_features[..., 0])
+        mps = self.mps[(slice(None),) + tuple(spatial_inds)]
+        return torch.exp(-2j * torch.pi * b0 * temporal_features[..., 0]) * mps
     
     def forward_matrix_prod(self,
                             spatial_input: torch.Tensor) -> torch.Tensor:
         
-        # Adjoint has positive exponent so multiple b0 by -1
+        # Adjoint has positive exponent so multiply b0 by -1
         freqs = (-self.b0_map * self.num_readout)[..., None]
-        out_readout = self.nufft.adjoint(spatial_input[None,] * self.phase_0.conj(), freqs[None])[0]
+        out_readout = self.nufft.adjoint((spatial_input * self.mps)[None,] * self.phase_0.conj(), freqs[None,])[0]
 
         # Fill in other dimensions
-        temporal_output = torch.zeros(self.trj_size, device=self.b0_map.device, dtype=torch.complex64)
-        tup = (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
+        temporal_output = torch.zeros((self.mps.shape[0], *self.trj_size), device=self.b0_map.device, dtype=torch.complex64)
+        tup = (slice(None),) + (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
+        # temporal_output = torch.zeros(self.trj_size, device=self.b0_map.device, dtype=torch.complex64)
+        # tup = (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
         temporal_output[...] = out_readout[tup]
 
         return temporal_output
@@ -350,24 +367,33 @@ class B0(spatio_temporal):
         freqs = (-self.b0_map * self.num_readout)[..., None]
         
         # Select only readout dim
-        tup = (0,) * self.readout_dim + (slice(None),) + (0,) * (len(self.trj_size) - self.readout_dim - 1)
+        tup = (slice(None),) + (0,) * self.readout_dim + (slice(None),) + (0,) * (len(self.trj_size) - self.readout_dim - 1)
         temporal_readout = temporal_input[tup]
 
-        return self.nufft(temporal_readout[None,], freqs[None,])[0] * self.phase_0
-    
-    def forward_adjoint_matrix_prod(self,
-                                    spatial_input: torch.Tensor) -> torch.Tensor:
-        return self.adjoint_matrix_prod(self.forward_matrix_prod(spatial_input))
+        imgs = self.nufft(temporal_readout[None,], freqs[None,])[0] * self.phase_0
+        return (self.mps.conj() * imgs).sum(dim=0)
     
     def adjoint_forward_matrix_prod(self,
                                     temporal_input: torch.Tensor) -> torch.Tensor:
         # Select readout dim only
-        tup = (0,) * self.readout_dim + (slice(None),) + (0,) * (len(self.trj_size) - self.readout_dim - 1)
-        out_readout = self.nufft.normal_toeplitz(temporal_input[tup][None, None,], self.toeplitz_kerns)[0, 0]
+        tup = (slice(None),) + (0,) * self.readout_dim + (slice(None),) + (0,) * (len(self.trj_size) - self.readout_dim - 1)
+        out_readout = temporal_input[tup]
+        
+        # Zero padded FFTs
+        padder = PadLast((self.toeplitz_kerns.shape[-1],), (self.num_readout,))
+        out_readout = padder.forward(out_readout)
+
+        # FFT, matmul with toeplitz kernels, iFFT
+        out_readout = fft(out_readout, dim=-1)
+        out_readout = einsum(out_readout, self.toeplitz_kerns, 'Ci T, Ci Co T -> Co T')
+        out_readout = ifft(out_readout, dim=-1)
+
+        # Crop
+        out_readout = padder.adjoint(out_readout)
         
         # Fill in other dimensions
-        temporal_output = torch.zeros(self.trj_size, device=self.b0_map.device, dtype=torch.complex64)
-        tup = (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
+        temporal_output = torch.zeros((self.mps.shape[0], *self.trj_size), device=self.b0_map.device, dtype=torch.complex64)
+        tup = (slice(None),) + (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
         temporal_output[...] = out_readout[tup]
         return temporal_output
 
@@ -395,11 +421,12 @@ class high_order_phase(spatio_temporal):
             the spatial phase maps with shape (B, *im_size)
         alphas : torch.Tensor
             the temporal phase maps with shape (B, *trj_size)
+        num_alpha_clusters : int
+            the number of temporal clusters to use 
+        img_downsample_factor : int
+            the factor to fourier downsample the spatial phase maps
 
-        B is the number of basis functions
         """
-        super(high_order_phase, self).__init__(im_size, trj_size, device=phis.device)
-
         B = alphas.shape[0]
         assert phis.shape[0] == B, 'Number of spatial and temporal basis functions must match'
         assert phis.device == alphas.device, 'Spatial and temporal basis functions must be on the same device'
@@ -414,20 +441,29 @@ class high_order_phase(spatio_temporal):
             self.idxs = torch.arange(self.betas.shape[-1], device=alphas.device).reshape(trj_size)
 
         # Spatial downsampling
-        downsampled_shape = [s // img_downsample_factor for s in im_size]
-        self.downsample = lambda x : fourier_resize(x, downsampled_shape)
-        self.upsample = lambda x : fourier_resize(x, im_size)
+        downsampled_shape = tuple([s // img_downsample_factor for s in im_size])
+        method = 'bilinear'
+        self.downsample = lambda x : spatial_resize(x, downsampled_shape, method).type(x.dtype)
+        self.upsample = lambda x : spatial_resize(x, im_size, method).type(x.dtype)
         self.phis = self.downsample(phis)
+        self.scale = img_downsample_factor ** len(im_size)
+
+        # Use downsampled image and number of clusters for dimensions
+        super(high_order_phase, self).__init__(downsampled_shape, (self.betas.shape[-1],), device=phis.device)
         
     def temporal_features(self,
                           temporal_inds: torch.Tensor) -> torch.Tensor:
-        features = self.betas[:, self.idxs[tuple(temporal_inds)]]
-        features = rearrange(features, 'b ... -> ... b')
+        features = self.betas[(slice(None),) + tuple(temporal_inds)].moveaxis(0, -1)
         return features
 
     def get_temporal_clusters(self, 
                               num_clusters: int) -> torch.Tensor:
-        return super().get_temporal_clusters(num_clusters)
+        # First grab all temporal features
+        trj_size = self.trj_size
+        temporal_inds = (slice(None),) * len(trj_size)
+        temporal_features = self.temporal_features(temporal_inds)
+        clusters, inds = quantize_data(temporal_features, num_clusters, method='cluster')
+        return clusters, inds
 
     def matrix_access(self,
                       spatial_inds: torch.Tensor,
@@ -439,20 +475,13 @@ class high_order_phase(spatio_temporal):
                             spatial_input: torch.Tensor) -> torch.Tensor:
         phis = self.phis
         matrix = torch.exp(-2j * torch.pi * einsum(phis, self.betas, 'B ..., B K -> ... K'))
-        return einsum(matrix, spatial_input, '... K, ... -> K')
+        return (matrix * spatial_input[..., None]).sum(dim=tuple(range(-len(self.im_size)-1, -1)))
+        # return einsum(matrix, spatial_input, '... K, ... -> K')
     
     def adjoint_matrix_prod(self,
                             temporal_input: torch.Tensor) -> torch.Tensor:
         phis = self.phis
-        matrix = torch.exp(2j * torch.pi * einsum(phis, self.betas, 'B ..., B K -> ... K'))
-        return einsum(matrix, temporal_input, '... K, K -> ...')
-    
-    def forward_adjoint_matrix_prod(self,
-                                    spatial_input: torch.Tensor) -> torch.Tensor:
-        return self.forward_matrix_prod(self.adjoint_matrix_prod(spatial_input))
-    
-    def adjoint_forward_matrix_prod(self,
-                                    temporal_input: torch.Tensor) -> torch.Tensor:
-        return self.adjoint_matrix_prod(self.forward_matrix_prod(temporal_input))
-        
-
+        matrix = torch.exp(2j * torch.pi * einsum(phis, self.betas, 'B ..., B K -> K ...'))
+        tup = (slice(None),) * temporal_input.ndim + (None,) * len(self.im_size)
+        return (matrix * temporal_input[tup]).sum(dim=-len(self.im_size)-1)
+        # return einsum(matrix, temporal_input, 'K ..., K -> ...')

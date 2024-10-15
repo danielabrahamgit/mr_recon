@@ -4,7 +4,7 @@ from typing import Optional
 from mr_recon.utils import gen_grd
 from mr_recon.imperfections.exponential import exponential_imperfection
 
-def bases(x, y, z):
+def sph_bases(x, y, z):
     assert x.shape == y.shape
     assert z.shape == x.shape
     tup = (None,) + (slice(None),) * x.ndim
@@ -124,7 +124,7 @@ class eddy_imperfection(exponential_imperfection):
             Y = coord_bases[..., 1]
             Z = coord_bases[..., 2]
         skope_inds = skope_inds.to(alphas.device)
-        all_bases = bases(X, Y, Z).to(alphas.device)
+        all_bases = sph_bases(X, Y, Z).to(alphas.device)
         phis = all_bases[skope_inds]
 
         super(eddy_imperfection, self).__init__(phis, alphas, L, method, interp_type, verbose)

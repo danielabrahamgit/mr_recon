@@ -9,45 +9,14 @@ from mr_recon.algs import (
     density_compensation, 
     conjugate_gradient, 
     power_method_operator, 
+    gradient_descent,
     FISTA
 )
-
-def rsos_recon(A: linop,
-               ksp: torch.Tensor,
-               max_iter: Optional[int] = 15,
-               lamda_l2: Optional[float] = 0.0,
-               max_eigen: Optional[float] = None,
-               verbose: Optional[bool] = True) -> torch.Tensor:
-    """
-    Run CG per channel, then coil combine.
-    
-    Parameters:
-    -----------
-    A : linop
-        The linear operator (see linop)
-    ksp : torch.Tensor
-        k-space data with shape (nc, ...)
-    max_iter : int
-        max number of iterations for recon algorithm
-    lamda_l2 : float
-        l2 lamda regularization for SENSE: ||Ax - b||_2^2 + lamda_l2||x||_2^2
-    max_eigen : float
-        maximum eigenvalue of AHA
-    verbose : bool 
-        Toggles print statements
-
-    Returns:
-    --------
-    recon : torch.Tensor
-        the reconstructed image/volume
-    """
-
-    imgs = CG_SENSE_recon(A, ksp, max_iter, lamda_l2, max_eigen, verbose)
-    return coil_combine(imgs)
 
 def min_norm_recon(A: linop,
                    ksp: torch.Tensor,
                    max_iter: int = 15,
+                   lamda_l2: Optional[float] = 0.0,
                    max_eigen: Optional[float] = None,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
@@ -62,6 +31,8 @@ def min_norm_recon(A: linop,
         k-space data with shape (nc, ...)
     max_iter : int
         max number of iterations for recon algorithm
+    lamda_l2 : float
+        l2 lamda regularization
     max_eigen : float
         maximum eigenvalue of AHA
     verbose : bool 
@@ -88,6 +59,7 @@ def min_norm_recon(A: linop,
     # Run CG
     y = conjugate_gradient(AHA=AAH, 
                            AHb=ksp.type(torch.complex64),
+                           lamda_l2=lamda_l2,
                            num_iters=max_iter,
                            verbose=verbose)
     
@@ -189,7 +161,7 @@ def coil_combine(multi_chan_img: torch.Tensor,
     """
 
     if mps is not None:
-        img_comb = (multi_chan_img * mps.conj()).sum(0) / mps.abs().square().sum(0)
+        img_comb = (multi_chan_img * mps.conj()).sum(0) / (mps.abs().square().sum(0) + 1e-5)
     elif walsh_kernel_size is not None:
         # Reshape image into blocks 
         raise NotImplementedError

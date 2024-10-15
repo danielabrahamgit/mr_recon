@@ -397,6 +397,7 @@ def lin_solve(AHA: torch.Tensor,
         optional L2 regularization 
     solver : str
         'pinv' - pseudo inverse 
+        'solve' - torch.linalg.solve
         'lstsq' - least squares
         'inv' - regular inverse
         'cg' - conjugate gradient
@@ -410,9 +411,12 @@ def lin_solve(AHA: torch.Tensor,
     I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
     tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
     solver = solver.lower()
-    AHA += lamda * I[tup]
+    if lamda > 0:
+        AHA += lamda * I[tup]
     if solver == 'lstsq_torch':
         x = torch.linalg.lstsq(AHA, AHb).solution
+    elif solver == 'solve':
+        x = torch.linalg.solve(AHA, AHb)
     elif solver == 'lstsq':
         n, m = AHb.shape[-2:]
         AHA_cp = torch_to_np(AHA).reshape(-1, n, n)
@@ -430,7 +434,7 @@ def lin_solve(AHA: torch.Tensor,
     elif solver == 'cg':
         x = conjugate_gradient(lambda x : AHA @ x, AHb, num_iters=100, lamda_l2=lamda)
     elif solver == 'gd':
-        x = gradient_descent(lambda x : AHA @ x, AHb, lr=1e-2, num_iters=100, lamda_l2=lamda)
+        x = gradient_descent(lambda x : AHA @ x, AHb, lr=1e-4*2, num_iters=10000, lamda_l2=lamda)
     else:
         raise NotImplementedError
     return x

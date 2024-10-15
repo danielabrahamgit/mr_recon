@@ -24,16 +24,19 @@ torch.manual_seed(0)
 
 # Params
 figsize = (14, 7)
-im_size = (220, 220)
+# im_size = (220, 220)
+# z_slc = slice(None)
+im_size = (220, 220, 220)
+z_slc = 110
 ninter = 16
-ncoil = 32
+ncoil = 6
 R = 4
-L = 14
+L = 7
 lamda_l2 = 1e-3 * 0
-max_iter = 500
+max_iter = 10
 max_eigen = 0.4
 device_idx = 5
-os_grid = 1.2
+os_grid = 1.0
 try: 
 	torch_dev = torch.device(device_idx)
 except:
@@ -41,37 +44,50 @@ except:
 
 # Gen data
 phantom = sp.shepp_logan(im_size)
-trj = mri.spiral(fov=1,
-				 N=220,
-				 f_sampling=.05,
-				 R=1.0,
-				 ninterleaves=ninter,
-				 alpha=1.0,
-				 gm=40e-3,
-				 sm=100)
-trj = trj.reshape((-1, ninter, 2), order='F')[:, ::round(R), :]
-# trj_lb = trj_lib(im_size)
-# trj = trj_lb.gen_trj_2d('spi', 
-#                         n_read=im_size[0] * 4,
-#                         n_shots=ninter,
-#                         R=R)
+# trj = mri.spiral(fov=1,
+# 				 N=220,
+# 				 f_sampling=.05,
+# 				 R=1.0,
+# 				 ninterleaves=ninter,
+# 				 alpha=1.0,
+# 				 gm=40e-3,
+# 				 sm=100)
+# trj = trj.reshape((-1, ninter, 2), order='F')[:, ::round(R), :]
+trj = np.load('../../mr_data/threeT/data/trj.npy')
+dcf = np.load('../../mr_data/threeT/data/dcf.npy')
 mps = mri.birdcage_maps((ncoil, *im_size), r=1.0)
-dcf = sp.to_device(mri.pipe_menon_dcf(trj, im_size, device=sp.Device(device_idx)))
+# dcf = sp.to_device(mri.pipe_menon_dcf(trj, im_size, device=sp.Device(device_idx)))
 dcf /= dcf.max()
 
-# Simulate with sigpy 
-ksp = sp.nufft(phantom * mps, trj, oversamp=2.0, width=6)
+# # Simulate ksp
+# ksp = sp.nufft(phantom * mps, trj, oversamp=2.0, width=6)
 
 # Move everything to torch
+phantom = np_to_torch(phantom).to(torch_dev).type(torch.complex64)
 trj = np_to_torch(trj).to(torch_dev).type(torch.float32)
 mps = np_to_torch(mps).to(torch_dev).type(torch.complex64)
 dcf = np_to_torch(dcf).to(torch_dev).type(torch.float32)
-ksp = np_to_torch(ksp).to(torch_dev).type(torch.complex64)
+# ksp = np_to_torch(ksp).to(torch_dev).type(torch.complex64)
 
 # Make nufft linops
-bparams = batching_params(coil_batch_size=ncoil)
+bparams = batching_params(coil_batch_size=1)
 # nufft_nc = torchkb_nufft(im_size=im_size, torch_dev)
-nufft_nc = sigpy_nufft(im_size=im_size)
+nufft_sim = sigpy_nufft(im_size=im_size, width=6, oversamp=2.0)
+A_sim = sense_linop(im_size=im_size,
+					trj=trj,
+					mps=mps,
+					dcf=dcf,
+					bparams=bparams,
+					nufft=nufft_sim,
+					use_toeplitz=False,)
+
+# Simulate with big nufft
+ksp = A_sim(phantom)
+phantom = phantom.cpu().numpy()
+print(f'Finished simulating data')
+
+# KB Recon
+nufft_nc = sigpy_nufft(im_size=im_size, width=4, oversamp=1.25)
 A_nc = sense_linop(im_size=im_size,
 					trj=trj,
 					mps=mps,
@@ -79,6 +95,7 @@ A_nc = sense_linop(im_size=im_size,
 					bparams=bparams,
 					nufft=nufft_nc,
 					use_toeplitz=False,)
+
 
 # NUFFT Recon
 start = time.perf_counter()
@@ -89,7 +106,7 @@ img_nufft = CG_SENSE_recon(A=A_nc, ksp=ksp,
 torch.cuda.synchronize()
 end = time.perf_counter()
 img_nufft = normalize(img_nufft.cpu().numpy(), phantom)
-nrmse_nufft = np.linalg.norm(img_nufft - phantom) / np.linalg.norm(phantom)
+nrmse_nufft = 100 * np.linalg.norm(img_nufft - phantom) / np.linalg.norm(phantom)
 t_nufft = (end - start)
 
 start = time.perf_counter()
@@ -109,12 +126,13 @@ rmses = []
 Ls = []
 ts = []
 plt.figure(figsize=figsize)
-nufft = svd_nufft(im_size, os_grid, L)
+nufft = svd_nufft(im_size, os_grid, L, n_batch_size=1)
 A = sense_linop(im_size=im_size, trj=trj, mps=mps, dcf=dcf,
 				nufft=nufft,
 				use_toeplitz=False,
 				bparams=bparams)
-for l_iter in range(1, L):
+L_start = 1
+for l_iter in range(L_start, L):
 	nufft.n_svd = l_iter
 	
 	print(f'\nRunning L = {l_iter}')
@@ -134,14 +152,13 @@ for l_iter in range(1, L):
 	Ls.append(l_iter)
 	ts.append(t_imperf)
 
-	plt.subplot(3, 5, l_iter)
+	plt.subplot(3, 4, l_iter)
 	plt.title(f'L = {l_iter} NRMSE = {nrmse:.2f} T = {t_imperf:.2f} s')
 	img = np.abs(img)
 	vmax = np.median(img) + 3 * np.std(img)
-	plt.imshow(img, cmap='gray', vmin=0, vmax=vmax)
+	plt.imshow(img[z_slc], cmap='gray', vmin=0, vmax=vmax)
 	plt.axis('off')
 plt.tight_layout()
-
 
 plt.figure(figsize=figsize)
 plt.plot(Ls, rmses)
@@ -160,7 +177,7 @@ plt.figure(figsize=figsize)
 plt.title(f'Nufft Recon T = {t_nufft:.2f} s')
 img = np.abs(img_nufft)
 vmax = np.median(img) + 3 * np.std(img)
-plt.imshow(img, cmap='gray', vmin=0, vmax=vmax)
+plt.imshow(img[z_slc], cmap='gray', vmin=0, vmax=vmax)
 plt.axis('off')
 plt.tight_layout()
 plt.show()

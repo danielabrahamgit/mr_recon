@@ -22,6 +22,7 @@ def quantize_data(data: torch.Tensor,
     method : str
         'cluster' - uses k-means to optimally find centers\n
         'uniform' - uniformly spaced bins
+        'unique' - just takes unique values
     
     Returns:
     --------
@@ -58,7 +59,7 @@ def quantize_data(data: torch.Tensor,
         centers = kmeans.centroids
 
     # Uniformly spaced time segments
-    else:
+    elif method == 'uniform':
         assert d == 1, 'uniform quantization only works for 1D data'
 
         # Pick clusters
@@ -79,12 +80,16 @@ def quantize_data(data: torch.Tensor,
         idxs = torch.round((data_flt[:, 0] - b) / m).type(torch.int)
         idxs = torch.clamp(idxs, 0, K - 1)
 
+    elif method == 'unique':
+        centers, idxs = torch.unique(data_flt, dim=0, return_inverse=True)
+        
     idxs = idxs.reshape(data.shape[:-1])
 
     return centers, idxs
 
 def gen_grd(im_size: tuple, 
-            fovs: Optional[tuple] = None) -> torch.Tensor:
+            fovs: Optional[tuple] = None,
+            balanced: Optional[bool] = False) -> torch.Tensor:
     """
     Generates a grid of points given image size and FOVs
 
@@ -102,10 +107,16 @@ def gen_grd(im_size: tuple,
     """
     if fovs is None:
         fovs = (1,) * len(im_size)
-    lins = [
-        fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2 + (im_size[i] % 2)) / (im_size[i]) 
-        for i in range(len(im_size))
-        ]
+    if balanced:
+        lins = [
+            fovs[i] * torch.linspace(-1/2, 1/2, im_size[i]) 
+            for i in range(len(im_size))
+            ]
+    else:
+        lins = [
+            fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2 + (im_size[i] % 2)) / (im_size[i]) 
+            for i in range(len(im_size))
+            ]
     grds = torch.meshgrid(*lins, indexing='ij')
     grd = torch.cat(
         [g[..., None] for g in grds], dim=-1)

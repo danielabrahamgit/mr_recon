@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import sigpy as sp
-from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, torchkb_nufft, gridded_nufft
+from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
 from einops import rearrange, einsum
 
@@ -35,9 +35,9 @@ img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
 # Create nuffts
 kb_nufft = torchkb_nufft(im_size, torch.device(device_idx))
 sp_nufft = sigpy_nufft(im_size)
-grd_nufft = chebyshev_nufft(im_size, 5)
+grd_nufft = svd_nufft(im_size, n_svd=15)
 nuffts = [sp_nufft, kb_nufft, grd_nufft]
-names = ['sigpy', 'torchkb', 'Chebyshev']
+names = ['sigpy', 'torchkb', 'SVD']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.show()

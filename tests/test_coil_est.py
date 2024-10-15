@@ -12,12 +12,16 @@ from mr_recon.calib import calc_coil_subspace
 from mr_recon.utils import np_to_torch, normalize
 from mr_recon.multi_coil.coil_est import csm_from_grappa, csm_from_espirit
 
+# Set seeds
+np.random.seed(0)
+torch.manual_seed(0)
+
 # Sim params
-nc = 8
+nc = 16
 ndim = 2
 im_size = (200,) * ndim
 cal_size = 32
-device_idx = 5
+device_idx = 1
 try:
     torch_dev = torch.device(device_idx)
 except:
@@ -25,8 +29,9 @@ except:
 
 # Estimation params
 num_kerns = 500
-num_src = 12
-crp = 0.0
+num_src = 5
+crp = None
+kern_width = 5
 max_iter = 100
 
 # Synth data
@@ -40,16 +45,17 @@ img_cal = np_to_torch(mps * phantom).to(torch_dev).type(torch.complex64)
 ksp_cal = np_to_torch(ksp_cal).to(torch_dev).type(torch.complex64)
 mps = np_to_torch(mps).to(torch_dev).type(torch.complex64)
 
-# Compress
-coil_sub, img_cal, ksp_cal, mps = calc_coil_subspace(ksp_cal, 0.95, img_cal, ksp_cal, mps)
+# # Compress
+# coil_sub, img_cal, ksp_cal, mps = calc_coil_subspace(ksp_cal, 0.95, img_cal, ksp_cal, mps)
 
 # Estimate coil maps with GRAPPA
 start = time.perf_counter()
 mps_grap, evals_grap = csm_from_grappa(ksp_cal, im_size,
                                        num_kerns=num_kerns, 
                                        num_src=num_src, 
-                                       kernel_width=5, 
-                                       crp=1e9, 
+                                       kernel_width=kern_width, 
+                                       crp=crp, 
+                                       min_eigen_value=False,
                                        max_iter=max_iter)
 end = time.perf_counter()
 grap_time = end - start
@@ -57,7 +63,7 @@ grap_time = end - start
 # Estimate coil maps with ESPIRiT
 start = time.perf_counter()
 mps_esp, evals_esp = csm_from_espirit(ksp_cal, im_size, 
-                                      kernel_width=5,
+                                      kernel_width=kern_width,
                                       thresh=0.02,
                                       crp=crp, 
                                       max_iter=max_iter)

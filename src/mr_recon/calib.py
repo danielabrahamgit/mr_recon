@@ -16,15 +16,34 @@ from torchkbnufft import (
 from mr_recon.algs import conjugate_gradient
 from mr_recon.fourier import fft
 from mr_recon.utils import np_to_torch, torch_to_np
+from mr_recon.linops import multi_chan_linop
+from mr_recon.recons import CG_SENSE_recon
 
 __all__ = [
     'truncate_trj_ksp',
     'to_cartesian',
     'extract_acs_region',
     'synth_cal',
+    'truncate_acs',
     'get_mps_kgrid_toep_pcg',
 ]
 
+def truncate_acs(ksp_mat: torch.Tensor,
+                 cal_size: tuple) -> torch.Tensor:
+    """
+    Truncated cartesian k-sspace to desired calibration size
+
+    Parameters:
+    -----------
+    ksp_mat: torch.Tensor
+        K-space with shape (C, *ksp_size)
+    cal_size: tuple
+        Desired calibration size, len(cal_size) == len(ksp_size)
+    """
+    ksp_size = ksp_mat.shape[1:]
+    tup = tuple([slice(ksp_size[i]//2 - cal_size[i]//2, ksp_size[i]//2 + cal_size[i]//2) for i in range(len(ksp_size))])
+    tup = (slice(None),) + tup
+    return ksp_mat[tup]
 
 def calc_coil_subspace(ksp_mat: torch.Tensor,
                        new_coil_size: Union[int, float],
@@ -44,7 +63,7 @@ def calc_coil_subspace(ksp_mat: torch.Tensor,
         n_coil = torch.argwhere(cmsm > new_coil_size * cmsm[-1]).squeeze()[0]
     elif type(new_coil_size) is int:
         n_coil = new_coil_size
-    coil_subspace = u[:, :n_coil]
+    coil_subspace = u[:, :n_coil] #/ s[:n_coil]
     coil_subspace.imag *= -1 # conj without .conj() for weird numpy conversion reasons
 
     comps = []
@@ -170,7 +189,62 @@ def extract_acs_region(trj, ksp, dcf, im_size, acs_size: int):
         Fimg_acs = Fimg[full_slc]
     return Fimg_acs
 
-def synth_cal(trj, ksp, acs_size: int,
+def synth_cal(ksp: torch.Tensor, 
+              cal_size: Union[tuple, int],
+              trj: Optional[torch.Tensor] = None,
+              dcf: Optional[torch.Tensor] = None,
+              num_iter: Optional[int] = 0) -> torch.Tensor:
+    """
+    Synthesizes a calibration region from data.
+    
+    Parameters:
+    -----------
+    ksp: torch.Tensor
+        k-space raw data with shape (C *trj_size)
+    cal_size: tuple or int
+        width of calibration along each dimension (isotropic if int)
+    trj: torch.Tensor
+        trajectory with shape (*trj_size D)
+    dcf: torch.Tensor
+        density compensation function with shape (*trj_size)
+    num_iter: int
+        number of conj gradient iterations for estimating rectilinear calib from non-cart data
+    """
+    # Consts
+    C = ksp.shape[0]
+    if type(cal_size) == int:
+        cal_size = (cal_size,) * D
+        
+    # Handle cartesian case first, assume calib is at center of k-space matrix
+    if trj is None:
+        D = ksp.ndim - 1
+        tup = tuple([slice(ksp.shape[i+1]//2 - cal_size[i]//2, ksp.shape[i+1]//2 + cal_size[i]//2) for i in range(D)])
+        tup = (slice(None),) + tup
+        ksp_cal = ksp[tup]
+    # Non-Cartesian case, do CG to estimate rectilinear calib
+    else:
+        # Truncate trajectory and k-space
+        D = trj.shape[-1]
+        inds = tuple(torch.argwhere(torch.all(trj.abs() < torch.tensor(cal_size, device=trj.device) / 2, dim=-1)).T)
+        inds_ksp = (slice(None),) + inds
+        trj_cut = trj[inds]
+        ksp_cut = ksp[inds_ksp]
+        if dcf is not None:
+            dcf_cut = dcf[inds]
+        else:
+            dcf_cut = None
+        
+        # Recon
+        A = multi_chan_linop((C, *cal_size), trj_cut, dcf_cut)
+        img_cal = CG_SENSE_recon(A, ksp_cut, max_iter=num_iter, lamda_l2=0.0, max_eigen=1.0)
+        ksp_cal = fft(img_cal, dim=tuple(range(-D, 0)))
+    
+    return ksp_cal
+        
+    
+    
+
+def synth_cal_old(trj, ksp, acs_size: int,
               method: Literal['inverse', 'adjoint'] = 'adjoint',
               dcf: Optional[np.ndarray] = None,
               device='cpu',
