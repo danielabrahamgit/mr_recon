@@ -3,7 +3,6 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
-  - frankong
 dependencies:
   - cupy
   - einops
@@ -13,24 +12,14 @@ dependencies:
   - matplotlib
   - nccl
   - numpy==1.22.4
-  - pydicom
+  - pip=24.0
   - python=3.10
   - pytorch-cuda=11.8
   - scikit-image
-  - sigpy
   - torchaudio
   - torchvision
   - pip:
       - cvxpy
       - fast-pytorch-kmeans
-      - fire
-      - flt
-      - gdown
-      - igrog
-      - ipympl
-      - ismrmrd
-      - mat73
-      - nibabel
+      - sigpy
       - torchkbnufft
-      - triton
-      - twixtools

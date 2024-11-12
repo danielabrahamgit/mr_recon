@@ -1,5 +1,4 @@
 import time
-from igrog import kernel_models
 import torch
 import sigpy as sp
 
