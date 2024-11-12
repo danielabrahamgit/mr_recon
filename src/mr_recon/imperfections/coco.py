@@ -1,3 +1,4 @@
+from einops import rearrange
 import torch
 
 from typing import Optional
@@ -78,8 +79,10 @@ class coco_imperfection(exponential_imperfection):
         # Get gradient from trj
         trj = trj.type(torch.float32)
         if d == 2:
-            trj = torch.cat((trj, trj[..., 0:1] * 0), dim=-1)
-            fov += (1,)
+            # trj = torch.cat((trj, trj[..., 0:1] * 0), dim=-1)
+            # fov += (1,)
+            trj = torch.stack([trj[..., 0], trj[..., 1]*0, trj[..., 1]], dim=-1)
+            fov = (fov[0], 1, fov[1])
         tup = (None,) * len(trj_size) + (slice(None),)
         fov_tensor = torch.tensor(fov).to(trj.device).type(trj.dtype)
         g = torch.diff(trj, dim=0) / (dt * gamma_bar * fov_tensor[tup])
@@ -88,7 +91,9 @@ class coco_imperfection(exponential_imperfection):
         # Gen X Y Z grids
         grd = gen_grd(im_size, fov).to(trj.device).type(trj.dtype)
         if d == 2:
-            grd = torch.concatenate((grd, grd[..., :1] * 0), dim=-1)
+            grd = gen_grd(im_size, (fov[0], fov[2])).to(trj.device).type(trj.dtype)
+            # grd = torch.concatenate((grd, grd[..., :1] * 0), dim=-1)
+            grd = torch.stack([grd[..., 0], grd[..., 1]*0, grd[..., 1]], dim=-1)
             
             if rotations is not None:
                 rotations = torch.tensor(rotations, dtype=torch.float32, device=trj.device)
@@ -112,25 +117,23 @@ class coco_imperfection(exponential_imperfection):
         # Build phis and alphas
         phis = torch.zeros((4, *im_size), dtype=trj.dtype, device=trj.device)
         alphas = torch.zeros((4, *trj_size), dtype=trj.dtype, device=trj.device)
-        X = grd[..., 2]
+        X = grd[..., 0]
         Y = grd[..., 1]
-        Z = grd[..., 0]
-        gx = g[..., 2]
+        Z = grd[..., 2]
+        gx = g[..., 0]
         gy = g[..., 1]
-        gz = g[..., 0]
-        phis[0] = X ** 2 + Y ** 2
-        alphas[0] = (gz ** 2) / 4
-        phis[1] = Z ** 2
-        alphas[1] = gx ** 2 + gy ** 2
-        phis[2] = X * Z
-        alphas[2] = gx * gz
-        phis[3] = Y * Z
-        alphas[3] = gy * gz
+        gz = g[..., 2]
+        phis = coco_bases(X, Y, Z)
+        alphas[0] = gx ** 2 + gy ** 2
+        alphas[1] = (gz ** 2) / 4
+        alphas[2] = -gx * gz 
+        alphas[3] = -gy * gz
         alphas /= 2 * B0
 
         # Integral on alphas, gamma_bar to map T to phase
-        alphas = torch.cumsum(alphas, dim=1) * dt * gamma_bar
-        super(coco_imperfection, self).__init__(phis, alphas, L, method, interp_type, verbose)
+        alphas = torch.cumulative_trapezoid(alphas, dx=dt, dim=1) * gamma_bar
+        alphas = torch.cat([alphas[:, :1] * 0, alphas], dim=1)
+        super(coco_imperfection, self).__init__(phis, alphas, L, method, interp_type, verbose=verbose)
 
     def _calc_svd(self):
         """

@@ -187,14 +187,6 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
         #                                 ndim=len(im_size), 
         #                                 ofs=0.15, 
         #                                 line_width=kernel_width)
-    
-    # import matplotlib.pyplot as plt
-    # for i in range(src_vecs.shape[0] * 0 + 1):
-    #     plt.scatter(*src_vecs[i].T)
-    # plt.xlim(-5, 5)
-    # plt.ylim(-5, 5)
-    # plt.show()
-    # quit()
 
     src_vecs = src_vecs.to(torch_dev)
     batch_size = 50

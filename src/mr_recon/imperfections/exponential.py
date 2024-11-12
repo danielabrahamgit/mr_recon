@@ -2,7 +2,7 @@ import torch
 
 from tqdm import tqdm
 from typing import Optional
-from einops import rearrange, einsum
+from einops import rearrange, einsum, reduce
 from mr_recon.fourier import sigpy_nufft
 from mr_recon.algs import lin_solve, svd_power_method_tall
 from mr_recon.imperfections.imperfection import imperfection
@@ -29,7 +29,8 @@ class exponential_imperfection(imperfection):
                  method: Optional[str] = 'ts',
                  interp_type: Optional[str] = 'zero',
                  verbose: Optional[bool] = True,
-                 complex_exp: Optional[bool] = True):
+                 complex_exp: Optional[bool] = True,
+                 custom_clusters: Optional[torch.Tensor] = None) -> None:
         """
         Parameters:
         -----------
@@ -67,6 +68,7 @@ class exponential_imperfection(imperfection):
         assert alphas.dtype == torch.float32, 'alphas must be float32'
         assert phis.dtype == torch.float32, 'phis must be float32'
 
+        self.custom_clusters = custom_clusters
         super().__init__(L, method, interp_type, verbose)
 
     def _calc_time_segmentation(self,
@@ -100,10 +102,18 @@ class exponential_imperfection(imperfection):
         # Otherwise, use k-means
         else:
             method = 'cluster'
-        alpha_clusters, idxs = quantize_data(self.alphas.reshape((self.B, -1)).T, 
-                                             self.L, method=method)
-        self.alpha_clusters = alpha_clusters
-        idxs = idxs.reshape(self.trj_size)
+        if self.custom_clusters is not None:
+            self.alpha_clusters = self.custom_clusters.type(torch.float32)
+            # diffs = reduce(-self.alpha_clusters, self.alphas, 'L B, B ... -> L B ...',
+            #                reduction='sum').norm(dim=1)
+            tup = (slice(None), slice(None),) + (None,) * (self.alphas.ndim - 1)
+            diffs = (self.alpha_clusters[tup] - self.alphas[None,]).norm(dim=1)
+            idxs = diffs.argmin(dim=0)
+        else:
+            alpha_clusters, idxs = quantize_data(self.alphas.reshape((self.B, -1)).T, 
+                                                self.L, method=method)
+            self.alpha_clusters = alpha_clusters
+            idxs = idxs.reshape(self.trj_size)
             
         if 'lstsq' in self.interp_type:
 
@@ -134,7 +144,7 @@ class exponential_imperfection(imperfection):
             # AHA_inv = torch.linalg.inv(AHA)
 
             # Heavy batching for AHb
-            for t1 in tqdm(range(0, T, temporal_batch_size), 'Least Squares Interpolators'):
+            for t1 in tqdm(range(0, T, temporal_batch_size), 'Least Squares Interpolators', disable=not self.verbose):
                 t2 = min(t1 + temporal_batch_size, T)
 
                 # Compute AHb
@@ -332,7 +342,8 @@ class exponential_imperfection(imperfection):
                                          AHA=AHA,
                                          inp_dims=(nro,),
                                          rank=self.L,
-                                         device=self.torch_dev)
+                                         device=self.torch_dev,
+                                         verbose=self.verbose)
         spatial_funcs = rearrange(U * S, '... nseg -> nseg ...') * nvox
         temporal_funcs = Vh.reshape((self.L, *self.trj_size))
 

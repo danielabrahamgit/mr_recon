@@ -1,37 +1,38 @@
 import torch
-import sigpy as sp
 import torch.nn.functional as F
 
 import matplotlib
 matplotlib.use('webagg')
 import matplotlib.pyplot as plt
 
-from mr_recon.fourier import fft, ifft
+from mr_recon.recons import coil_combine
+from mr_recon.multi_coil.coil_est import csm_from_espirit
+from mr_recon.fourier import ifft
 from mr_recon.utils import np_to_torch
-from sigpy.mri import birdcage_maps
 from einops import rearrange
 
 # ------------------ Parmeters ------------------
-C = 12 # number of channels
+C = 16 # number of channels
 R = 2 # acceleration factor
-cal_size = (32, 32) # calibration region size
-im_size = (256, 256) # image dimensions as (Nx, Ny)
+cal_size = (38, 38) # calibration region size
+im_size = (146, 146) # image dimensions as (Nx, Ny)
 kern_size = (5, 2) # GRAPPA kernel size
-lamda_l2 = 1e-2*0 # GRAPPA L2 regularization parameter
+lamda_l2 = 1e-5  # GRAPPA L2 regularization parameter
 torch_dev = torch.device(5) # GPU device
 
-# ------------------ Simulate ------------------
-# Make fake image and sensitivity maps to use 
-img = np_to_torch(sp.shepp_logan(im_size)).type(torch.complex64).to(torch_dev)
-mps = np_to_torch(birdcage_maps((C, *im_size), r=1)).type(torch.complex64).to(torch_dev)
+# ------------------ Load Data ------------------
+# Load kspace data
+import numpy as np
+ksp_zf = np.load('/local_mount/space/tiger/1/users/abrahamd/kspc_data.npy')
+ksp_cal = np.load('/local_mount/space/tiger/1/users/abrahamd/kspc_calib.npy')
+ksp_zf = np_to_torch(rearrange(ksp_zf, 'R P C -> C R P')).to(torch_dev)
+ksp = ksp_zf[:, :, 35::2]
+ksp_cal = np_to_torch(rearrange(ksp_cal, 'R P C -> C R P')).to(torch_dev)
+tup = tuple([slice(ksp_cal.shape[i+1]//2 - cal_size[i]//2, ksp_cal.shape[i+1]//2 + cal_size[i]//2) for i in range(2)])
+ksp_cal = ksp_cal[(slice(None),) + tup]
 
-# Simulate calibration data
-ksp_cal = fft(img * mps, dim=[-2,-1])[:, im_size[0]//2 - cal_size[0]//2:im_size[0]//2 + cal_size[0]//2, 
-                                         im_size[1]//2 - cal_size[1]//2:im_size[1]//2 + cal_size[1]//2]
-ksp_cal /= ksp_cal.abs().max()
-
-# Simulate k-space data, undersample the Y dimension
-ksp = fft(img * mps, dim=[-2, -1])[:, :, ::R]
+# Est maps via espirit on calib
+mps = csm_from_espirit(ksp_cal, im_size)[0]
 
 # ------------------ Train GRAPPA kernel ------------------
 # Extract fully sampled (fs) patches
@@ -58,34 +59,29 @@ source = rearrange(source, '(C Kx Ky) N -> N (C Kx Ky)',
 
 # Apply GRAPPA Kernel
 target = (source @ grappa_kernel).T
-target = target.reshape((C, im_size[0] - 2*(kern_size[0]//2), im_size[1]//R - kern_size[1]//2))
+target = target.reshape((C, im_size[0] - 2*(kern_size[0]//2), -1))
 
 # Insert into kspace matrix
 ksp_grappa = torch.zeros((C, *im_size), device=torch_dev, dtype=torch.complex64)
-ksp_zero_filled = ksp_grappa.clone()
-ksp_zero_filled[..., ::R] = ksp
-ksp_grappa[..., ::R] = ksp
-ksp_grappa[:, (kern_size[0]//2):-(kern_size[0]//2), 1:im_size[1]-1:R] = target
+# ksp_zero_filled = ksp_grappa.clone()
+# ksp_zero_filled[..., ::R] = ksp
+ksp_zero_filled = ksp_zf.clone()
+ksp_grappa = ksp_zf.clone()
+ksp_grappa[:, (kern_size[0]//2):-(kern_size[0]//2), 36::2] = target
 
 # iFFT Recon to image and square root sum squares over coil dimension
-img_grappa = ifft(ksp_grappa, dim=[-2, -1]).abs().square().sum(dim=0).sqrt()
-img_zero_filled = ifft(ksp_zero_filled, dim=[-2, -1]).abs().square().sum(dim=0).sqrt()
+img_grappa = coil_combine(ifft(ksp_grappa, dim=[-2, -1]), mps).abs()
+img_zero_filled = coil_combine(ifft(ksp_zero_filled, dim=[-2, -1]))
 
 # ------------------ Plot ------------------
-vmin = 0
-vmax = img.abs().max().item()
 plt.figure(figsize=(14,7))
-plt.subplot(131)
-plt.title(f'Ground Truth')
-plt.imshow(img.abs().cpu(), cmap='gray', vmin=vmin, vmax=vmax)
-plt.axis('off')
-plt.subplot(132)
+plt.subplot(121)
 plt.title(f'Naive Recon (zero filled)')
-plt.imshow(img_zero_filled.cpu(), cmap='gray', vmin=vmin, vmax=vmax)
+plt.imshow(img_zero_filled.cpu(), cmap='gray')
 plt.axis('off')
-plt.subplot(133)
+plt.subplot(122)
 plt.title(f'GRAPPA Recon')
-plt.imshow(img_grappa.cpu(), cmap='gray', vmin=vmin, vmax=vmax)
+plt.imshow(img_grappa.cpu(), cmap='gray')
 plt.axis('off')
 plt.tight_layout()
 plt.show()

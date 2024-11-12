@@ -11,6 +11,7 @@ class main_field_imperfection(exponential_imperfection):
                  ro_dim: int,
                  dt: float,
                  L: int,
+                 te: Optional[float] = 0.0,
                  method: Optional[str] = 'ts',
                  interp_type: Optional[str] = 'zero',
                  verbose: Optional[bool] = True):
@@ -47,7 +48,7 @@ class main_field_imperfection(exponential_imperfection):
         nro = trj_size[ro_dim]
         tup = (None,) * ro_dim + (slice(None),) + (None,) * (len(trj_size) - ro_dim - 1)
         alphas = torch.arange(nro, device=b0_map.device, dtype=torch.float32)[tup]
-        alphas = alphas[None,]
+        alphas = alphas[None,] + te / dt
         self.prod1 = torch.prod(torch.tensor(trj_size)[ro_dim:]).item()
         self.prod2 = torch.prod(torch.tensor(trj_size)[ro_dim+1:]).item()
         self.orig_trj_size = trj_size

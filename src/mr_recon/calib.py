@@ -236,7 +236,7 @@ def synth_cal(ksp: torch.Tensor,
         
         # Recon
         A = multi_chan_linop((C, *cal_size), trj_cut, dcf_cut)
-        img_cal = CG_SENSE_recon(A, ksp_cut, max_iter=num_iter, lamda_l2=0.0, max_eigen=1.0)
+        img_cal = CG_SENSE_recon(A, ksp_cut, max_iter=num_iter, lamda_l2=0.0, max_eigen=1.0, verbose=False)
         ksp_cal = fft(img_cal, dim=tuple(range(-D, 0)))
     
     return ksp_cal
