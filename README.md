@@ -6,6 +6,11 @@ You can create the relevant conda environment using mamba (you can use conda but
 mamba env create -n mr_recon --file environment.yml
 ```
 
+Activate the installed environment:
+```
+mamba activate mr_recon
+```
+
 Then install the mr_recon library by moving to the mr_recon directory and running
 ```
 pip install -e ./
