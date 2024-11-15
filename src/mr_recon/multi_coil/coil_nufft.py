@@ -1,8 +1,8 @@
-from matplotlib.pyplot import grid
 import torch
 import gc
 import torch.nn as nn
 
+from mr_recon.dtypes import complex_dtype
 from mr_recon.indexing import multi_index, multi_grid
 from mr_recon.pad import PadLast
 from mr_recon.utils import gen_grd, np_to_torch, batch_iterator
@@ -119,7 +119,7 @@ class coil_nufft(NUFFT):
         if use_toeplitz:
             kerns = sp_nufft.calc_teoplitz_kernels(ks[None])
             def gram(y):
-                y_hat = torch.zeros(matrix_size, device=torch_dev, dtype=torch.complex64)
+                y_hat = torch.zeros(matrix_size, device=torch_dev, dtype=complex_dtype)
                 batch_size = C
                 for c1, c2 in batch_iterator(C, batch_size):
                     y_coil = y * mps_rs[c1:c2]
@@ -213,7 +213,7 @@ class coil_nufft(NUFFT):
                                                       grid=grid_new_flt[None,],
                                                       mode=mode, 
                                                       align_corners=align_corners)[0]
-        basis_funcs_flt = (basis_funcs_flt_r + 1j * basis_funcs_flt_i).type(torch.complex64)
+        basis_funcs_flt = (basis_funcs_flt_r + 1j * basis_funcs_flt_i).type(complex_dtype)
         
         # Reshape
         basis_funcs_new = basis_funcs_flt.squeeze().reshape((*channel_size, *grid_new.shape[:-1]))
@@ -327,7 +327,7 @@ class coil_nufft(NUFFT):
 
         # Adjoint NUFFT
         ksp_os = torch.zeros((*ksp_torch.shape[:-(trj.ndim - 2)], *os_size), 
-                             dtype=torch.complex64, device=ksp_torch.device)
+                             dtype=complex_dtype, device=ksp_torch.device)
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), os_size)
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))

@@ -1,4 +1,3 @@
-from turtle import forward
 import torch
 import sigpy as sp
 import torch.nn as nn
@@ -7,8 +6,8 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
+from mr_recon.dtypes import complex_dtype
 from sigpy.mri import pipe_menon_dcf
-# from mr_recon.fourier import sigpy_nufft
 
 def density_compensation(trj: torch.Tensor,
                          im_size: tuple,
@@ -103,7 +102,7 @@ def svd_power_method_tall(A: callable,
                           rank: int,
                           inp_dims: tuple,
                           niter: Optional[int] = 100,
-                          inp_dtype: Optional[torch.dtype] = torch.complex64,
+                          inp_dtype: Optional[torch.dtype] = complex_dtype,
                           device: Optional[torch.device] = torch.device('cpu'),
                           verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -550,7 +549,7 @@ def conjugate_gradient(AHA: nn.Module,
                        P: Optional[nn.Module] = None,
                        num_iters: Optional[int] = 10, 
                        lamda_l2: Optional[float] = 0.0,
-                       tolerance: Optional[float] = 1e-8,
+                       tolerance: Optional[float] = 1e-8 * 0,
                        return_resids: Optional[bool] = False,
                        verbose=True) -> torch.Tensor:
     """Conjugate gradient for complex numbers. The output is also complex.

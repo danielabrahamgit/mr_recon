@@ -2,6 +2,7 @@ import torch
 
 from typing import Optional
 from einops import einsum
+from mr_recon.dtypes import real_dtype
 
 def b0_est_naive(multi_echo_imgs: torch.Tensor,
                  echo_time_diff: float,
@@ -46,8 +47,8 @@ def b0_est_naive(multi_echo_imgs: torch.Tensor,
         raise NotImplementedError
     
     # Fit linear phase to phase images
-    b0_map = torch.zeros(im_size, dtype=torch.float32, device=phase_imgs.device)
-    n = torch.arange(1, nechos, dtype=torch.float32, device=phase_imgs.device)
+    b0_map = torch.zeros(im_size, dtype=real_dtype, device=phase_imgs.device)
+    n = torch.arange(1, nechos, dtype=real_dtype, device=phase_imgs.device)
     b0_map = -einsum(phase_imgs, n, 'N ..., N -> ...') / (n @ n) / (2 * torch.pi * echo_time_diff)
     b0_map = b0_map * mask
 
@@ -93,7 +94,7 @@ def b0_est_regularized(multi_echo_imgs: torch.Tensor,
     nechos = multi_echo_imgs.shape[0]
     im_size = multi_echo_imgs.shape[1:]
     assert nechos > 1, 'At least two echos are required for B0 estimation.'
-    deltas = torch.arange(nechos, dtype=torch.float32, device=multi_echo_imgs.device) * echo_time_diff
+    deltas = torch.arange(nechos, dtype=real_dtype, device=multi_echo_imgs.device) * echo_time_diff
 
     # Defaults
     if proxg is None:

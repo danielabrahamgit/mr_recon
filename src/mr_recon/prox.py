@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Callable, Union
+from typing import Tuple, Optional, Callable, Union
 
 from einops import rearrange
 import numpy as np
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import sigpy as sp
 
 from mr_recon.block import Block
+from mr_recon.dtypes import complex_dtype, np_complex_dtype
 
 
 __all__ = [
@@ -103,7 +104,7 @@ class L1Wav(nn.Module):
         
         # Random stuff
         shift = round(self.rng.uniform(-self.rnd_shift, self.rnd_shift))
-        phase = np.exp(1j * self.rng.uniform(-np.pi, np.pi)).astype(np.complex64)
+        phase = np.exp(1j * self.rng.uniform(-np.pi, np.pi)).astype(np_complex_dtype)
 
         # Roll each axis
         nd = len(self.axes)
@@ -119,7 +120,7 @@ class L1Wav(nn.Module):
         # Apply prox
         input_sigpy = self.W.H(sp.thresh.soft_thresh(self.lamda * alpha,
                                                         self.W(input_sigpy)))
-        input_sigpy = input_sigpy.astype(np.complex64)
+        input_sigpy = input_sigpy.astype(np_complex_dtype)
         
         # Undo random phase ...
         input_sigpy *= np.conj(phase)
@@ -192,7 +193,7 @@ class LocallyLowRank(nn.Module):
             input_type: Optional[Callable]= None,
     ):
         super().__init__()
-        self.input_type = input_type if input_type is not None else torch.complex64
+        self.input_type = input_type if input_type is not None else complex_dtype
         self.hparams = hparams
 
         # Using a fixed random number generator so that recons are consistent

@@ -1,3 +1,4 @@
+from math import isclose
 import torch
 
 from tqdm import tqdm
@@ -108,15 +109,23 @@ def calc_variance_PMR(R: callable,
     var : torch.Tensor
         variance map with same size as image.
     """
-    var = None
-    for n in tqdm(range(n_replicas), 'PMR Loop', disable=not verbose):
-        noise = (noise_var ** 0.5) * torch.randn_like(ksp * 0)
-        recon = R(ksp + noise)
-        var_n = recon.abs() ** 2 / (n_replicas * noise_var)
-        if var is None:
-            var = var_n
-        else:
-            var += var_n
+    if ksp.norm().isclose(torch.tensor(0.0)):
+        var = None
+        for n in tqdm(range(n_replicas), 'PMR Loop', disable=not verbose):
+            noise = (noise_var ** 0.5) * torch.randn_like(ksp * 0)
+            recon = R(ksp + noise)
+            var_n = recon.abs() ** 2 / (n_replicas * noise_var)
+            if var is None:
+                var = var_n
+            else:
+                var += var_n
+    else:
+        recons = []
+        for n in tqdm(range(n_replicas), 'PMR Loop', disable=not verbose):
+            noise = (noise_var ** 0.5) * torch.randn_like(ksp * 0)
+            recons.append(R(ksp + noise))
+        recons = torch.stack(recons, dim=0)
+        var = torch.var(recons, dim=0)
     return var
 
 def diagonal_estimator(M: callable,

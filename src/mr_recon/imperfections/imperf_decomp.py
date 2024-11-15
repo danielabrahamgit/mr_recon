@@ -1,9 +1,9 @@
-from sympy import adjoint
 import torch
 
 from typing import Optional
 from mr_recon.imperfections.spatio_temporal_imperf import spatio_temporal
 from mr_recon.algs import svd_power_method_tall
+from mr_recon.dtypes import complex_dtype
 from einops import rearrange, einsum
 from mr_recon.utils import gen_grd
 
@@ -203,7 +203,7 @@ def temporal_segmentation(st_imperf: spatio_temporal,
 
     # Compute spatial basis functions
     im_size = st_imperf.im_size
-    spatial_funcs = torch.zeros(L, *im_size, device=st_imperf.torch_dev, dtype=torch.complex64)
+    spatial_funcs = torch.zeros(L, *im_size, device=st_imperf.torch_dev, dtype=complex_dtype)
     grd = gen_grd(im_size, im_size).reshape((-1, len(im_size)))
     grd = (grd + torch.tensor(im_size)//2).type(torch.int).T
     grd = grd.to(st_imperf.torch_dev)
@@ -212,7 +212,7 @@ def temporal_segmentation(st_imperf: spatio_temporal,
         spatial_funcs[i, ...] = st_imperf.matrix_access(grd, temp_features).reshape(im_size)
 
     # Compute temporal basis functions
-    temporal_funcs = torch.zeros(L, *st_imperf.trj_size, device=st_imperf.torch_dev, dtype=torch.complex64)
+    temporal_funcs = torch.zeros(L, *st_imperf.trj_size, device=st_imperf.torch_dev, dtype=complex_dtype)
     if 'zero' in interp_type:
         for i in range(L):
             temporal_funcs[i, ...] = ((inds == i) * 1.0)
@@ -221,13 +221,13 @@ def temporal_segmentation(st_imperf: spatio_temporal,
     elif 'lstsq' in interp_type:
         # First compute AHA, which is all the pairwise 
         # dot products of the spatial features
-        AHA = torch.zeros((L, L), device=st_imperf.torch_dev, dtype=torch.complex64)
+        AHA = torch.zeros((L, L), device=st_imperf.torch_dev, dtype=complex_dtype)
         for i in range(L):
             for j in range(L):
                 AHA[i, j] = (spatial_funcs[i].conj() * spatial_funcs[j]).mean()
 
         # Next compute AHy, which is essentially int_r W(r, t) * b_l(r).conj() dr
-        AHy = torch.zeros((L, *st_imperf.trj_size), device=st_imperf.torch_dev, dtype=torch.complex64)
+        AHy = torch.zeros((L, *st_imperf.trj_size), device=st_imperf.torch_dev, dtype=complex_dtype)
         for i in range(L):
             AHy[i, ...] = st_imperf.forward_matrix_prod(spatial_funcs[i].conj()) / grd.shape[1]
 

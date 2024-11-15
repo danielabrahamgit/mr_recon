@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from typing import Optional
 from einops import rearrange, einsum
+from mr_recon.dtypes import complex_dtype, real_dtype
 from mr_recon.utils import (
     rotation_matrix,
     quantize_data,
@@ -215,7 +216,7 @@ class motion_imperfection(imperfection):
             raise NotImplementedError("Linear interpolation not implemented yet")
         elif 'zero' in self.interp_type:
             # Indicator function
-            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=torch.complex64, device=self.torch_dev)
+            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=complex_dtype, device=self.torch_dev)
             for i in range(self.L):
                 interp_funcs[i, ...] = 1.0 * (idxs == i)
 
@@ -386,10 +387,10 @@ class motion_op(nn.Module):
 
         # Save
         self.im_size = im_size
-        self.kgrid = nn.Parameter(kgrid.type(torch.float32), requires_grad=False)
-        self.rgrid = nn.Parameter(rgrid.type(torch.float32), requires_grad=False)
-        # self.rgrid = rgrid.type(torch.float32)
-        # self.kgrid = kgrid.type(torch.float32)
+        self.kgrid = nn.Parameter(kgrid.type(real_dtype), requires_grad=False)
+        self.rgrid = nn.Parameter(rgrid.type(real_dtype), requires_grad=False)
+        # self.rgrid = rgrid.type(real_dtype)
+        # self.kgrid = kgrid.type(real_dtype)
         self.U = None
         self.V = None
         self.reuse_UV = reuse_UV
@@ -409,7 +410,7 @@ class motion_op(nn.Module):
         U : torch.Tensor
             The U terms with shape (N, *im_size)
         """
-        return torch.exp(-1j * einsum(self.kgrid, translations.type(torch.float32), 
+        return torch.exp(-1j * einsum(self.kgrid, translations.type(real_dtype), 
                                       '... out, N out -> N ...'))
     
     def _build_V(self,
@@ -428,7 +429,7 @@ class motion_op(nn.Module):
             The V terms with shape (6, N, *im_size)
         """
 
-        roations_radians = torch.deg2rad(rotations).type(torch.float32)
+        roations_radians = torch.deg2rad(rotations).type(real_dtype)
         v_1_tan = torch.tan(roations_radians[:, 0] / 2) * \
                   self.kgrid[None, ..., 1] * self.rgrid[None, ..., 2]
         v_1_sin = torch.sin(roations_radians[:, 0]) * \

@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 from typing import Optional
 from einops import rearrange, einsum, reduce
+from mr_recon.dtypes import complex_dtype, real_dtype
 from mr_recon.fourier import sigpy_nufft
 from mr_recon.algs import lin_solve, svd_power_method_tall
 from mr_recon.imperfections.imperfection import imperfection
@@ -65,8 +66,8 @@ class exponential_imperfection(imperfection):
             self.exp_scale = 1
 
         assert alphas.device == self.torch_dev, 'alphas and phis must be on same device'
-        assert alphas.dtype == torch.float32, 'alphas must be float32'
-        assert phis.dtype == torch.float32, 'phis must be float32'
+        assert alphas.dtype == real_dtype, 'alphas must be float32'
+        assert phis.dtype == real_dtype, 'phis must be float32'
 
         self.custom_clusters = custom_clusters
         super().__init__(L, method, interp_type, verbose)
@@ -103,7 +104,7 @@ class exponential_imperfection(imperfection):
         else:
             method = 'cluster'
         if self.custom_clusters is not None:
-            self.alpha_clusters = self.custom_clusters.type(torch.float32)
+            self.alpha_clusters = self.custom_clusters.type(real_dtype)
             # diffs = reduce(-self.alpha_clusters, self.alphas, 'L B, B ... -> L B ...',
             #                reduction='sum').norm(dim=1)
             tup = (slice(None), slice(None),) + (None,) * (self.alphas.ndim - 1)
@@ -131,11 +132,11 @@ class exponential_imperfection(imperfection):
 
             # Desired temporal functions
             interp_funcs = torch.zeros((self.L, T),
-                                        dtype=torch.complex64, device=self.torch_dev)
+                                        dtype=complex_dtype, device=self.torch_dev)
             
             # Compute AHA
             AHA = torch.zeros((self.L, self.L), 
-                              dtype=torch.complex64, device=self.torch_dev)
+                              dtype=complex_dtype, device=self.torch_dev)
             for n1, n2 in batch_iterator(N, spatial_batch_size):
                 n2 = min(n1 + spatial_batch_size, N)
                 A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
@@ -149,7 +150,7 @@ class exponential_imperfection(imperfection):
 
                 # Compute AHb
                 AHb = torch.zeros((self.L, t2 - t1), 
-                                dtype=torch.complex64, device=self.torch_dev)
+                                dtype=complex_dtype, device=self.torch_dev)
 
                 # Sketch over voxel dimension
                 if sketch_AHb:
@@ -176,7 +177,7 @@ class exponential_imperfection(imperfection):
             raise NotImplementedError
         elif 'zero' in self.interp_type:
             # Indicator function
-            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=torch.complex64, device=self.torch_dev)
+            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=complex_dtype, device=self.torch_dev)
             for i in range(self.L):
                 interp_funcs[i, ...] = 1.0 * (idxs == i)
         else:
@@ -246,7 +247,7 @@ class exponential_imperfection(imperfection):
         def A(x):
             x = x.reshape((-1))
             nvox = torch.prod(torch.tensor(self.im_size)).item()
-            y = torch.zeros((nvox,), dtype=torch.complex64, device=x.device)
+            y = torch.zeros((nvox,), dtype=complex_dtype, device=x.device)
             for n1, n2 in batch_iterator(nvox, spatial_batch_size):
                 y[n1:n2] = self._build_spatio_temporal_matrix(r_slice=slice(n1, n2), 
                                                               t_slice=slice(None), 
@@ -258,7 +259,7 @@ class exponential_imperfection(imperfection):
             y = y.reshape((-1))
             nvox = torch.prod(torch.tensor(self.im_size)).item()
             ntrj = torch.prod(torch.tensor(self.trj_size)).item()
-            x = torch.zeros((ntrj,), dtype=torch.complex64, device=y.device)
+            x = torch.zeros((ntrj,), dtype=complex_dtype, device=y.device)
             for n1, n2 in batch_iterator(nvox, spatial_batch_size):
                 x += self._build_spatio_temporal_matrix(r_slice=slice(n1, n2), 
                                                         t_slice=slice(None), 
@@ -317,7 +318,7 @@ class exponential_imperfection(imperfection):
         freqs = nufft.rescale_trajectory(phis * nro)[0, ..., None]
 
         # Compute phase_0 to make sure that no phase is applied at first time point
-        x_0 = torch.zeros((nro,), dtype=torch.complex64, device=self.torch_dev)
+        x_0 = torch.zeros((nro,), dtype=complex_dtype, device=self.torch_dev)
         x_0[0] = 1
         phase_0 = nufft(x_0[None,], freqs[None,])[0] * nro / nvox # scaling nro / nvox helps with numerical stability
 

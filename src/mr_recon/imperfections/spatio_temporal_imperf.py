@@ -2,6 +2,7 @@ import torch
 
 from typing import Optional, Union
 from einops import rearrange, einsum
+from mr_recon.dtypes import complex_dtype
 from mr_recon.pad import PadLast
 from mr_recon.fourier import sigpy_nufft, fft, ifft
 from mr_recon.utils import gen_grd, quantize_data, batch_iterator
@@ -210,9 +211,9 @@ class spatio_temporal:
         k = len(trj_size)
 
         # Gen Inputs
-        inp_spatial = torch.randn(self.im_size, device=self.torch_dev, dtype=torch.complex64)
+        inp_spatial = torch.randn(self.im_size, device=self.torch_dev, dtype=complex_dtype)
         inp_spatial_flt = inp_spatial.flatten()
-        inp_temporal = torch.randn(self.trj_size, device=self.torch_dev, dtype=torch.complex64)
+        inp_temporal = torch.randn(self.trj_size, device=self.torch_dev, dtype=complex_dtype)
         inp_temporal_flt = inp_temporal.flatten()
 
         # Indices for matrix access
@@ -290,7 +291,7 @@ class B0(spatio_temporal):
         super(B0, self).__init__(im_size, trj_size, device=b0_map.device)
 
         if coil_maps is None:
-            coil_maps = torch.ones((1, *im_size), device=b0_map.device, dtype=torch.complex64)
+            coil_maps = torch.ones((1, *im_size), device=b0_map.device, dtype=complex_dtype)
         assert coil_maps.shape[1:] == im_size, 'Coil maps must have same size as image'
 
         # Store the B0 map and readout dimension
@@ -315,7 +316,7 @@ class B0(spatio_temporal):
         # self.toeplitz_kerns = self.nufft.calc_teoplitz_kernels((-b0_map * num_readout)[None, ..., None], weights[None,])
         C = coil_maps.shape[0]
         trj = (-b0_map * num_readout)[..., None]
-        self.toeplitz_kerns = torch.zeros((C, C, num_readout * 2), device=b0_map.device, dtype=torch.complex64)
+        self.toeplitz_kerns = torch.zeros((C, C, num_readout * 2), device=b0_map.device, dtype=complex_dtype)
         for c1 in range(C):
             weights_c1c2 = weights * coil_maps * coil_maps[c1].conj()
             kern = self.nufft.calc_teoplitz_kernels(trj[None,], weights_c1c2)
@@ -353,9 +354,9 @@ class B0(spatio_temporal):
         out_readout = self.nufft.adjoint((spatial_input * self.mps)[None,] * self.phase_0.conj(), freqs[None,])[0]
 
         # Fill in other dimensions
-        temporal_output = torch.zeros((self.mps.shape[0], *self.trj_size), device=self.b0_map.device, dtype=torch.complex64)
+        temporal_output = torch.zeros((self.mps.shape[0], *self.trj_size), device=self.b0_map.device, dtype=complex_dtype)
         tup = (slice(None),) + (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
-        # temporal_output = torch.zeros(self.trj_size, device=self.b0_map.device, dtype=torch.complex64)
+        # temporal_output = torch.zeros(self.trj_size, device=self.b0_map.device, dtype=complex_dtype)
         # tup = (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
         temporal_output[...] = out_readout[tup]
 
@@ -392,7 +393,7 @@ class B0(spatio_temporal):
         out_readout = padder.adjoint(out_readout)
         
         # Fill in other dimensions
-        temporal_output = torch.zeros((self.mps.shape[0], *self.trj_size), device=self.b0_map.device, dtype=torch.complex64)
+        temporal_output = torch.zeros((self.mps.shape[0], *self.trj_size), device=self.b0_map.device, dtype=complex_dtype)
         tup = (slice(None),) + (None,) * self.readout_dim + (slice(None),) + (None,) * (len(self.trj_size) - self.readout_dim - 1)
         temporal_output[...] = out_readout[tup]
         return temporal_output

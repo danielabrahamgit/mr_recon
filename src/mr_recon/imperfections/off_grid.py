@@ -1,6 +1,7 @@
 import torch
 
 from typing import Optional
+from mr_recon.dtypes import real_dtype
 from mr_recon.utils import gen_grd
 from mr_recon.imperfections.exponential import exponential_imperfection
 
@@ -36,8 +37,8 @@ class off_grid_imperfection(exponential_imperfection):
         """
         # Make regular grid for phis, and alphas are just the deviations
         device = grid_deviations.device
-        phis = gen_grd(im_size).to(device).type(torch.float32)
-        alphas = grid_deviations.type(torch.float32)
+        phis = gen_grd(im_size).to(device).type(real_dtype)
+        alphas = grid_deviations.type(real_dtype)
         super(off_grid_imperfection, self).__init__(phis.moveaxis(-1, 0), 
                                                     alphas.moveaxis(-1, 0),
                                                     L, method, interp_type, verbose)

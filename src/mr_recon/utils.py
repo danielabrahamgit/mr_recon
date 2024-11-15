@@ -1,8 +1,8 @@
 import torch
 import cupy as cp
-import sigpy as sp
 import numpy as np
 
+from mr_recon.dtypes import real_dtype
 from typing import Optional
 from fast_pytorch_kmeans import KMeans
 from scipy.signal import get_window
@@ -176,7 +176,7 @@ def rotation_matrix(axis: torch.Tensor,
     b = -axis[..., 0] * torch.sin(theta / 2.0)
     c = -axis[..., 1] * torch.sin(theta / 2.0)
     d = -axis[..., 2] * torch.sin(theta / 2.0)
-    R = torch.zeros((*theta.shape, 3, 3), device=dev, dtype=torch.float32)
+    R = torch.zeros((*theta.shape, 3, 3), device=dev, dtype=real_dtype)
     R[..., 0, 0] = a * a + b * b - c * c - d * d
     R[..., 0, 1] = 2 * (b * c - a * d)
     R[..., 0, 2] = 2 * (b * d + a * c)

@@ -341,8 +341,6 @@ def inverse_nufft_pcg(omega, ksp, cal_size,
     omega = omega.to(device)
     if dcf is not None:
         dcf = dcf.to(device)
-    #omega = omega[None, ...]
-    #dummy_smaps = torch.ones((C, *cal_size), dtype=torch.complex64).to(device)
     with torch.cuda.device(device):
         x_init = nufft_adj(y, omega=omega, norm='ortho')
     img_cal = conjugate_gradient(AHA=A_op,

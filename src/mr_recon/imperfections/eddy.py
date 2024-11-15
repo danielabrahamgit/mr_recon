@@ -1,6 +1,7 @@
 import torch
 
 from typing import Optional
+from mr_recon.dtypes import real_dtype
 from mr_recon.utils import gen_grd
 from mr_recon.imperfections.exponential import exponential_imperfection
 
@@ -98,7 +99,7 @@ class eddy_imperfection(exponential_imperfection):
                 grd = torch.concatenate((grd, grd[..., :1] * 0), dim=-1)
                 
                 if rotations is not None:
-                    rotations = torch.tensor(rotations, dtype=torch.float32, device=alphas.device)
+                    rotations = torch.tensor(rotations, dtype=real_dtype, device=alphas.device)
                     thetas = torch.deg2rad(rotations)
                     Rx = torch.tensor([
                         [1, 0, 0],
