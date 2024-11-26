@@ -201,7 +201,7 @@ class motion_imperfection(imperfection):
 
         # Cluster motion states
         self.motion_clusters, idxs = quantize_data(self.motion_params.reshape((-1, 6)), 
-                                                   self.L, method='cluster')
+                                                   self.L, method='cluster', verbose=self.verbose)
         idxs = idxs.reshape(self.trj_size)
         self.affine_mats = affine_mats_from_parms(self.motion_clusters)
         self.affine_mats_adj = self.affine_mats.clone()

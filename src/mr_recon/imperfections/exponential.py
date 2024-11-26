@@ -112,7 +112,7 @@ class exponential_imperfection(imperfection):
             idxs = diffs.argmin(dim=0)
         else:
             alpha_clusters, idxs = quantize_data(self.alphas.reshape((self.B, -1)).T, 
-                                                self.L, method=method)
+                                                self.L, method=method, verbose=self.verbose)
             self.alpha_clusters = alpha_clusters
             idxs = idxs.reshape(self.trj_size)
             

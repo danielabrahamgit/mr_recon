@@ -9,7 +9,8 @@ from scipy.signal import get_window
 
 def quantize_data(data: torch.Tensor,  
                   K: int,
-                  method: Optional['str'] = 'uniform') -> torch.Tensor:
+                  method: Optional['str'] = 'uniform',
+                  verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Given data of shape (..., d), finds K 'clusters' with shape (K, d)
 
@@ -41,7 +42,6 @@ def quantize_data(data: torch.Tensor,
     if method == 'cluster':
         max_iter = 1000
         mode = 'euclidean'
-        verbose = 1
         # mode = 'cosine'
         if (torch_dev.index == -1) or (torch_dev.index is None):
             kmeans = KMeans(n_clusters=K,
