@@ -78,6 +78,7 @@ def CG_SENSE_recon(A: linop,
                    max_iter: Optional[int] = 15,
                    lamda_l2: Optional[float] = 0.0,
                    max_eigen: Optional[float] = None,
+                   tolerance: Optional[float] = 1e-8,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run CG SENSE recon:
@@ -95,6 +96,8 @@ def CG_SENSE_recon(A: linop,
         l2 lamda regularization for SENSE: ||Ax - b||_2^2 + lamda_l2||x||_2^2
     max_eigen : float
         maximum eigenvalue of AHA
+    tolerance : float
+        tolerance for CG algorithm
     verbose : bool 
         Toggles print statements
 
@@ -136,6 +139,7 @@ def CG_SENSE_recon(A: linop,
                                AHb=AHb,
                                num_iters=max_iter,
                                lamda_l2=lamda_l2,
+                               tolerance=tolerance,
                                verbose=verbose)
     
     return recon

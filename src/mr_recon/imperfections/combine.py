@@ -36,14 +36,14 @@ class combined_imperfections(imperfection):
         """
         Every imperfection will be characterized by some important 
         features. For example, Motion imperfections naturally should 
-        return rigid body motion parameters, etc.
+        return rigid body motion parameters, field imperfections return time-like features, etc.
 
         Returns:
         --------
         features : torch.Tensor
             The features of the imperfection
         """
-        return torch.cat([imp.get_network_features() for imp in self.imperfections], dim=0)
+        return torch.cat([imp.get_network_features() for imp in self.imperfections], dim=-1)
 
     def _l_slice_helper(self,
                         ls: Optional[torch.Tensor] = slice(None)):
@@ -197,4 +197,38 @@ class combined_imperfections(imperfection):
             else:
                 x_all *= imp.apply_temporal_adjoint(y_ones, inds_batch[:, k])
         return x_all
+    
+    def apply_spatio_temporal(self,
+                              x: torch.Tensor,
+                              r_inds: Optional[torch.Tensor] = slice(None), 
+                              t_inds: Optional[torch.Tensor] = slice(None),
+                              lowrank: Optional[bool] = False) -> torch.Tensor:
+        """
+        Applies the combined full spatio-temporal imperfection model to the data
+
+        Parameters:
+        -----------
+        x : torch.Tensor
+            The input data with shape (..., nc, *im_size)
+        r_inds : Optional[tuple]
+            Slices the flattened spatial terms with shape (N,)
+        t_inds : Optional[tuple]
+            Slices the flattened temporal terms with shape (N,)
+        lowrank : Optional[bool]
+            if True, uses lowrank approximation
+        
+        Returns:
+        --------
+        xt : torch.Tensor
+            The spatio-temporal data with shape (..., nc, N)
+        """
+        # Product of all spatio temporal operators
+        xt = None
+        for imp in self.imperfections:
+            xti = imp.apply_spatio_temporal(x, r_inds, t_inds, lowrank)
+            if xt is None:
+                xt = xti
+            else:
+                xt *= xti
+        return xt
     

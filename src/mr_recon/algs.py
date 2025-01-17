@@ -297,6 +297,7 @@ def eigen_decomp_operator(A: callable,
     """
     eigen_vecs = torch.zeros(num_eigen, *x0.shape, device=x0.device, dtype=x0.dtype)
     eigen_vals = torch.zeros(num_eigen, device=x0.device, dtype=x0.dtype)
+    A_clone = A
     def A_resid_operator(x):
         y = A_clone(x)
         VH_x = einsum(eigen_vecs.conj(), x, 'n ..., ... -> n') * eigen_vals
@@ -308,20 +309,19 @@ def eigen_decomp_operator(A: callable,
         init = torch.randn_like(x0)
         init /= torch.linalg.norm(init)
         if reverse_order:
-            # vec, val = inverse_power_method_operator(A_resid_operator, init, 
-            #                                         num_iter=num_power_iter, 
-            #                                         verbose=False)
-            # Get largest eval first
-            if r == 0:
-                _, val_max = power_method_operator(A, init, 
-                                                num_iter=num_power_iter * 10, 
-                                                verbose=False)
-                val_max *= 1.0
-                A_clone = lambda x : val_max * x - A(x)
-            vec, val = power_method_operator(A_resid_operator, init, 
-                                            num_iter=num_power_iter, 
-                                            verbose=False)
-            
+            vec, val = inverse_power_method_operator(A_resid_operator, init, 
+                                                    num_iter=num_power_iter, 
+                                                    verbose=False)
+            # # Get largest eval first
+            # if r == 0:
+            #     _, val_max = power_method_operator(A, init, 
+            #                                     num_iter=num_power_iter * 10, 
+            #                                     verbose=False)
+            #     val_max *= 1.0
+            #     A_clone = lambda x : val_max * x - A(x)
+            # vec, val = power_method_operator(A_resid_operator, init, 
+            #                                 num_iter=num_power_iter, 
+            #                                 verbose=False)
         else:
             vec, val = power_method_operator(A_resid_operator, init, 
                                             num_iter=num_power_iter, 
@@ -331,8 +331,8 @@ def eigen_decomp_operator(A: callable,
 
 
     if reverse_order:
-        eigen_vals = val_max - eigen_vals
-        # eigen_vals = 1 / eigen_vals
+        # eigen_vals = val_max - eigen_vals
+        eigen_vals = 1 / eigen_vals
 
     return eigen_vecs, eigen_vals
                           
@@ -549,7 +549,7 @@ def conjugate_gradient(AHA: nn.Module,
                        P: Optional[nn.Module] = None,
                        num_iters: Optional[int] = 10, 
                        lamda_l2: Optional[float] = 0.0,
-                       tolerance: Optional[float] = 1e-8 * 0,
+                       tolerance: Optional[float] = 1e-8,
                        return_resids: Optional[bool] = False,
                        verbose=True) -> torch.Tensor:
     """Conjugate gradient for complex numbers. The output is also complex.

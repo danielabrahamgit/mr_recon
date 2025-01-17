@@ -1,3 +1,4 @@
+from turtle import forward
 import torch
 import torch.nn as nn
 
@@ -985,6 +986,33 @@ class subspace_linop_grog(linop):
             self.inv_noise_cov = None
         else:
             self.inv_noise_cov = torch.linalg.inv(noise_cov)
+     
+    def apply_kspace_coil_mat(self,
+                             ksp: torch.Tensor,
+                             ksp_coil_mat: torch.Tensor) -> torch.Tensor:
+        """
+        Applies a coil matrix to each point in kspace
+        
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        ksp_coil_mat : torch.tensor <complex> | GPU
+            the coil matrix with shape (*trj_size, nc, nc)
+        
+        Returns
+        ---------
+        ksp_new : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size) after applying the coil matrix
+        """
+        ksp_new = torch.zeros_like(ksp)
+        first_coil_batch = self.A.bparams.coil_batch_size
+        for c1, c2 in batch_iterator(ksp.shape[0], first_coil_batch):
+            second_coil_batch = ksp.shape[0]
+            for d1, d2 in batch_iterator(ksp.shape[0], second_coil_batch):
+                ksp_new[c1:c2] = einsum(ksp[d1:d2], ksp_coil_mat[..., c1:c2, d1:d2], 'ci ..., ... co ci -> co ...')
+        # ksp_new = einsum(ksp, ksp_coil_mat, 'ci ..., ... co ci -> co ...')
+        return ksp_new  
 
     def forward(self,
                 img: torch.Tensor) -> torch.Tensor:
@@ -1021,14 +1049,10 @@ class subspace_linop_grog(linop):
         """
         # Apply noise covaraince
         if self.inv_noise_cov is not None:
-            ksp_new = torch.zeros_like(ksp)
-            for c1, c2 in batch_iterator(ksp.shape[0], self.A.bparams.coil_batch_size):
-                second_coil_batch = ksp.shape[0]
-                for d1, d2 in batch_iterator(ksp.shape[0], second_coil_batch):
-                    ksp_new[c1:c2] = einsum(ksp[d1:d2], self.inv_noise_cov[..., c1:c2, d1:d2], 'ci ..., ... co ci -> co ...')
-            ksp = ksp_new
-            # ksp = einsum(ksp, self.inv_noise_cov, 'ci ..., ... co ci -> co ...')
-        img = self.A.adjoint(ksp)
+            ksp_new = self.apply_kspace_coil_mat(ksp, self.inv_noise_cov)
+        else:
+            ksp_new = ksp
+        img = self.A.adjoint(ksp_new)
         return img
     
     def normal(self,
@@ -1105,6 +1129,33 @@ class sense_linop_grog(linop):
             self.inv_noise_cov = None
         else:
             self.inv_noise_cov = torch.linalg.inv(noise_cov)
+            
+    def apply_kspace_coil_mat(self,
+                             ksp: torch.Tensor,
+                             ksp_coil_mat: torch.Tensor) -> torch.Tensor:
+        """
+        Applies a coil matrix to each point in kspace
+        
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        ksp_coil_mat : torch.tensor <complex> | GPU
+            the coil matrix with shape (*trj_size, nc, nc)
+        
+        Returns
+        ---------
+        ksp_new : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size) after applying the coil matrix
+        """
+        ksp_new = torch.zeros_like(ksp)
+        first_coil_batch = self.A.bparams.coil_batch_size
+        for c1, c2 in batch_iterator(ksp.shape[0], first_coil_batch):
+            second_coil_batch = ksp.shape[0]
+            for d1, d2 in batch_iterator(ksp.shape[0], second_coil_batch):
+                ksp_new[c1:c2] = einsum(ksp[d1:d2], ksp_coil_mat[..., c1:c2, d1:d2], 'ci ..., ... co ci -> co ...')
+        # ksp_new = einsum(ksp, ksp_coil_mat, 'ci ..., ... co ci -> co ...')
+        return ksp_new  
 
     def forward(self,
                 img: torch.Tensor) -> torch.Tensor:
@@ -1141,33 +1192,29 @@ class sense_linop_grog(linop):
         """
         # Apply noise covaraince
         if self.inv_noise_cov is not None:
-            ksp_new = torch.zeros_like(ksp)
-            for c1, c2 in batch_iterator(ksp.shape[0], self.A.bparams.coil_batch_size):
-                second_coil_batch = ksp.shape[0]
-                for d1, d2 in batch_iterator(ksp.shape[0], second_coil_batch):
-                    ksp_new[c1:c2] = einsum(ksp[d1:d2], self.inv_noise_cov[..., c1:c2, d1:d2], 'ci ..., ... co ci -> co ...')
-            ksp = ksp_new
-            # ksp = einsum(ksp, self.inv_noise_cov, 'ci ..., ... co ci -> co ...')
-        img = self.A.adjoint(ksp)
+            ksp_new = self.apply_kspace_coil_mat(ksp, self.inv_noise_cov)
+        else:
+            ksp_new = ksp
+        img = self.A.adjoint(ksp_new)
         return img
     
     def normal(self,
                img: torch.Tensor) -> torch.Tensor:
-          """
-          Gram/normal call of this linear model (A.H (A (x))).
-    
-          Parameters
-          ----------
-          img : torch.tensor <complex>
-                the image with shape (*im_size)
-          
-          Returns
-          ---------
-          img_hat : torch.tensor <complex>
-                the ouput image with shape (*im_size)
-          """
-          img_hat = self.adjoint(self.forward(img))
-          return img_hat
+        """
+        Gram/normal call of this linear model (A.H (A (x))).
+
+        Parameters
+        ----------
+        img : torch.tensor <complex>
+            the image with shape (*im_size)
+        
+        Returns
+        ---------
+        img_hat : torch.tensor <complex>
+            the ouput image with shape (*im_size)
+        """
+        img_hat = self.adjoint(self.forward(img))
+        return img_hat
 
 class spirit_linop(linop):
     """
@@ -1298,6 +1345,78 @@ class grappa_linop(linop):
             kernel = nfft.adjoint(kernel[None,], source_vecs[None,])[0]
         else:
             kernel = kernel.reshape((*kernel.shape[:-1], *kern_size))
+
+class subspace_linop_wierd(linop):
+    
+    def __init__(self,
+                 im_size: tuple,
+                 trj: torch.Tensor,
+                 mps: torch.Tensor,
+                 phi: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 nufft: Optional[NUFFT] = None,
+                 imperf_model: Optional[imperfection] = None,
+                 bparams: Optional[batching_params] = batching_params()):
+        ishape = (phi.shape[1], *im_size)
+        oshape = (mps.shape[0], *trj.shape[:-1])
+        super().__init__(ishape, oshape)
+        
+        self.Aphi = subspace_linop(im_size, trj, mps, phi, dcf, nufft, imperf_model, False, bparams)
+    
+    def forward(self,
+                imgs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward call of this linear model.
+
+        Parameters
+        ----------
+        imgs : torch.tensor <complex> | GPU
+            the temporal volumes with shape (T, *im_size)
+        
+        Returns
+        ---------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        """
+        alphas = einsum(self.Aphi.phi.conj(), imgs, 'K T, T ... -> K ...')
+        ksp = self.Aphi.forward(alphas)
+        return ksp
+    
+    def adjoint(self, 
+                ksp: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint call of this linear model.
+        
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        
+        Returns
+        ---------
+        imgs : torch.tensor <complex> | GPU
+            the temporal volumes with shape (T, *im_size)
+        """
+        alphas = self.Aphi.adjoint(ksp)
+        imgs = einsum(self.Aphi.phi, alphas, 'K T , K ... -> T ...')
+        return imgs
+    
+    def normal(self,
+               imgs: torch.Tensor) -> torch.Tensor:
+        """
+        Gram/normal call of this linear model (A.H (A (x))).
+        
+        Parameters
+        ----------
+        imgs : torch.tensor <complex> | GPU
+            the temporal volumes with shape (T, *im_size)
+        
+        Returns
+        ---------
+        imgs_hat : torch.tensor <complex> | GPU
+            the output temporal volumes with shape (T, *im_size)
+        """
+        return self.adjoint(self.forward(imgs))
 
 class subspace_linop(linop):
     """

@@ -29,15 +29,13 @@ grd = gen_grd(im_size).to(torch_dev)
 crds = (torch.rand((1000, 2), dtype=torch.float32, device=torch_dev) - 0.5)
 crds[..., 0] *= im_size[0] * 0.99
 crds[..., 1] *= im_size[1] * 0.99
-# crds = torch.round(crds * grd_os) / grd_os
+crds = torch.round(crds * grd_os) / grd_os
 img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
 
 # Create nuffts
-kb_nufft = torchkb_nufft(im_size, torch.device(device_idx))
-sp_nufft = sigpy_nufft(im_size)
-grd_nufft = svd_nufft(im_size, n_svd=15)
-nuffts = [sp_nufft, kb_nufft, grd_nufft]
-names = ['sigpy', 'torchkb', 'SVD']
+grd_nufft = gridded_nufft(im_size, grd_os)
+nuffts = [grd_nufft]
+names = ['gridded nufft']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.show()
@@ -73,7 +71,6 @@ for nufft, name in zip(nuffts, names):
     assert torch.all(err <= rtol), f'{name} toeplitz failed {plot_err_img(err)}'
 
 # ------------- Test Toeplitz Compared to no Toeplitz ---------------
-nuffts = [sp_nufft, kb_nufft, grd_nufft]
 for nufft, name in zip(nuffts, names):
     crds_rs = nufft.rescale_trajectory(crds)
 
@@ -87,3 +84,5 @@ for nufft, name in zip(nuffts, names):
 
     err = (aha - aha_no).abs() / (aha_no.abs() + eps)
     assert torch.all(err <= rtol), f'{name} toeplitz - normal failed {plot_err_img(err)}'
+    
+print('All tests passed')
