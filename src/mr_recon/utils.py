@@ -121,7 +121,7 @@ def gen_grd(im_size: tuple,
     grd = torch.cat(
         [g[..., None] for g in grds], dim=-1)
         
-    return grd
+    return grd.type(real_dtype)
 
 def three_rotation_matrix(thetas: torch.Tensor) -> torch.Tensor:
     """

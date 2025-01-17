@@ -1,4 +1,3 @@
-from math import isclose
 import torch
 
 from tqdm import tqdm
@@ -109,7 +108,7 @@ def calc_variance_PMR(R: callable,
     var : torch.Tensor
         variance map with same size as image.
     """
-    if ksp.norm().isclose(torch.tensor(0.0)):
+    if ksp.norm() < 1e-9:
         var = None
         for n in tqdm(range(n_replicas), 'PMR Loop', disable=not verbose):
             noise = (noise_var ** 0.5) * torch.randn_like(ksp * 0)
@@ -131,7 +130,7 @@ def calc_variance_PMR(R: callable,
 def diagonal_estimator(M: callable,
                       inp_example: torch.Tensor,
                       n_replicas: Optional[int] = 100,
-                      rnd_vec_type: Optional[str] = None,
+                      rnd_vec_type: Optional[str] = 'real',
                       verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Estimates the diagoal elements of some matrix operator M using a modified Hutchinson's method.

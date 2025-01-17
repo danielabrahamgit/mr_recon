@@ -209,6 +209,11 @@ def synth_cal(ksp: torch.Tensor,
         density compensation function with shape (*trj_size)
     num_iter: int
         number of conj gradient iterations for estimating rectilinear calib from non-cart data
+    
+    Returns:
+    --------
+    ksp_cal: torch.Tensor
+        calibration signal with shape (C, *cal_size)
     """
     # Consts
     C = ksp.shape[0]

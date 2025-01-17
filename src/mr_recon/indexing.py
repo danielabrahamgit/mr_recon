@@ -20,9 +20,10 @@ def ravel(x, shape, dim):
     torch.LongTensor of same shape as x but with indexing dimension removed
     """
     out = 0
-    for s, i in zip(shape[1:], range(x.shape[dim]-1)):
-        out = s * (out + torch.select(x, dim, i))
-    out += torch.select(x, dim, -1)
+    shape_shifted = tuple(shape[1:]) + (1,)
+    for s, s_next, i in zip(shape, shape_shifted, range(x.shape[dim])):
+        out += torch.select(x, dim, i) % s
+        out *= s_next
     return out
 
 def multi_index(x: torch.Tensor, ndims: int, idx: torch.Tensor, raveled: bool = False):

@@ -127,6 +127,7 @@ class exponential_imperfection(imperfection):
             # Defualt batch
             if spatial_batch_size is None:
                 spatial_batch_size = N
+                spatial_batch_size = 2 ** 20
             if temporal_batch_size is None:
                 temporal_batch_size = T
 
@@ -137,7 +138,7 @@ class exponential_imperfection(imperfection):
             # Compute AHA
             AHA = torch.zeros((self.L, self.L), 
                               dtype=complex_dtype, device=self.torch_dev)
-            for n1, n2 in batch_iterator(N, spatial_batch_size):
+            for n1 in tqdm(range(0, N, spatial_batch_size), 'Least Squares AHA Loop', disable=not self.verbose):
                 n2 = min(n1 + spatial_batch_size, N)
                 A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
                 A_batch = torch.exp(-self.exp_scale * A_batch)
@@ -145,7 +146,7 @@ class exponential_imperfection(imperfection):
             # AHA_inv = torch.linalg.inv(AHA)
 
             # Heavy batching for AHb
-            for t1 in tqdm(range(0, T, temporal_batch_size), 'Least Squares Interpolators', disable=not self.verbose):
+            for t1 in tqdm(range(0, T, temporal_batch_size), 'Least Squares AHb Loop', disable=not self.verbose):
                 t2 = min(t1 + temporal_batch_size, T)
 
                 # Compute AHb
@@ -486,13 +487,13 @@ class exponential_imperfection(imperfection):
         features : torch.Tensor
             The features of the imperfection with shape (*trj_size, nfeat)
         """
-        if self.method == 'ts' and self.interp_type == 'zero':
-            self.temporal_funcs /= self.temporal_funcs.abs().max()
-            features = torch.cat((self.alphas, 
-                                self.temporal_funcs.real, 
-                                self.temporal_funcs.imag), dim=0)
-        else:
-            features = self.alphas
+        # if self.method == 'ts' and self.interp_type == 'lstsq':
+        #     self.temporal_funcs /= self.temporal_funcs.abs().max()
+        #     features = torch.cat((self.alphas, 
+        #                         self.temporal_funcs.real, 
+        #                         self.temporal_funcs.imag), dim=0)
+        # else:
+        features = self.alphas
         features = rearrange(features, 'nfeat ... -> ... nfeat')
         return features
     

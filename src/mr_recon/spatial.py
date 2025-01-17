@@ -182,7 +182,8 @@ def fourier_resize(x, new_shape, window='hamming'):
 
 def spatial_resize(x: torch.Tensor,
                    im_size: tuple, 
-                   method: Optional[str] = 'bilinear') -> torch.Tensor:
+                   method: Optional[str] = 'bilinear',
+                   window: Optional[str] = 'boxcar') -> torch.Tensor:
     """
     Resize a spatial tensor to a new spatial size.
 
@@ -198,6 +199,8 @@ def spatial_resize(x: torch.Tensor,
             - 'bicubic': cubic interpolation
             - 'nearest': nearest sample interpolation
             - 'fourier': Fourier interpolation
+    window : (Optional[str])
+        The window to apply to the fourier interpolation
     
     Returns:
     --------
@@ -211,7 +214,7 @@ def spatial_resize(x: torch.Tensor,
     x_flt = x.reshape((-1, *orig_im_size))
 
     if method == 'fourier':
-        x_rs_flt = fourier_resize(x_flt, im_size)
+        x_rs_flt = fourier_resize(x_flt, im_size, window=window)
     else:
         grd = 2 * gen_grd(im_size).to(x.device)
         grd -= grd.min()
