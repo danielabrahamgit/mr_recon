@@ -4,8 +4,9 @@ from typing import Optional
 from mr_recon.imperfections.spatio_temporal_imperf import spatio_temporal
 from mr_recon.algs import svd_power_method_tall
 from mr_recon.dtypes import complex_dtype
-from einops import rearrange, einsum
 from mr_recon.utils import gen_grd
+from einops import rearrange, einsum
+from tqdm import tqdm
 
 """
 All of these techniques are used to decompose a spatio-temporal imperfection:
@@ -87,25 +88,30 @@ def svd_decomp_operator(st_imperf: spatio_temporal,
 
     nvox = torch.prod(torch.tensor(st_imperf.im_size)).item()
     ntrj = torch.prod(torch.tensor(st_imperf.trj_size)).item()
-    if nvox < ntrj:
-        fast_axis = 'spatial'
-    else:
-        fast_axis = 'temporal'
+    if fast_axis is None:
+        if nvox < ntrj:
+            fast_axis = 'spatial'
+        else:
+            fast_axis = 'temporal'
 
     if 'temporal' in fast_axis:
-        U, S, Vh = svd_power_method_tall(A=st_imperf.adjoint_matrix_prod, 
-                                        AHA=st_imperf.adjoint_forward_matrix_prod,
-                                        inp_dims=st_imperf.trj_size,
-                                        rank=L,
-                                        device=st_imperf.torch_dev)
+        A = lambda x : st_imperf.adjoint_matrix_prod(x[None,])[0]
+        AHA = lambda x : st_imperf.gram_temporal_prod(x[None,])[0]
+        U, S, Vh = svd_power_method_tall(A=A,
+                                         AHA=AHA,
+                                         inp_dims=st_imperf.trj_size,
+                                         rank=L,
+                                         device=st_imperf.torch_dev)
         spatial_funcs = rearrange(U * (S ** 0.5), '... L -> L ...').conj()
         temporal_funcs = einsum(Vh, (S ** 0.5), 'L ..., L -> L ...').conj()
     elif 'spatial' in fast_axis:
-        U, S, Vh = svd_power_method_tall(A=st_imperf.forward_matrix_prod, 
-                                        AHA=st_imperf.forward_adjoint_matrix_prod,
-                                        inp_dims=st_imperf.im_size,
-                                        rank=L,
-                                        device=st_imperf.torch_dev)
+        A = lambda x : st_imperf.forward_matrix_prod(x[None,])[0]
+        AHA = lambda x : st_imperf.gram_spatial_prod(x[None,])[0]
+        U, S, Vh = svd_power_method_tall(A=A,
+                                         AHA=AHA,
+                                         inp_dims=st_imperf.im_size,
+                                         rank=L,
+                                         device=st_imperf.torch_dev)
         temporal_funcs = rearrange(U * (S ** 0.5), '... L -> L ...')
         spatial_funcs = einsum(Vh, (S ** 0.5), 'L ..., L -> L ...')
 
@@ -208,7 +214,7 @@ def temporal_segmentation(st_imperf: spatio_temporal,
     grd = (grd + torch.tensor(im_size)//2).type(torch.int).T
     grd = grd.to(st_imperf.torch_dev)
     for i in range(L):
-        temp_features = torch.tile(clusters[i, None, :], (grd.shape[1], 1))
+        temp_features = torch.tile(clusters[:, None, i], (1, grd.shape[1]))
         spatial_funcs[i, ...] = st_imperf.matrix_access(grd, temp_features).reshape(im_size)
 
     # Compute temporal basis functions
@@ -228,8 +234,8 @@ def temporal_segmentation(st_imperf: spatio_temporal,
 
         # Next compute AHy, which is essentially int_r W(r, t) * b_l(r).conj() dr
         AHy = torch.zeros((L, *st_imperf.trj_size), device=st_imperf.torch_dev, dtype=complex_dtype)
-        for i in range(L):
-            AHy[i, ...] = st_imperf.forward_matrix_prod(spatial_funcs[i].conj()) / grd.shape[1]
+        for i in tqdm(range(L), 'Least Squares Forward Pass'):
+            AHy[i, ...] = st_imperf.forward_matrix_prod(spatial_funcs[None, i].conj())[0] / grd.shape[1]
 
         # Solve for h_l(t) using least squares
         AHA_inv = torch.linalg.pinv(AHA)
