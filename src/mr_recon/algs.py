@@ -168,7 +168,7 @@ def svd_power_method_tall(A: callable,
     for r in tqdm(range(rank), 'SVD Iterations', disable=not verbose):
         # Power method to calc u_i sigma_i v_i
         x0 = torch.randn(inp_dims, device=device, dtype=inp_dtype)
-        v, _ = power_method_operator(AHA_resid_operator, x0, num_iter=niter, verbose=False)
+        v, _ = power_method_operator(AHA_resid_operator, x0, num_iter=niter, verbose=True)
         v = v / torch.linalg.norm(v)
         u = A_resid_operator(v)
         sigma = torch.linalg.norm(u)

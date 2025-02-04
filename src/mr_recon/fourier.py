@@ -291,6 +291,28 @@ class sigpy_nufft(NUFFT):
         else:
             self.beta = beta
     
+    def _apodize_1d(self, 
+                    x: torch.Tensor) -> torch.Tensor:
+        """
+        1D apodization for the NUFFT
+        
+        Parameters:
+        -----------
+        x : torch.Tensor <float>
+            Arb shape signal between [-1/2, 1/2]
+            
+        Returns:
+        --------
+        apod : torch.Tensor <float>
+            apodization evaluated at input x
+        """
+
+        apod = (
+            self.beta**2 - (np.pi * self.width * x / self.oversamp) ** 2
+        ) ** 0.5
+        apod /= torch.sinh(apod)
+        return apod
+    
     def forward_FT_only(self, 
                         img: torch.Tensor) -> torch.Tensor:
         """
@@ -422,6 +444,34 @@ class sigpy_nufft(NUFFT):
                         ksp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
             ksp_ret /= width ** ndim
         return np_to_torch(ksp_ret)
+
+    def adjoint_grid_only(self,
+                          ksp: torch.Tensor, 
+                          trj: torch.Tensor):
+        # Convert to cupy first
+        ksp_cp, trj_cp = torch_to_np(ksp, trj)
+        
+        # Consts
+        width = self.width
+        oversamp = self.oversamp
+        beta = self.beta
+        ndim = trj_cp.shape[-1]
+        N = trj.shape[0]
+        im_size = self.im_size
+        oshape = (N, *ksp.shape[1:-(trj.ndim-2)], *im_size)
+        os_shape = _get_oversamp_shape(oshape, ndim, oversamp)
+
+        # Gridding
+        dev = sp.get_device(trj_cp)
+        with dev:
+            trj_cp = _scale_coord(trj_cp, oshape, oversamp)
+            output = dev.xp.zeros(os_shape, dtype=np_complex_dtype)
+            for i in range(N):
+                output[i] = sp.interp.gridding(ksp_cp[i], trj_cp[i], os_shape[1:], 
+                                                 kernel='kaiser_bessel', width=width, param=beta)
+            output /= width**ndim
+    
+        return np_to_torch(output)
 
     def adjoint(self, 
                 ksp: torch.Tensor, 
