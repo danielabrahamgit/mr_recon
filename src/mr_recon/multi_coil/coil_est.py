@@ -5,7 +5,7 @@ import sigpy as sp
 from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
-from mr_recon.dtypes import complex_dtype
+from mr_recon import dtypes
 from mr_recon.algs import power_method_matrix
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
@@ -196,7 +196,7 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
         kerns_batch = train_kernels(img_cal, src_vecs[n1:n2], 
                                     fast_method=False, 
                                     solver='solve',
-                                    lamda_tikonov=lamda_tikonov).type(complex_dtype)
+                                    lamda_tikonov=lamda_tikonov).type(dtypes.complex_dtype)
         if kerns is None:
             kerns = kerns_batch
         else:

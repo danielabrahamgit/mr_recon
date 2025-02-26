@@ -3,7 +3,7 @@ import torch
 from tqdm import tqdm
 from typing import Optional
 from einops import rearrange, einsum, reduce
-from mr_recon.dtypes import complex_dtype, real_dtype
+from mr_recon import dtypes
 from mr_recon.fourier import sigpy_nufft
 from mr_recon.algs import lin_solve, svd_power_method_tall
 from mr_recon.imperfections.imperfection import imperfection
@@ -66,9 +66,11 @@ class exponential_imperfection(imperfection):
             self.exp_scale = 1
 
         assert alphas.device == self.torch_dev, 'alphas and phis must be on same device'
-        assert alphas.dtype == real_dtype, 'alphas must be float32'
-        assert phis.dtype == real_dtype, 'phis must be float32'
-
+        assert alphas.dtype == dtypes.real_dtype, f'alphas must be {dtypes.real_dtype}'
+    
+        if method != 'ts':
+            assert phis.dtype == dtypes.real_dtype,   f'phis must be {dtypes.real_dtype}'
+        
         self.custom_clusters = custom_clusters
         super().__init__(L, method, interp_type, verbose)
 
@@ -104,7 +106,7 @@ class exponential_imperfection(imperfection):
         else:
             method = 'cluster'
         if self.custom_clusters is not None:
-            self.alpha_clusters = self.custom_clusters.type(real_dtype)
+            self.alpha_clusters = self.custom_clusters.type(self.phis.dtype)
             # diffs = reduce(-self.alpha_clusters, self.alphas, 'L B, B ... -> L B ...',
             #                reduction='sum').norm(dim=1)
             tup = (slice(None), slice(None),) + (None,) * (self.alphas.ndim - 1)
@@ -112,14 +114,14 @@ class exponential_imperfection(imperfection):
             idxs = diffs.argmin(dim=0)
         else:
             alpha_clusters, idxs = quantize_data(self.alphas.reshape((self.B, -1)).T, 
-                                                self.L, method=method)
-            self.alpha_clusters = alpha_clusters
+                                                self.L, method=method, verbose=self.verbose)
+            self.alpha_clusters = alpha_clusters.to(self.phis.dtype)
             idxs = idxs.reshape(self.trj_size)
             
         if 'lstsq' in self.interp_type:
 
             # Flatten spatial and temporal terms
-            alphas_flt = rearrange(self.alphas, 'nbasis ... -> (...) nbasis')
+            alphas_flt = rearrange(self.alphas, 'nbasis ... -> (...) nbasis').to(self.phis.dtype)
             phis_flt = rearrange(self.phis, 'nbasis ... -> (...) nbasis')
             T = alphas_flt.shape[0]
             N = phis_flt.shape[0]
@@ -133,11 +135,11 @@ class exponential_imperfection(imperfection):
 
             # Desired temporal functions
             interp_funcs = torch.zeros((self.L, T),
-                                        dtype=complex_dtype, device=self.torch_dev)
+                                        dtype=dtypes.complex_dtype, device=self.torch_dev)
             
             # Compute AHA
             AHA = torch.zeros((self.L, self.L), 
-                              dtype=complex_dtype, device=self.torch_dev)
+                              dtype=dtypes.complex_dtype, device=self.torch_dev)
             for n1 in tqdm(range(0, N, spatial_batch_size), 'Least Squares AHA Loop', disable=not self.verbose):
                 n2 = min(n1 + spatial_batch_size, N)
                 A_batch = phis_flt[n1:n2] @ self.alpha_clusters.T
@@ -151,7 +153,7 @@ class exponential_imperfection(imperfection):
 
                 # Compute AHb
                 AHb = torch.zeros((self.L, t2 - t1), 
-                                dtype=complex_dtype, device=self.torch_dev)
+                                dtype=dtypes.complex_dtype, device=self.torch_dev)
 
                 # Sketch over voxel dimension
                 if sketch_AHb:
@@ -178,7 +180,7 @@ class exponential_imperfection(imperfection):
             raise NotImplementedError
         elif 'zero' in self.interp_type:
             # Indicator function
-            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=complex_dtype, device=self.torch_dev)
+            interp_funcs = torch.zeros((self.L, *self.trj_size,), dtype=dtypes.complex_dtype, device=self.torch_dev)
             for i in range(self.L):
                 interp_funcs[i, ...] = 1.0 * (idxs == i)
         else:
@@ -248,7 +250,7 @@ class exponential_imperfection(imperfection):
         def A(x):
             x = x.reshape((-1))
             nvox = torch.prod(torch.tensor(self.im_size)).item()
-            y = torch.zeros((nvox,), dtype=complex_dtype, device=x.device)
+            y = torch.zeros((nvox,), dtype=dtypes.complex_dtype, device=x.device)
             for n1, n2 in batch_iterator(nvox, spatial_batch_size):
                 y[n1:n2] = self._build_spatio_temporal_matrix(r_slice=slice(n1, n2), 
                                                               t_slice=slice(None), 
@@ -260,7 +262,7 @@ class exponential_imperfection(imperfection):
             y = y.reshape((-1))
             nvox = torch.prod(torch.tensor(self.im_size)).item()
             ntrj = torch.prod(torch.tensor(self.trj_size)).item()
-            x = torch.zeros((ntrj,), dtype=complex_dtype, device=y.device)
+            x = torch.zeros((ntrj,), dtype=dtypes.complex_dtype, device=y.device)
             for n1, n2 in batch_iterator(nvox, spatial_batch_size):
                 x += self._build_spatio_temporal_matrix(r_slice=slice(n1, n2), 
                                                         t_slice=slice(None), 
@@ -319,7 +321,7 @@ class exponential_imperfection(imperfection):
         freqs = nufft.rescale_trajectory(phis * nro)[0, ..., None]
 
         # Compute phase_0 to make sure that no phase is applied at first time point
-        x_0 = torch.zeros((nro,), dtype=complex_dtype, device=self.torch_dev)
+        x_0 = torch.zeros((nro,), dtype=dtypes.complex_dtype, device=self.torch_dev)
         x_0[0] = 1
         phase_0 = nufft(x_0[None,], freqs[None,])[0] * nro / nvox # scaling nro / nvox helps with numerical stability
 

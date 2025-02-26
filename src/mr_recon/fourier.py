@@ -10,7 +10,7 @@ from torchkbnufft import KbNufft, KbNufftAdjoint
 from einops import einsum, rearrange
 from scipy.special import jv
 from math import ceil, floor
-from mr_recon.dtypes import complex_dtype, np_complex_dtype, real_dtype
+from mr_recon import dtypes
 from mr_recon.pad import PadLast
 from mr_recon.algs import svd_power_method_tall, eigen_decomp_operator
 from mr_recon.indexing import (
@@ -78,7 +78,7 @@ def calc_toep_kernel_helper(nufft_adj_os: callable,
         # Consts
         torch_dev = trj.device
         if weights is None:
-            weights = torch.ones(trj.shape[:-1], dtype=real_dtype, device=torch_dev)
+            weights = torch.ones(trj.shape[:-1], dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert weights.device == torch_dev
         trj_batch = trj.shape[1:-1]
@@ -88,7 +88,7 @@ def calc_toep_kernel_helper(nufft_adj_os: callable,
         d = trj.shape[-1]
         
         # Get toeplitz kernel via adjoint nufft on 1s ksp
-        ksp = torch.ones((N, 1, *trj_batch), device=torch_dev, dtype=complex_dtype)
+        ksp = torch.ones((N, 1, *trj_batch), device=torch_dev, dtype=dtypes.complex_dtype)
         ksp_weighted = ksp * weights[:, None, ...]
         img = nufft_adj_os(ksp_weighted, trj)[:, 0, ...] # (N, *im_size_os)
 
@@ -391,7 +391,7 @@ class sigpy_nufft(NUFFT):
         dev = sp.get_device(trj_cp)
         with dev:
             trj_cp = _scale_coord(trj_cp, img_shape, oversamp)
-            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=np_complex_dtype)
+            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.np_complex_dtype)
             for i in range(N):
                 ksp_ret[i] = sp.interp.interpolate(
                         ksp_os_cp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
@@ -438,7 +438,7 @@ class sigpy_nufft(NUFFT):
 
             # Interpolate
             trj_cp = _scale_coord(trj_cp, img_cp.shape, oversamp)
-            ksp_ret = dev.xp.zeros((N, *img_cp.shape[1:-ndim], *trj.shape[1:-1]), dtype=np_complex_dtype)
+            ksp_ret = dev.xp.zeros((N, *img_cp.shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.np_complex_dtype)
             for i in range(N):
                 ksp_ret[i] = sp.interp.interpolate(
                         ksp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
@@ -465,7 +465,7 @@ class sigpy_nufft(NUFFT):
         dev = sp.get_device(trj_cp)
         with dev:
             trj_cp = _scale_coord(trj_cp, oshape, oversamp)
-            output = dev.xp.zeros(os_shape, dtype=np_complex_dtype)
+            output = dev.xp.zeros(os_shape, dtype=dtypes.np_complex_dtype)
             for i in range(N):
                 output[i] = sp.interp.gridding(ksp_cp[i], trj_cp[i], os_shape[1:], 
                                                  kernel='kaiser_bessel', width=width, param=beta)
@@ -494,7 +494,7 @@ class sigpy_nufft(NUFFT):
         dev = sp.get_device(trj_cp)
         with dev:
             trj_cp = _scale_coord(trj_cp, oshape, oversamp)
-            output = dev.xp.zeros(os_shape, dtype=np_complex_dtype)
+            output = dev.xp.zeros(os_shape, dtype=dtypes.np_complex_dtype)
             for i in range(N):
                 output[i] = sp.interp.gridding(ksp_cp[i], trj_cp[i], os_shape[1:], 
                                                  kernel='kaiser_bessel', width=width, param=beta)
@@ -585,7 +585,7 @@ class torchkb_nufft(NUFFT):
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
         ksp = self.kb_ob(image=img_torchkb, omega=omega, norm='ortho')
         ksp = ksp.reshape((N, *img.shape[1:-d], *trj.shape[1:-1]))
-        return ksp * self.oversamp
+        return ksp * np.sqrt(self.oversamp) # NOTE: scaling updated as sqrt to match sigpy scaling
 
     def adjoint(self,
                 ksp: torch.Tensor,
@@ -603,7 +603,7 @@ class torchkb_nufft(NUFFT):
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
         img = self.kb_adj_ob(data=ksp_torch_kb, omega=omega, norm='ortho')
         img = img.reshape((N, *ksp.shape[1:-(trj.ndim - 2)], *im_size))
-        return img * self.oversamp
+        return img * np.sqrt(self.oversamp)
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
@@ -676,7 +676,7 @@ class gridded_nufft(NUFFT):
         
         # Return k-space
         ksp = torch.zeros((*img.shape[:-d], *trj.shape[1:-1]), 
-                          dtype=complex_dtype, device=img_torch.device)
+                          dtype=dtypes.complex_dtype, device=img_torch.device)
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
         
@@ -715,7 +715,7 @@ class gridded_nufft(NUFFT):
 
         # Adjoint NUFFT
         ksp_os = torch.zeros((*ksp.shape[:-(trj.ndim - 2)], *grid_os_size), 
-                             dtype=complex_dtype, device=ksp_torch.device)
+                             dtype=dtypes.complex_dtype, device=ksp_torch.device)
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), grid_os_size)
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
@@ -902,7 +902,7 @@ class lr_nufft(NUFFT):
                                                       grid=grid_new_flt[None,],
                                                       mode=mode, 
                                                       align_corners=align_corners)[0]
-        basis_funcs_flt = (basis_funcs_flt_r + 1j * basis_funcs_flt_i).type(complex_dtype)
+        basis_funcs_flt = (basis_funcs_flt_r + 1j * basis_funcs_flt_i).type(dtypes.complex_dtype)
         
         # Reshape
         basis_funcs_flt = basis_funcs_flt.squeeze().reshape((L, *grid_new.shape[:-1]))
@@ -961,7 +961,7 @@ class lr_nufft(NUFFT):
         
         # Return k-space
         ksp = torch.zeros((*img_torch.shape[:-d], *trj.shape[1:-1]), 
-                          dtype=complex_dtype, device=img_torch.device)
+                          dtype=dtypes.complex_dtype, device=img_torch.device)
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
 
@@ -1010,7 +1010,7 @@ class lr_nufft(NUFFT):
 
         # Adjoint NUFFT
         ksp_os = torch.zeros((*ksp_torch.shape[:-(trj.ndim - 2)], *os_size), 
-                             dtype=complex_dtype, device=ksp_torch.device)
+                             dtype=dtypes.complex_dtype, device=ksp_torch.device)
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), os_size)
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
@@ -1127,7 +1127,7 @@ class svd_nufft(NUFFT):
         
         # Return k-space
         ksp = torch.zeros((*img_torch.shape[:-d], *trj.shape[1:-1]), 
-                          dtype=complex_dtype, device=img_torch.device)
+                          dtype=dtypes.complex_dtype, device=img_torch.device)
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
 
@@ -1176,7 +1176,7 @@ class svd_nufft(NUFFT):
 
         # Adjoint NUFFT
         ksp_os = torch.zeros((*ksp_torch.shape[:-(trj.ndim - 2)], *grid_os_size), 
-                             dtype=complex_dtype, device=ksp_torch.device)
+                             dtype=dtypes.complex_dtype, device=ksp_torch.device)
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), grid_os_size)
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
@@ -1232,7 +1232,7 @@ class chebyshev_nufft(NUFFT):
 
         # Make image basis functions
         grd = gen_grd(im_size)
-        b = torch.zeros((d, n_cheby, *im_size),dtype=complex_dtype)
+        b = torch.zeros((d, n_cheby, *im_size),dtype=dtypes.complex_dtype)
         for i in range(d):
             r = grd[..., i]
             for lp in range(n_cheby):
@@ -1268,7 +1268,7 @@ class chebyshev_nufft(NUFFT):
         T = lambda x, n : torch.cos(n * torch.arccos(x))
 
         # Make temporal basis functions
-        h = torch.zeros((d, n_cheby, *trj_size),dtype=complex_dtype)
+        h = torch.zeros((d, n_cheby, *trj_size),dtype=dtypes.complex_dtype)
         for i in range(d):
             k = trj_dev[..., i]
             for lp in range(n_cheby):
@@ -1319,7 +1319,7 @@ class chebyshev_nufft(NUFFT):
 
         # Return k-space
         ksp = torch.zeros((*img.shape[:-d], *trj.shape[1:-1]), 
-                          dtype=complex_dtype, device=img_torch.device)
+                          dtype=dtypes.complex_dtype, device=img_torch.device)
 
         # Batch over basis functions
         for l1, l2 in batch_iterator(L, self.n_batch_size):
@@ -1374,10 +1374,10 @@ class chebyshev_nufft(NUFFT):
         grid_os_size = self.grog_padder.pad_im_size
 
         # Adjoint NUFFT
-        img = torch.zeros((*ksp.shape[:-tb], *self.im_size), dtype=complex_dtype, device=ksp_torch.device)
+        img = torch.zeros((*ksp.shape[:-tb], *self.im_size), dtype=dtypes.complex_dtype, device=ksp_torch.device)
         for l1, l2 in batch_iterator(L, self.n_batch_size):
             ksp_os = torch.zeros((*ksp.shape[:-(trj.ndim - 2)], (l2-l1), *grid_os_size), 
-                                  dtype=complex_dtype, device=ksp_torch.device)
+                                  dtype=dtypes.complex_dtype, device=ksp_torch.device)
             for i in range(N):
                 # Multiply by temporal terms
                 ksp_os[i] = multi_grid(ksp_torch[i].unsqueeze(-tb-1) * self.h[l1:l2].conj(), 
