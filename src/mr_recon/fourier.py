@@ -488,6 +488,14 @@ class triton_nufft(NUFFT):
         N = trj.shape[0]    
 
         # Interpolate
+        dev = sp.get_device(trj_cp)
+        with dev:
+            trj_cp = _scale_coord(trj_cp, img_shape, oversamp)
+            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.np_complex_dtype)
+            for i in range(N):
+                ksp_ret[i] = sp.interp.interpolate(
+                        ksp_os_cp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
+            ksp_ret /= width ** ndim
         trj = self._scale_trj(trj, img_shape)
         ksp_ret = torch.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=complex_dtype, device=ksp_os.device)
         for i in range(N):

@@ -810,7 +810,7 @@ class coil_spatiotemporal_linp(linop):
         if nufft is None:
             nufft = sigpy_nufft(im_size)
         if dcf is None:
-            dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+            dcf = torch.ones(trj_size, dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
         
