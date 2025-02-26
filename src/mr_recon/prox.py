@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import sigpy as sp
 
 from mr_recon.block import Block
-from mr_recon.dtypes import complex_dtype, np_complex_dtype
+from mr_recon import dtypes
 
 
 __all__ = [
@@ -104,7 +104,7 @@ class L1Wav(nn.Module):
         
         # Random stuff
         shift = round(self.rng.uniform(-self.rnd_shift, self.rnd_shift))
-        phase = np.exp(1j * self.rng.uniform(-np.pi, np.pi)).astype(np_complex_dtype)
+        phase = np.exp(1j * self.rng.uniform(-np.pi, np.pi)).astype(dtypes.np_complex_dtype)
 
         # Roll each axis
         nd = len(self.axes)
@@ -120,7 +120,7 @@ class L1Wav(nn.Module):
         # Apply prox
         input_sigpy = self.W.H(sp.thresh.soft_thresh(self.lamda * alpha,
                                                         self.W(input_sigpy)))
-        input_sigpy = input_sigpy.astype(np_complex_dtype)
+        input_sigpy = input_sigpy.astype(dtypes.np_complex_dtype)
         
         # Undo random phase ...
         input_sigpy *= np.conj(phase)
@@ -193,7 +193,7 @@ class LocallyLowRank(nn.Module):
             input_type: Optional[Callable]= None,
     ):
         super().__init__()
-        self.input_type = input_type if input_type is not None else complex_dtype
+        self.input_type = input_type if input_type is not None else dtypes.complex_dtype
         self.hparams = hparams
 
         # Using a fixed random number generator so that recons are consistent
@@ -201,7 +201,7 @@ class LocallyLowRank(nn.Module):
         self.rnd_shift = hparams.rnd_shift
 
         # Derived
-        self.block = Block(self.hparams.block_size, self.hparams.block_stride)
+        self.block = Block(self.hparams.block_size, self.hparams.block_stride, input_type=self.input_type)
         self.block_weights = nn.Parameter(
             self.block.precompute_normalization(input_size).type(self.input_type),
             requires_grad=False,
