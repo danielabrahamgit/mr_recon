@@ -1,7 +1,7 @@
 import torch
 
 from typing import Optional
-from mr_recon.dtypes import real_dtype
+from mr_recon import dtypes
 from mr_recon.utils import gen_grd
 from mr_recon.imperfections.exponential import exponential_imperfection
 
@@ -77,7 +77,7 @@ class coco_imperfection(exponential_imperfection):
         assert d == len(im_size)
 
         # Get gradient from trj
-        trj = trj.type(real_dtype)
+        trj = trj.type(dtypes.real_dtype)
         if d == 2:
             # trj = torch.cat((trj, trj[..., 0:1] * 0), dim=-1)
             # fov += (1,)
@@ -96,7 +96,7 @@ class coco_imperfection(exponential_imperfection):
             grd = torch.stack([grd[..., 0], grd[..., 1]*0, grd[..., 1]], dim=-1)
             
             if rotations is not None:
-                rotations = torch.tensor(rotations, dtype=real_dtype, device=trj.device)
+                rotations = torch.tensor(rotations, dtype=dtypes.real_dtype, device=trj.device)
                 thetas = torch.deg2rad(rotations)
                 Rx = torch.tensor([
                     [1, 0, 0],
