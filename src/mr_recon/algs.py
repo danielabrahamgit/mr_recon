@@ -6,7 +6,7 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
-from mr_recon.dtypes import complex_dtype
+from mr_recon import dtypes
 from sigpy.mri import pipe_menon_dcf
 
 def density_compensation(trj: torch.Tensor,
@@ -102,7 +102,7 @@ def svd_power_method_tall(A: callable,
                           rank: int,
                           inp_dims: tuple,
                           niter: Optional[int] = 100,
-                          inp_dtype: Optional[torch.dtype] = complex_dtype,
+                          inp_dtype: Optional[torch.dtype] = dtypes.complex_dtype,
                           device: Optional[torch.device] = torch.device('cpu'),
                           verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """

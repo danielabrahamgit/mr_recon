@@ -1,7 +1,7 @@
 import torch
 
 from typing import Optional
-from mr_recon.dtypes import real_dtype
+from mr_recon import dtypes
 from mr_recon.imperfections.exponential import exponential_imperfection
 
 class main_field_imperfection(exponential_imperfection):
@@ -41,14 +41,14 @@ class main_field_imperfection(exponential_imperfection):
             toggles print statements
         """
         if torch.is_complex(b0_map):
-            b0_map = b0_map.abs().type(real_dtype)
+            b0_map = b0_map.abs().type(dtypes.real_dtype)
             complex_exp = False
         else:
             complex_exp = True
         phis = b0_map[None, ...] * dt
         nro = trj_size[ro_dim]
         tup = (None,) * ro_dim + (slice(None),) + (None,) * (len(trj_size) - ro_dim - 1)
-        alphas = torch.arange(nro, device=b0_map.device, dtype=real_dtype)[tup]
+        alphas = torch.arange(nro, device=b0_map.device, dtype=dtypes.real_dtype)[tup]
         alphas = alphas[None,] + te / dt
         self.prod1 = torch.prod(torch.tensor(trj_size)[ro_dim:]).item()
         self.prod2 = torch.prod(torch.tensor(trj_size)[ro_dim+1:]).item()
