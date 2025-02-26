@@ -2,10 +2,10 @@ import torch
 import numpy as np
 
 # Define defaults for global variables
-real_dtype = torch.float64
-complex_dtype = torch.complex128
-np_real_dtype = np.float64
-np_complex_dtype = np.complex128
+real_dtype = torch.float32
+complex_dtype = torch.complex64
+np_real_dtype = np.float32
+np_complex_dtype = np.complex64
 
 SUPPORTED_PRECISIONS = ['float32', 'float64']
 
