@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-# Define defaults for global variables
+# Define defaults for global variables. Default float32 precision.
 real_dtype = torch.float32
 complex_dtype = torch.complex64
 np_real_dtype = np.float32
