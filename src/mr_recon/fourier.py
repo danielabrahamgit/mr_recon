@@ -13,6 +13,8 @@ from math import ceil, floor
 from mr_recon.dtypes import complex_dtype, np_complex_dtype, real_dtype
 from mr_recon.pad import PadLast
 from mr_recon.algs import svd_power_method_tall, eigen_decomp_operator
+from mr_recon.triton_interp.interp import interpolate, interpolate_adjoint
+from mr_recon.triton_interp.ungrid import ungrid, ungrid_torch
 from mr_recon.indexing import (
     multi_grid,
     multi_index
@@ -25,7 +27,8 @@ from mr_recon.utils import (
     gen_grd,
     torch_to_np, 
     np_to_torch,
-    batch_iterator)
+    batch_iterator,
+    resize)
 
 def fft(x, dim=None, oshape=None, norm='ortho'):
     """Matches Sigpy's fft, but in torch"""
@@ -274,7 +277,12 @@ class NUFFT(nn.Module):
 
         return img_hat
 
-class sigpy_nufft(NUFFT):
+class triton_nufft(NUFFT):
+    """
+    Uses Mark Nishimura's Triton implimentation of gridding and interpolation 
+    to perform the NUFFT:
+    https://github.com/nishi951/torch-named-linops/blob/main/src/torchlinops/functional/_interp/interp.py
+    """
     
     def __init__(self,
                  im_size: tuple,
@@ -291,8 +299,8 @@ class sigpy_nufft(NUFFT):
         else:
             self.beta = beta
     
-    def _apodize_1d(self, 
-                    x: torch.Tensor) -> torch.Tensor:
+    def _apodization_func(self, 
+                          x: torch.Tensor) -> torch.Tensor:
         """
         1D apodization for the NUFFT
         
@@ -308,10 +316,44 @@ class sigpy_nufft(NUFFT):
         """
 
         apod = (
-            self.beta**2 - (np.pi * self.width * x / self.oversamp) ** 2
+            self.beta**2 - (np.pi * self.width * x) ** 2
         ) ** 0.5
         apod /= torch.sinh(apod)
         return apod
+    
+    def apodize_img(self,
+                    img: torch.Tensor) -> torch.Tensor:
+        """
+        Applies apodization to the input image
+        
+        Parameters:
+        -----------
+        img : torch.Tensor <complex>
+            input image with shape (..., *im_size)
+
+        Returns:
+        --------
+        img_apod : torch.Tensor <complex>
+            apodized image with shape (..., *im_size)
+        """
+        ndim = len(self.im_size)
+        for i in range(-ndim, 0):
+            crds = torch.arange(-(img.shape[i] // 2), img.shape[i] // 2, device=img.device)
+            tup = (slice(None),) + (None,) * (-i-1)
+            img *= self._apodization_func(crds / ceil(self.oversamp * img.shape[i]))[tup]
+        return img
+    
+    def _scale_trj(self, trj, shape):
+        ndim = trj.shape[-1]
+        output = trj.clone()
+        oversamp = self.oversamp
+        for i in range(-ndim, 0):
+            scale = ceil(oversamp * shape[i]) / shape[i]
+            shift = ceil(oversamp * shape[i]) // 2
+            output[..., i] *= scale
+            output[..., i] += shift
+
+        return output
     
     def forward_FT_only(self, 
                         img: torch.Tensor) -> torch.Tensor:
@@ -331,31 +373,23 @@ class sigpy_nufft(NUFFT):
         ksp_os : torch.Tensor <complex>
             k-space grid with shape (N, *img_batch, *im_size_os)
         """
-        # Convert to cupy first
-        img_cp = torch_to_np(img)
         
         # Consts
-        width = self.width
         oversamp = self.oversamp
-        beta = self.beta
         ndim = len(self.im_size)
-        os_shape = _get_oversamp_shape(img_cp.shape, ndim, oversamp)
+        os_shape = list(img.shape)[:-ndim] + [ceil(oversamp * i) for i in img.shape[-ndim:]]
 
-        dev = sp.get_device(img_cp)
-        with dev:
-        
-            ksp_os = img_cp.copy()
+        # Apodize
+        img_apod = img.clone()
+        if self.apodize:
+            img_apod = self.apodize_img(img_apod)
 
-            # Apodize
-            if self.apodize:
-                _apodize(ksp_os, ndim, oversamp, width, beta)
+        # Zero-pad
+        img_apod /= np.prod(img_apod.shape[-ndim:])**0.5
+        img_zp = resize(img_apod, os_shape)
 
-            # Zero-pad
-            ksp_os /= sp.util.prod(img_cp.shape[-ndim:])**0.5
-            ksp_os = sp.util.resize(ksp_os, os_shape)
-
-            # FFT
-            ksp_os = fft(np_to_torch(ksp_os), dim=tuple(range(-ndim, 0)), norm=None)
+        # FFT
+        ksp_os = fft(img_zp, dim=tuple(range(-ndim, 0)), norm=None)
 
         return ksp_os
 
@@ -375,23 +409,255 @@ class sigpy_nufft(NUFFT):
         ksp : torch.Tensor <complex>
             k-space with shape (N, *img_batch, *trj_size)
         """
-        # Convert to cupy first
-        ksp_os_cp = torch_to_np(ksp_os)
-        trj_cp = torch_to_np(trj)
 
+        # Consts
+        width = self.width
+        beta = self.beta
+        ndim = len(self.im_size)
+        img_shape = (*ksp_os.shape[:-ndim], *self.im_size)
+        N = trj.shape[0]    
+
+        # Interpolate
+        trj = self._scale_trj(trj, img_shape)
+        ksp_ret = torch.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=complex_dtype, device=ksp_os.device)
+        for i in range(N):
+            ksp_ret[i] = interpolate(ksp_os[i], trj[i], width=(width,)*ndim, 
+                                     kernel='kaiser_bessel', 
+                                     kernel_params={'beta':beta}, 
+                                     pad_mode='circular')
+        ksp_ret /= width ** ndim
+        return np_to_torch(ksp_ret)
+    
+    def forward(self,
+                img: torch.Tensor,
+                trj: torch.Tensor) -> torch.Tensor:
+        return self.forward_interp_only(self.forward_FT_only(img), trj)
+    
+    def adjoint_iFT_only(self,
+                         ksp_os: torch.Tensor) -> torch.Tensor:
+        # Consts
+        oversamp = self.oversamp
+        ndim = len(self.im_size)
+        im_size = self.im_size
+        oshape = (*ksp_os.shape[:-ndim], *im_size)
+        os_shape = list(oshape)[:-ndim] + [ceil(oversamp * i) for i in oshape[-ndim:]]
+        
+        # iFFT
+        img_os = ifft(ksp_os, dim=tuple(range(-ndim, 0)), norm=None)
+
+        # Crop
+        output = resize(img_os, oshape)
+        output *= np.prod(os_shape[-ndim:]) / np.prod(oshape[-ndim:])**0.5
+
+        # Apodize
+        if self.apodize:
+            output = self.apodize_img(output)
+
+        return output
+    
+    def adjoint_grid_only(self,
+                          ksp: torch.Tensor, 
+                          trj: torch.Tensor):
+        
         # Consts
         width = self.width
         oversamp = self.oversamp
         beta = self.beta
-        ndim = len(self.im_size)
-        img_shape = (*ksp_os_cp.shape[:-ndim], *self.im_size)
+        ndim = trj.shape[-1]
         N = trj.shape[0]
+        im_size = self.im_size
+        oshape = (N, *ksp.shape[1:-(trj.ndim-2)], *im_size)
+        os_shape = _get_oversamp_shape(oshape, ndim, oversamp)
+
+        # Gridding
+        trj = self._scale_trj(trj, oshape)
+        output = torch.zeros(os_shape, dtype=complex_dtype, device=ksp.device)
+        for i in range(N):
+            output[i] = interpolate_adjoint(ksp[i], trj[i], os_shape[-ndim:], 
+                                            kernel='kaiser_bessel', width=(width,)*ndim, kernel_params={'beta':beta})
+        output /= width**ndim
+    
+        return output
+
+    def adjoint(self, 
+                ksp: torch.Tensor, 
+                trj: torch.Tensor) -> torch.Tensor:
+        return self.adjoint_iFT_only(self.adjoint_grid_only(ksp, trj))
+
+    def calc_teoplitz_kernels(self,
+                              trj: torch.Tensor,
+                              weights: Optional[torch.Tensor] = None,
+                              os_factor: Optional[float] = 2.0,):
+        """
+        Calculate the Toeplitz kernels for the NUFFT
+
+        Parameters:
+        -----------
+        trj : torch.Tensor <float>
+            input trajectory with shape (N, *trj_batch, len(im_size))
+        weights : torch.Tensor <float>
+            weighting function with shape (N, *trj_batch)
+        os_factor : float
+            oversampling factor for toeplitz
+
+        Returns:
+        --------
+        toeplitz_kernels : torch.Tensor <complex>
+            the toeplitz kernels with shape (N, *im_size_os)
+            where im_size_os is the oversampled image size
+        """
+
+        # Consts
+        im_size_os = tuple([round(i * os_factor) for i in self.im_size])
+
+        # Make new instance of NUFFT with oversampled image size
+        nufft_os = triton_nufft(im_size=im_size_os, 
+                               oversamp=self.oversamp, width=self.width)
+
+        return calc_toep_kernel_helper(nufft_os.adjoint, trj * os_factor, weights) * (os_factor ** len(self.im_size))
+
+class sigpy_nufft(NUFFT):
+    
+    def __init__(self,
+                 im_size: tuple,
+                 oversamp: Optional[float] = 1.25,
+                 width: Optional[int] = 6,
+                 beta: Optional[float] = None,
+                 apodize: Optional[bool] = True):
+        super().__init__(im_size)
+        self.oversamp = oversamp
+        self.width = width
+        self.apodize = apodize
+        if beta is None:
+            self.beta = np.pi * (((width / oversamp) * (oversamp - 0.5))**2 - 0.8)**0.5
+        else:
+            self.beta = beta
+    
+    def _apodization_func(self, 
+                          x: torch.Tensor) -> torch.Tensor:
+        """
+        1D apodization for the NUFFT
+        
+        Parameters:
+        -----------
+        x : torch.Tensor <float>
+            Arb shape signal between [-1/2, 1/2]
+            
+        Returns:
+        --------
+        apod : torch.Tensor <float>
+            apodization evaluated at input x
+        """
+
+        apod = (
+            self.beta**2 - (np.pi * self.width * x) ** 2
+        ) ** 0.5
+        apod /= torch.sinh(apod)
+        return apod
+    
+    def _scale_trj(self, trj, shape):
+        ndim = trj.shape[-1]
+        output = trj.clone()
+        oversamp = self.oversamp
+        for i in range(-ndim, 0):
+            scale = ceil(oversamp * shape[i]) / shape[i]
+            shift = ceil(oversamp * shape[i]) // 2
+            output[..., i] *= scale
+            output[..., i] += shift
+
+        return output
+    
+    def apodize_img(self,
+                    img: torch.Tensor) -> torch.Tensor:
+        """
+        Applies apodization to the input image
+        
+        Parameters:
+        -----------
+        img : torch.Tensor <complex>
+            input image with shape (..., *im_size)
+
+        Returns:
+        --------
+        img_apod : torch.Tensor <complex>
+            apodized image with shape (..., *im_size)
+        """
+        ndim = len(self.im_size)
+        for i in range(-ndim, 0):
+            crds = torch.arange(img.shape[i], device=img.device) - img.shape[i] // 2
+            tup = (slice(None),) + (None,) * (-i-1)
+            img *= self._apodization_func(crds / ceil(self.oversamp * img.shape[i]))[tup]
+        return img
+    
+    def forward_FT_only(self, 
+                        img: torch.Tensor) -> torch.Tensor:
+        """
+        Only does the FT part of the nufft. This includes
+        - apodization 
+        - zero padding 
+        - fft 
+
+        Parameters:
+        -----------
+        img : torch.Tensor <complex>
+            input image with shape (N, *img_batch, *im_size)
+        
+        Returns:
+        --------
+        ksp_os : torch.Tensor <complex>
+            k-space grid with shape (N, *img_batch, *im_size_os)
+        """
+        # Consts
+        oversamp = self.oversamp
+        ndim = len(self.im_size)
+        os_shape = list(img.shape)[:-ndim] + [ceil(oversamp * i) for i in img.shape[-ndim:]]
+
+        # Apodize
+        img_apod = img.clone()
+        if self.apodize:
+            img_apod = self.apodize_img(img_apod)
+
+        # Zero-pad
+        img_apod /= np.prod(img_apod.shape[-ndim:])**0.5
+        img_zp = resize(img_apod, os_shape)
+
+        # FFT
+        ksp_os = fft(img_zp, dim=tuple(range(-ndim, 0)), norm=None)
+
+        return ksp_os
+
+    def forward_interp_only(self,
+                            ksp_os: torch.Tensor,
+                            trj: torch.Tensor) -> torch.Tensor:
+        """
+        Only does the interpolation part of the nufft. Input is output of forward_FT_only.
+
+        Parameters:
+        -----------
+        ksp_os : torch.Tensor <complex>
+            k-space grid with shape (N, *img_batch, *im_size_os)
+
+        Returns:
+        --------
+        ksp : torch.Tensor <complex>
+            k-space with shape (N, *img_batch, *trj_size)
+        """
+
+        # Consts
+        width = self.width
+        beta = self.beta
+        ndim = len(self.im_size)
+        img_shape = (*ksp_os.shape[:-ndim], *self.im_size)
+        N = trj.shape[0]
+        
+        # Scale trajectory and move to cupy
+        trj_cp = torch_to_np(self._scale_trj(trj, img_shape))
+        ksp_os_cp = torch_to_np(ksp_os)
 
         # Interpolate
-        dev = sp.get_device(trj_cp)
+        dev = sp.get_device(ksp_os_cp)
         with dev:
-            trj_cp = _scale_coord(trj_cp, img_shape, oversamp)
-            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=np_complex_dtype)
+            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj_cp.shape[1:-1]), dtype=np_complex_dtype)
             for i in range(N):
                 ksp_ret[i] = sp.interp.interpolate(
                         ksp_os_cp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
@@ -408,7 +674,7 @@ class sigpy_nufft(NUFFT):
         NUFFT implimentation, which feels so very wrong, and then augment 
         the KB inerpolate part :')
         """
-
+        return self.forward_interp_only(self.forward_FT_only(img), trj)
         # Convert to cupy first
         img_cp, trj_cp = torch_to_np(img, trj)
         

@@ -35,7 +35,8 @@ def gfactor_SENSE_PMR(R_ref: callable,
     gfactor : torch.Tensor
         g-factor map with same size as image.
     """
-    
+    if n_replicas <= 1:
+        return 0 * R_ref(ksp_ref).abs()
     var_ref = calc_variance_PMR(R_ref, ksp_ref, noise_var, n_replicas, verbose)
     var_acc = calc_variance_PMR(R_acc, ksp_acc, noise_var, n_replicas, verbose)
     gfactor = (var_acc / var_ref).sqrt()
