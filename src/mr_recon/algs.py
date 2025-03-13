@@ -8,6 +8,8 @@ from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon import dtypes
 from sigpy.mri import pipe_menon_dcf
+from cupyx.scipy.sparse.linalg import eigsh
+from logging import warning
 
 def density_compensation(trj: torch.Tensor,
                          im_size: tuple,
@@ -184,6 +186,61 @@ def svd_power_method_tall(A: callable,
     Vh = torch.stack(V, dim=0).conj()
 
     return U, S, Vh
+
+def svd_matrix_method_tall(A: torch.Tensor,
+                           rank: int,
+                           niter: Optional[int] = None,
+                           verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Perform SVD on matrix A using eigh matrix method. This returns the compact SVD.
+
+    Parameters:
+    -----------
+    A : torch.Tensor
+        input matrix with shape (N, M)
+    rank : int
+        rank of the SVD
+    niter : int
+        number of iterations to run lobpcg
+    verbose : bool
+        toggles progress bar
+    
+    Returns:
+    --------
+    U : torch.Tensor
+        left singular vectors with shape (N, rank)
+    S : torch.Tensor
+        singular values with shape (rank)
+    Vh : torch.Tensor
+        right singular vectors with shape (rank, M)
+    """
+    # HACK -- torch lobpcg doesn't support complex numbers
+    AHA = A.H @ A
+    Ar_top = torch.cat([AHA.real, -AHA.imag], dim=1)
+    Ar_bot = torch.cat([AHA.imag, AHA.real], dim=1)
+    Ar = torch.cat([Ar_top, Ar_bot], dim=0)
+    
+    # Compute real eigen decomposition
+    M = AHA.shape[-1]
+    sig_squaredr, Vhr = torch.lobpcg(Ar, k=2*rank, niter=niter)
+    
+    # Sort by singular values
+    idx = torch.argsort(sig_squaredr, descending=True)
+    sig_squaredr = sig_squaredr[idx]
+    Vhr = Vhr[..., idx]
+    
+    # Convert to complex
+    Vh1 =       Vhr[..., :M, ::2] + 1j * Vhr[..., M:, ::2]
+    Vh2 = -1j * Vhr[..., :M, 1::2] +     Vhr[..., M:, 1::2]
+    sgns = torch.logical_and((Vh1.real * Vh2.real).mean(dim=-2) > 0, (Vh1.imag * Vh2.imag).mean(dim=-2) > 0)
+    sgns = sgns.float() * 2 - 1
+    Vh = (Vh1 + Vh2 * sgns)/2
+    sig_squared = sig_squaredr[..., ::2]
+    
+    # Compute U
+    Vh = Vh.H
+    U = (A @ Vh.H / sig_squared ** 0.5)
+    return U, sig_squared ** 0.5, Vh
 
 def power_method_matrix(M: torch.Tensor,
                         vec_init: Optional[torch.Tensor] = None,
@@ -382,7 +439,7 @@ def inverse_power_method_operator(A: callable,
 def lin_solve(AHA: torch.Tensor, 
               AHb: torch.Tensor, 
               lamda: Optional[float] = 0.0, 
-              solver: Optional[int] = 'lstsq') -> torch.Tensor:
+              solver: Optional[int] = 'solve') -> torch.Tensor:
     """
     Solves (AHA + lamda I) @ x = AHb for x
 
@@ -443,6 +500,7 @@ def FISTA(AHA: nn.Module,
           proxg: callable, 
           num_iters: Optional[int] = 20,
           ptol_exit: Optional[float] = 0.5,
+          return_ptols: Optional[bool] = False,
           verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Solves ||Ax - b||_2^2 + lamda ||Gx||_1, where G is a linear function.
@@ -460,6 +518,8 @@ def FISTA(AHA: nn.Module,
         Number of iterations
     ptol_exit : float
         percent tolerance exit condition
+    return_ptols : bool
+        toggles return of ptols
     verbose : bool
         toggles print statements
 
@@ -475,7 +535,8 @@ def FISTA(AHA: nn.Module,
     
     if num_iters <= 0:
         return x
-
+    
+    ptols = []
     for k in tqdm(range(0, num_iters), 'FISTA Iterations', disable=not verbose):
 
         x_old = x.clone()
@@ -489,11 +550,14 @@ def FISTA(AHA: nn.Module,
             step  = k/(k + 3)
             z     = x + step * (x - x_old)
         ptol = 100 * torch.norm(x_old - x)/torch.norm(x)
+        ptols.append(ptol.item())
         if ptol < ptol_exit:
             if verbose:
                 print(f'Tolerance reached after {k+1} iterations, exiting FISTA')
             break
-        
+    
+    if return_ptols:
+        return ptols, x
     return x
 
 def gradient_descent(AHA: nn.Module,

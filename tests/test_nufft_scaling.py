@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import sigpy as sp
-from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft
+from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft, triton_nufft
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
 from einops import rearrange, einsum
 
@@ -20,22 +20,26 @@ try:
     torch_dev = torch.device(device_idx)
 except:
     torch_dev = torch.device('cpu')
-im_size = (220, 220)
+d = 2
+im_size = (50,)*d
 rtol = 5e-2 
 eps = 1e-2
 
 # Make grid and k-space coordinates
 grd = gen_grd(im_size).to(torch_dev)
-crds = (torch.rand((1000, 2), dtype=torch.float32, device=torch_dev) - 0.5)
-crds[..., 0] *= im_size[0] * 0.99
-crds[..., 1] *= im_size[1] * 0.99
-crds = torch.round(crds * grd_os) / grd_os
+crds = (torch.rand((1000, d), dtype=torch.float32, device=torch_dev) - 0.5)
+for i in range(d):
+    crds[..., i] *= im_size[i]
+# crds = torch.round(crds * grd_os) / grd_os
 img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
+img = torch.randn_like(img)
 
 # Create nuffts
-grd_nufft = gridded_nufft(im_size, grd_os)
-nuffts = [grd_nufft]
-names = ['gridded nufft']
+# grd_nufft = gridded_nufft(im_size, grd_os)
+sp_nufft = sigpy_nufft(im_size)
+tr_nufft = triton_nufft(im_size)
+nuffts = [sp_nufft, tr_nufft]
+names = ['sigpy_nufft', 'triton_nufft']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.show()

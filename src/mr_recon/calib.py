@@ -5,6 +5,7 @@ from einops import rearrange, einsum
 import numpy as np
 import sigpy as sp
 import sigpy.mri as mri
+from sympy import use
 import torch
 from torchkbnufft import (
     KbNufft,
@@ -239,7 +240,8 @@ def synth_cal(ksp: torch.Tensor,
               cal_size: Union[tuple, int],
               trj: Optional[torch.Tensor] = None,
               dcf: Optional[torch.Tensor] = None,
-              num_iter: Optional[int] = 0) -> torch.Tensor:
+              num_iter: Optional[int] = 0,
+              use_toeplitz: Optional[bool] = False) -> torch.Tensor:
     """
     Synthesizes a calibration region from data.
     
@@ -255,6 +257,8 @@ def synth_cal(ksp: torch.Tensor,
         density compensation function with shape (*trj_size)
     num_iter: int
         number of conj gradient iterations for estimating rectilinear calib from non-cart data
+    use_toeplitz: bool
+        use toeplitz nufft for estimating rectilinear calib from non-cart data
     
     Returns:
     --------
@@ -286,7 +290,7 @@ def synth_cal(ksp: torch.Tensor,
             dcf_cut = None
         
         # Recon
-        A = multi_chan_linop((C, *cal_size), trj_cut, dcf_cut)
+        A = multi_chan_linop((C, *cal_size), trj_cut, dcf_cut, use_toeplitz=use_toeplitz)
         img_cal = CG_SENSE_recon(A, ksp_cut, max_iter=num_iter, lamda_l2=0.0, max_eigen=1.0, verbose=False)
         ksp_cal = fft(img_cal, dim=tuple(range(-D, 0)))
     

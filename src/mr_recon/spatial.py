@@ -5,7 +5,7 @@ from typing import Optional
 from torch.nn.functional import conv1d
 from einops import rearrange
 from mr_recon.fourier import fft, ifft
-from mr_recon.utils import gen_grd, torch_to_np, np_to_torch, apply_window
+from mr_recon.utils import gen_grd, torch_to_np, np_to_torch, apply_window, resize
 
 def derivative(u: torch.Tensor,
                dim: Optional[int] = -1,
@@ -154,31 +154,21 @@ def laplacian(u: torch.Tensor,
 
 def fourier_resize(x, new_shape, window='hamming'):
 
-    # Get GPU dev
-    x_np = torch_to_np(x)
-    dev = sp.get_device(x_np)
-    
-    with dev:
+    # FFT
+    ndim = len(new_shape)
+    X = fft(x, dim=tuple(range(-ndim, 0)))
 
-        # FFT
-        ndim = len(new_shape)
-        X = sp.fft(x_np, axes=tuple(range(-ndim, 0)))
-
-        # Zero pad/chop
-        oshape = X.shape[:-ndim] + new_shape
-        X_rs = sp.resize(X, oshape)
+    # Zero pad/chop
+    oshape = X.shape[:-ndim] + new_shape
+    X_rs = resize(X, oshape)
 
     # Windowing
-    X_rs = apply_window(np_to_torch(X_rs), ndim, window)
+    X_rs = apply_window(X_rs, ndim, window)
 
     # IFFT
     x_rs = ifft(X_rs, dim=tuple(range(-ndim, 0)))
 
-    # Convert to original
-    if torch.is_tensor(x):
-        return x_rs
-    else:
-        return torch_to_np(x_rs)
+    return x_rs
 
 def spatial_resize(x: torch.Tensor,
                    im_size: tuple, 

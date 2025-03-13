@@ -13,7 +13,7 @@ from einops import einsum
 
 
 # ------------------- Parameters & Setup -------------------
-D = 1 # Dimension of image
+D = 2 # Dimension of image
 B = 2 # Number of basis phases
 N = 220 # Number of signal points in each dim
 M = 1000 # Total number of transform points
@@ -23,15 +23,15 @@ torch_dev = torch.device(5)
 
 # Define the function and non-linear phases
 def f(r):
-    x = r[..., 0]
+    # x = r[..., 0]
     # y = r[..., 1]
-    ret = x * 0 + 1
+    # ret = x * 0 + 1
     # ret = torch.cos(2 * torch.pi * 50 * x ** 2)
-    # ret = sl.img(im_size).to(torch_dev)
+    ret = sl.img(im_size).to(torch_dev)
     return ret.type(torch.complex64)
 def phi(r):
-    # return torch.stack([r[..., 0] ** 2, r[..., 1] ** 2], dim=-1)
-    return torch.stack([r[..., 0], r[..., 0] ** 2], dim=-1)
+    return torch.stack([r[..., 0] ** 2, r[..., 1] ** 2], dim=-1)
+    # return torch.stack([r[..., 0], r[..., 0] ** 2], dim=-1)
     # return r[..., 0:1] ** 2 +  r[..., 1:2] ** 2
 
 # Gen data
@@ -53,9 +53,11 @@ def adj_naive(F, alphas):
     return fr
 start = time.perf_counter()
 F_naive = eval_naive(fr, alphas)
-F_naive = adj_naive(F_naive, alphas).cpu()
+# F_naive = adj_naive(F_naive, alphas)
+torch.cuda.synchronize()
 end = time.perf_counter()
 print(f'Elapsed time: {end - start}')
+F_naive = F_naive.cpu()
 
 # -------------------- HOP Library Transform -------------------
 phi_hop = phis.moveaxis(-1, 0)
@@ -63,8 +65,10 @@ alphas_hop = alphas.moveaxis(-1, 0)
 hop = high_order_phase(phi_hop, alphas_hop)
 start = time.perf_counter()
 F_hop = hop.forward_matrix_prod(fr[None,])[0]
-F_hop = hop.adjoint_matrix_prod(F_hop[None,])[0].cpu()
+# F_hop = hop.adjoint_matrix_prod(F_hop[None,])[0]
+torch.cuda.synchronize()
 end = time.perf_counter()
+F_hop = F_hop.cpu()
 F_hop = normalize(F_hop, F_naive)
 print(f'Elapsed time: {end - start}')
 

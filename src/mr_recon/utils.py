@@ -7,6 +7,64 @@ from typing import Optional
 from fast_pytorch_kmeans import KMeans
 from scipy.signal import get_window
 
+def _expand_shapes(*shapes):
+    """
+    Given iterable of shapes, returns shapes with appropriate empty 
+    dimensions such that all returned shapes have the same number of dimensions.
+    
+    Direct copy from Frank Ong's Sigpy library.
+    """
+    shapes = [list(shape) for shape in shapes]
+    max_ndim = max(len(shape) for shape in shapes)
+    shapes_exp = [[1] * (max_ndim - len(shape)) + shape for shape in shapes]
+
+    return tuple(shapes_exp)
+
+def resize(input, oshape, ishift=None, oshift=None):
+    """
+    Resize with zero-padding or cropping.
+    
+    Direct copy from Frank Ong's Sigpy library.
+
+    Parameters:
+    -----------
+    input : torch.Tensor
+        Input array with arb shape
+    oshape : tuple
+        Output shape with same number of dimensions as input
+    ishift : tuple
+        Shift of input array.
+    oshift : tuple
+        Shift of output array.
+
+    Returns:
+        array: Zero-padded or cropped result.
+    """
+    
+    ishape1, oshape1 = _expand_shapes(input.shape, oshape)
+
+    if ishape1 == oshape1:
+        return input.reshape(oshape)
+
+    if ishift is None:
+        ishift = [max(i // 2 - o // 2, 0) for i, o in zip(ishape1, oshape1)]
+
+    if oshift is None:
+        oshift = [max(o // 2 - i // 2, 0) for i, o in zip(ishape1, oshape1)]
+
+    copy_shape = [
+        min(i - si, o - so)
+        for i, si, o, so in zip(ishape1, ishift, oshape1, oshift)
+    ]
+    islice = tuple([slice(si, si + c) for si, c in zip(ishift, copy_shape)])
+    oslice = tuple([slice(so, so + c) for so, c in zip(oshift, copy_shape)])
+
+    output = torch.zeros(oshape1, dtype=input.dtype, device=input.device)
+    input = input.reshape(ishape1)
+    output[oslice] = input[islice]
+
+    return output.reshape(oshape)
+
 def quantize_data(data: torch.Tensor,  
                   K: int,
                   method: Optional['str'] = 'uniform',

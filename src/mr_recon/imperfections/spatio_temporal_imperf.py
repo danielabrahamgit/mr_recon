@@ -1,14 +1,130 @@
 import torch
+import numpy as np
 
 from typing import Optional, Union
 from einops import rearrange, einsum
 from mr_recon import dtypes
 from mr_recon.pad import PadLast
-from mr_recon.fourier import sigpy_nufft, fft, ifft
+from mr_recon.fourier import sigpy_nufft, triton_nufft, fft, ifft
 from mr_recon.utils import gen_grd, quantize_data, batch_iterator
 from mr_recon.spatial import spatial_resize
+from mr_recon.imperfections.sh import SH_BASES_FUNCTIONS
 from math import ceil
+from tqdm import tqdm
 
+def phis_from_spha(xyz_crds: torch.Tensor,
+                   spherical_harmonics_inds: list[int],) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates phis for spherical harmonic phase -- likely from skope
+    
+    Parameters:
+    -----------
+    xyz_crds: torch.Tensor
+        the xyz coordinates with shape (*im_size, 3)
+    spherical_harmonics_inds: list
+        the list of spherical harmonics indices between [0, 35]
+    """
+    phis = None
+    for ind in spherical_harmonics_inds:
+        phi = SH_BASES_FUNCTIONS[ind](xyz_crds.moveaxis(-1, 0))[None,]
+        if phis is None:
+            phis = phi
+        else:
+            phis = torch.cat([phis, phi], dim=0)
+            
+    return phis
+    
+def alphas_phis_from_coco(trj: torch.Tensor, 
+                          xyz_crds: torch.Tensor,
+                          fovs: tuple,
+                          dt: float, 
+                          b0: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes the alphas and phis from concomitant fields.
+    
+    Parameters:
+    -----------
+    trj: torch.Tensor
+        the k-space trajectory with shape (*trj_size, 3)
+        Assuming that the first dimension of trj is the readout!!!
+    xyz_crds: torch.Tensor
+        the xyz coordinates with shape (*im_size, 3)
+    fovs: tuple
+        the FOVs in meters in each dimension i.e. shape (3,)
+    dt: float
+        the dwell time in seconds
+    b0: float
+        the B0 field in Tesla
+        
+    Returns:
+    --------
+    alphas: torch.Tensor
+        the alphas with shape (4, *trj_size)
+    phis: torch.Tensor
+        the phis with shape (4, *im_size)
+    """
+    # Consts
+    assert trj.shape[-1] == 3, 'trj must have shape (*trj_size, 3)'
+    assert xyz_crds.shape[-1] == 3, 'xyz_crds must have shape (*im_size, 3)'
+    gamma_bar = gamma_bar = 42.5774e6 # Hz / T
+    
+    # Get gradient from trajectory
+    fovs_tensor = torch.tensor(fovs, dtype=trj.dtype, device=trj.device)
+    g = torch.diff(trj, dim=0) / (dt * gamma_bar * fovs_tensor)
+    g = torch.cat((g, g[-1:]), dim=0)
+    
+    # Build phis -- the spatial terms of coco phase evolution
+    X = xyz_crds[..., 0]
+    Y = xyz_crds[..., 1]
+    Z = xyz_crds[..., 2]
+    phis = torch.stack([Z ** 2, 
+                        X ** 2 + Y ** 2, 
+                        X * Z, 
+                        Y * Z], dim=0)
+    
+    # Build alphas -- temporal terms of coco phase evolution
+    gx = g[..., 0]
+    gy = g[..., 1]
+    gz = g[..., 2]
+    alphas = torch.stack([gx **2 + gy ** 2,
+                          gz ** 2 / 4,
+                          -gz * gx,
+                          -gz * gy], dim=0) / (2 * b0)
+    alphas = torch.cumulative_trapezoid(alphas, dx=dt, dim=1) * gamma_bar
+    alphas = torch.cat([alphas[:, :1] * 0, alphas], dim=1)
+    
+    return alphas, phis
+    
+def alphas_phis_from_B0(b0_map: torch.Tensor,
+                        trj_size: tuple,
+                        dt: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes the alphas and phis from a B0 map.
+    
+    Parameters:
+    -----------
+    b0_map: torch.Tensor
+        the B0 map with shape (*im_size) in Hz
+    trj_size: tuple
+        the size of the trajectory (*trj_size)
+        Assuming that the first dimension of trj is the readout!!!
+    dt: float
+        the dwell time in seconds
+    
+    Returns:
+    --------
+    alphas: torch.Tensor
+        the alphas with shape (1, *trj_size[0], empty_dims)
+    phis: torch.Tensor
+        the phis with shape (1, *im_size)
+    """
+    tup = (slice(None),) + (None,) * len(trj_size[1:])
+    ts = torch.arange(trj_size[0], device=b0_map.device)[tup] * dt
+    alphas = ts[None,]
+    phis = b0_map[None,]
+    
+    return alphas, phis
+    
 class spatio_temporal:
     """
     This class represents imperfections that takes the form W(r, p(t)),
@@ -35,7 +151,8 @@ class spatio_temporal:
                  trj_size: tuple,
                  spatial_batch_size: Optional[int] = None,
                  temporal_batch_size: Optional[int] = None,
-                 device: Optional[torch.device] = torch.device('cpu')):
+                 device: Optional[torch.device] = torch.device('cpu'),
+                 verbose: Optional[bool] = False):
         """
         Parameters:
         -----------
@@ -45,6 +162,14 @@ class spatio_temporal:
         trj_size: tuple
             the size of the trajectory (M_0, M_1, ..., M_{k-1})
             k is the number of temporal dimensions
+        spatial_batch_size: int
+            the batch size for spatial indices
+        temporal_batch_size: int
+            the batch size for temporal indices
+        device: torch.device
+            the device to use for computation
+        verbose: bool
+            whether to print progress bars and such
         """
         self.im_size = im_size
         self.trj_size = trj_size
@@ -53,6 +178,7 @@ class spatio_temporal:
         self.ntrj = torch.prod(torch.tensor(trj_size)).item()
         self.spatial_batch_size = self.nvox if spatial_batch_size is None else spatial_batch_size
         self.temporal_batch_size = self.ntrj if temporal_batch_size is None else temporal_batch_size
+        self.verbose = verbose
 
     def temporal_features(self, 
                           temporal_inds: torch.Tensor) -> torch.Tensor:
@@ -151,16 +277,21 @@ class spatio_temporal:
         spatial_inds = gen_grd(self.im_size, self.im_size) + torch.tensor(self.im_size) // 2
         spatial_inds = spatial_inds.view((-1, len(self.im_size))).T.type(torch.int)
         
+        # Unbatched matrix product
+        if spatial_batch_size >= self.nvox and temporal_batch_size >= temporal_features.shape[-1]:
+            mat = self.matrix_access(spatial_inds[..., None], temporal_features[:, None, :]) # vox t
+            output = spatial_input_flt @ mat
         # Batched matrix product
-        output = torch.zeros((N, temporal_features.shape[-1]), device=spatial_input_flt.device, dtype=spatial_input_flt.dtype)
-        for r1, r2 in batch_iterator(self.nvox, spatial_batch_size):
-            for t1, t2 in batch_iterator(temporal_features.shape[-1], temporal_batch_size):
-                spatial_inds_batch = torch.zeros((d, r2-r1, t2-t1), dtype=torch.int, device=self.torch_dev)
-                temporal_feat_batch = torch.zeros((f, r2-r1, t2-t1), dtype=temporal_features.dtype, device=self.torch_dev)
-                spatial_inds_batch[...] = spatial_inds[:, r1:r2, None]
-                temporal_feat_batch[...] = temporal_features[:, None, t1:t2]
-                mat = self.matrix_access(spatial_inds_batch, temporal_feat_batch)
-                output[:, t1:t2] += spatial_input_flt[:, r1:r2] @ mat
+        else:
+            output = torch.zeros((N, temporal_features.shape[-1]), device=spatial_input_flt.device, dtype=spatial_input_flt.dtype)
+            for r1, r2 in batch_iterator(self.nvox, spatial_batch_size):
+                for t1, t2 in batch_iterator(temporal_features.shape[-1], temporal_batch_size):
+                    spatial_inds_batch = torch.zeros((d, r2-r1, t2-t1), dtype=torch.int, device=self.torch_dev)
+                    temporal_feat_batch = torch.zeros((f, r2-r1, t2-t1), dtype=temporal_features.dtype, device=self.torch_dev)
+                    spatial_inds_batch[...] = spatial_inds[:, r1:r2, None]
+                    temporal_feat_batch[...] = temporal_features[:, None, t1:t2]
+                    mat = self.matrix_access(spatial_inds_batch, temporal_feat_batch)
+                    output[:, t1:t2] += spatial_input_flt[:, r1:r2] @ mat
                 
         return output.view(N, *temporal_shape)
 
@@ -201,16 +332,21 @@ class spatio_temporal:
         temporal_input_flt = temporal_input.view((-1, temporal_features.shape[1]))
         N = temporal_input_flt.shape[0]
         
-        # Batched matrix product
-        output = torch.zeros((N, self.nvox), device=temporal_input_flt.device, dtype=temporal_input_flt.dtype)
-        for r1, r2 in batch_iterator(self.nvox, spatial_batch_size):
-            for t1, t2 in batch_iterator(temporal_features.shape[-1], temporal_batch_size):
-                spatial_inds_batch = torch.zeros((d, t2-t1, r2-r1), dtype=torch.int, device=self.torch_dev)
-                temporal_feat_batch = torch.zeros((f, t2-t1, r2-r1), dtype=temporal_features.dtype, device=self.torch_dev)
-                spatial_inds_batch[...] = spatial_inds[:, None, r1:r2]
-                temporal_feat_batch[...] = temporal_features[:, t1:t2, None]
-                mat = self.matrix_access(spatial_inds_batch, temporal_feat_batch)
-                output[:, r1:r2] += temporal_input_flt[:, t1:t2] @ mat.conj()
+        # Unbatched matrix product
+        if spatial_batch_size >= self.nvox and temporal_batch_size >= temporal_features.shape[-1]:
+            mat = self.matrix_access(spatial_inds[:, None, :], temporal_features[..., None]) # vox t
+            output = temporal_input_flt @ mat.conj()
+        else:
+            # Batched matrix product
+            output = torch.zeros((N, self.nvox), device=temporal_input_flt.device, dtype=temporal_input_flt.dtype)
+            for r1, r2 in batch_iterator(self.nvox, spatial_batch_size):
+                for t1, t2 in batch_iterator(temporal_features.shape[-1], temporal_batch_size):
+                    spatial_inds_batch = torch.zeros((d, t2-t1, r2-r1), dtype=torch.int, device=self.torch_dev)
+                    temporal_feat_batch = torch.zeros((f, t2-t1, r2-r1), dtype=temporal_features.dtype, device=self.torch_dev)
+                    spatial_inds_batch[...] = spatial_inds[:, None, r1:r2]
+                    temporal_feat_batch[...] = temporal_features[:, t1:t2, None]
+                    mat = self.matrix_access(spatial_inds_batch, temporal_feat_batch)
+                    output[:, r1:r2] += temporal_input_flt[:, t1:t2] @ mat.conj()
                 
         return output.view(N, *self.im_size)
 
@@ -375,8 +511,6 @@ class spatio_temporal:
         print(f'AHAx Error = {AHAx_err.item()}')
         print(f'AAHy Error = {AAHy_err.item()}')
 
-
-# TODO FIXME 
 class B0(spatio_temporal):
     """
     This spatial-temporal imperfection has the form
@@ -509,8 +643,10 @@ class high_order_phase(spatio_temporal):
     def __init__(self,
                  phis: torch.Tensor,
                  alphas: torch.Tensor,
+                 use_KB: Optional[bool] = True,
                  spatial_batch_size: Optional[int] = None,
-                 temporal_batch_size: Optional[int] = None):
+                 temporal_batch_size: Optional[int] = None,
+                 verbose: Optional[bool] = False):
         """
         Parameters:
         -----------
@@ -518,65 +654,107 @@ class high_order_phase(spatio_temporal):
             the spatial phase maps with shape (B, *im_size)
         alphas : torch.Tensor
             the temporal phase coefficents with shape (B, *trj_size)
+        use_KB : bool
+            whether to use Kaiser-Bessel interpolation to speed things up
         """
         # Store
         self.phis = phis
         self.alphas = alphas
         self.B, *trj_size = alphas.shape
         B, *im_size = phis.shape
+        self.use_KB = use_KB
         assert alphas.device == phis.device, 'phis and alphas must be on same device'
         assert B == self.B, 'Number of spatial and temporal features must match'
-        
-        # ------------- High Order Phase Via NUFFT -------------
-        # Params
-        W = 4
-        os = 1.25
-        
-        # Scale alphas so that phis are between [-1/2, 1/2]
-        self.scales = phis.abs().view(self.B, -1).max(dim=-1).values * 2 # B 
-        self.alphas_rescaled = self.alphas.moveaxis(0, -1) * self.scales
-        
-        # Determine matrix size from extent of scaled alphas
-        alphas_rescaled_max = self.alphas_rescaled.abs().view((-1, self.B)).max(dim=0).values
-        matrix_size = ((alphas_rescaled_max + W/os/2) * 2).ceil().int()
-        # TODO FIXME. Currently uses isotropic matrix size, would be nice if we can fix that.
-        # This is because we need that each matrix dimension after multiplying by os is an integer.
-        mx = matrix_size.max().item()
-        matrix_size = (matrix_size.max() * (matrix_size * 0 + 1)).int().tolist()
-        os = round(mx * os) / mx
-        matrix_size_os = [ceil(matrix_size[i] * os) for i in range(len(matrix_size))]
-        print(f'Required Grid Size = {matrix_size_os}')
-        
-        # Create NUFFT module and define desired alphas grid points + apodization
-        self.nufft = sigpy_nufft(matrix_size, oversamp=os, width=W)
-        self.alphas_grid = ((gen_grd(matrix_size_os, matrix_size_os).to(phis.device) / os) / self.scales).moveaxis(-1, 0)
-        self.apod = torch.prod(torch.stack([self.nufft._apodize_1d(phis[i] / self.scales[i]) for i in range(self.B)], dim=0), dim=0)
-        
-        
-        # Find only required alphas on the grid and correspinding indices
-        kern = gen_grd([W]*self.B, [W]*self.B).view(-1, self.B).to(phis.device) / os
-        alphas_required = (self.alphas_rescaled * os).round().view(-1,self.B) / os
-        alphas_required = alphas_required.unique(dim=0)[:, None, :] + kern
-        alphas_required = alphas_required.reshape(-1, self.B).unique(dim=0)
-        inds_required = alphas_required * os
-        breakpoint()
-        
-        import matplotlib.pyplot as plt
-        fig = plt.figure()
-        ax = fig.add_subplot(projection='3d')
-        
-        alphas = (self.alphas.moveaxis(0, -1) * self.scales).moveaxis(-1, 0).cpu()
-        alphas_grid = (self.alphas_grid.moveaxis(0, -1) * self.scales).moveaxis(-1, 0).cpu()
-        
-        ax.scatter(*alphas.view(3,-1), marker='.', alpha=0.3)
-        # ax.scatter(*alphas_grid.view(3,-1), marker='.', alpha=0.05)
-        plt.show()
-        quit()
-
         super(high_order_phase, self).__init__(im_size, trj_size, 
                                                spatial_batch_size=spatial_batch_size, temporal_batch_size=temporal_batch_size, 
-                                               device=alphas.device)
-    
+                                               device=alphas.device, verbose=verbose)
+        
+        # Rescale alphas so that phis are between [-1/2, 1/2]
+        self.scales = phis.abs().view(self.B, -1).max(dim=-1).values * 2 # B 
+        self.alphas_rescaled = (self.alphas.moveaxis(0, -1) * self.scales).contiguous()
+        
+        if use_KB:
+            # ------------- High Order Phase Via NUFFT -------------
+            # Params
+            W = 4
+            os = 2.0
+            
+            # Determine matrix size from extent of scaled alphas
+            alphas_rescaled_max = self.alphas_rescaled.abs().view((-1, self.B)).max(dim=0).values
+            matrix_size = ((alphas_rescaled_max + (W+(W%2))/os/2) * 2).ceil().int()
+            mx = matrix_size.max().item()
+            matrix_size = (mx * (matrix_size * 0 + 1)).int()
+            os = round(mx * os) / mx
+            matrix_size_os_tensor = (matrix_size * os).ceil()
+            matrix_size_os = matrix_size_os_tensor.int().tolist()
+            self.matrix_size_os = matrix_size_os
+            
+            # ------------------------------ Old ------------------------------
+            # Create NUFFT module and define desired alphas grid points + apodization
+            # self.nufft = triton_nufft(tuple(matrix_size.tolist()), oversamp=os, width=W)
+            self.nufft = sigpy_nufft(tuple(matrix_size.tolist()), oversamp=os, width=W)
+            self.apod = torch.prod(torch.stack([self.nufft._apodization_func(phis[i] / self.scales[i] / os) for i in range(self.B)], dim=0), dim=0)
+            
+            # Find only required alphas on the grid and correspinding indices
+            kern = gen_grd([W]*self.B, [W]*self.B).view(-1, self.B).to(phis.device) / os
+            alphas_required = (self.alphas_rescaled * os).ceil().view(-1,self.B) / os
+            alphas_required = alphas_required.unique(dim=0)[:, None, :] + kern
+            alphas_required = (alphas_required * os).round().reshape(-1, self.B).unique(dim=0) / os
+            self.inds_required = ((alphas_required * os) + matrix_size_os_tensor//2).int().moveaxis(-1, 0)
+            self.alphas_required = (alphas_required / self.scales).moveaxis(-1, 0)
+            
+            # Minimal bounding box around trajectory
+            inds_lower = self.inds_required.min(dim=-1).values
+            inds_upper = self.inds_required.max(dim=-1).values
+            inds_range = inds_upper - inds_lower + 1
+            self.grid_zeros = torch.zeros(inds_range.tolist(), device=phis.device, dtype=complex_dtype)
+            self.alphas_rescaled -= inds_lower / os
+            self.inds_required = self.inds_required - inds_lower[:, None]
+            req_rect = torch.prod(inds_range, dim=0).item()            
+            # self.grid_zeros = torch.zeros(matrix_size_os, device=phis.device, dtype=complex_dtype)
+            
+            # Show requirements
+            if self.verbose:
+                print(f'\nRequired # Grid Points = {self.inds_required.shape[1]} / {np.prod(trj_size)} Total')
+                print(f'OS Matrix Shape = {matrix_size_os}')
+                print(f'OS Matrix Size = {np.prod(matrix_size_os) * 8 / 2 ** 30:.3f}GB')
+                print(f'Rect Grid Size = {req_rect * 8 / 2 ** 30:.3f}GB')
+            # -----------------------------------------------------------------
+            
+            
+            # # ------------------------------ New ------------------------------
+            # # Nufft and apod
+            # self.nufft = triton_nufft(tuple(matrix_size.tolist()), oversamp=os, width=W)
+            # self.apod = torch.prod(torch.stack([self.nufft._apodization_func(phis[i] / self.scales[i] / os) for i in range(self.B)], dim=0), dim=0)
+            
+            # # Scale and shift to match non-negative oversampled coordinates
+            # self.alphas_rescaled = (torch.rand_like(self.alphas_rescaled) - 0.5) * matrix_size[0]
+            # alphas_os_crds = self.nufft._scale_trj(self.alphas_rescaled, matrix_size)
+            
+            # # Append kernel
+            # kern = (W/2 + gen_grd((W+1,)*self.B, (W+1,)*self.B).view(-1, self.B)).to(phis.device)
+            # radius = W/2
+            # alphas_lower = (alphas_os_crds - radius).ceil().int()
+            # alphas_grid = alphas_lower[..., None, :] + kern
+            
+            # # Find only unique grid points -- since grid points are expensive to compute
+            # alphas_grid_flt = alphas_grid.reshape(-1, self.B)
+            # alphas_grid, idxs = alphas_grid_flt.int().unique(dim=0, return_inverse=True)
+            # # -----------------------------------------------------------------
+            
+            # import matplotlib.pyplot as plt
+            # grd = (self.alphas_grid.reshape(self.B, -1).T * self.scales).T
+            # req = (self.alphas_required.reshape(self.B, -1).T * self.scales).T
+            # alp = self.alphas_rescaled.reshape(-1, B).T
+            # fig = plt.figure(figsize=(8, 6))
+            # pts = torch.randperm(alp.shape[1])[:10_000]
+            # ax = fig.add_subplot(111, projection='3d')
+            # ax.scatter(*grd.cpu(), alpha=0.05, marker='.')
+            # ax.scatter(*req.cpu(), alpha=0.2, marker='.')
+            # ax.scatter(*alp.cpu()[:, pts], alpha=0.03, marker='.')
+            # plt.show()
+            # quit()
+
     def get_temporal_clusters(self,
                               num_clusters: int) -> Union[torch.Tensor, torch.Tensor]:
             """
@@ -639,16 +817,102 @@ class high_order_phase(spatio_temporal):
         """
         return self.alphas[(slice(None),) + tuple(temporal_inds)]
 
-    def forward_matrix_prod(self, spatial_input):
-        # return super().forward_matrix_prod(spatial_input)
-        matmul = self._continuous_forward_matrix_prod(spatial_input * self.apod, self.alphas_grid) # N ...
-        out = self.nufft.forward_interp_only(matmul, self.alphas_rescaled[None,])
+    def _continuous_forward_matrix_prod(self, spatial_input, temporal_features):
+        """
+        Parameters:
+        -----------
+        spatial_input: torch.Tensor
+            the spatial input vector with shape (N, *im_size)
+            N is a batch dimension
+        temporal_features: torch.Tensor
+            the temporal features with shape (f, ...)
+        
+        Returns:
+        --------
+        torch.Tensor
+            the output temporal vector with shape (N, ...)
+        """
+        # Consts
+        N = spatial_input.shape[0]
+        f = temporal_features.shape[0]
+        assert f == self.B, 'Number of temporal features must match number of spatial bases'
+        
+        # Flatten things
+        phis_flt = self.phis.reshape((self.B, -1)) # B R
+        inp_flt = spatial_input.reshape((N, -1)) # N R
+        feat_flt = temporal_features.reshape((f, -1)) # B T
+        out_flt = torch.zeros((N, feat_flt.shape[1]), 
+                              device=spatial_input.device, dtype=complex_dtype) # N T
+        
+        # Batched matrix products
+        for t1 in tqdm(range(0, feat_flt.shape[1], self.temporal_batch_size), disable=not self.verbose, desc='Forward Prod'):
+            t2 = min(t1 + self.temporal_batch_size, feat_flt.shape[1])
+            feat_batch = feat_flt[:, t1:t2] # B T
+            phz = phis_flt.T @ feat_batch # R T
+            mat_prod = inp_flt @ torch.exp(-2j * torch.pi * phz) # N T
+            out_flt[:, t1:t2] = mat_prod
+        
+        # Reshape output
+        return out_flt.view(N, *temporal_features.shape[1:])        
 
+    def _continuous_adjoint_matrix_prod(self, temporal_input, temporal_features):
+        """
+        Parameters:
+        -----------
+        temporal_input: torch.Tensor
+            the temporal input vector with shape (N, ...)
+            N is a batch dimension
+        temporal_features: torch.Tensor
+            the temporal features with shape (f, ...)
+        
+        Returns:
+        --------
+        torch.Tensor
+            the output temporal vector with shape (N, *im_size)
+        """
+        # Consts
+        N = temporal_input.shape[0]
+        f = temporal_features.shape[0]
+        assert f == self.B, 'Number of temporal features must match number of spatial bases'
+        
+        # Flatten things
+        phis_flt = self.phis.reshape((self.B, -1)) # B R
+        inp_flt = temporal_input.reshape((N, -1)) # N T
+        feat_flt = temporal_features.reshape((f, -1)) # B T
+        out_flt = torch.zeros((N, self.nvox), 
+                              device=temporal_input.device, dtype=complex_dtype) # N R
+        
+        # Bached matrix products
+        for t1 in tqdm(range(0, feat_flt.shape[1], self.temporal_batch_size), disable=not self.verbose, desc='Adjoint Prod'):
+            t2 = min(t1 + self.temporal_batch_size, feat_flt.shape[1])
+            feat_batch = feat_flt[:, t1:t2] # B T
+            phz = feat_batch.T @ phis_flt # T R
+            mat_prod = inp_flt[:, t1:t2] @ torch.exp(2j * torch.pi * phz) # N R
+            out_flt += mat_prod
+        
+        # Reshape output
+        return out_flt.view(N, *self.im_size)
+
+    def forward_matrix_prod(self, spatial_input):
+        if self.use_KB:
+            # First compute required grid points
+            matmul = self._continuous_forward_matrix_prod(spatial_input * self.apod, self.alphas_required)
+            N = matmul.shape[0]
+            
+            # Interpolate to off-grid points
+            grid_zeros = torch.zeros((N, *self.grid_zeros.shape), device=spatial_input.device, dtype=complex_dtype)
+            tup = (slice(None),) + tuple(self.inds_required)
+            grid_zeros[tup] = matmul
+            out = self.nufft.forward_interp_only(grid_zeros[None,], self.alphas_rescaled[None,])[0]
+        else:
+            out = super().forward_matrix_prod(spatial_input)
         return out
     
     def adjoint_matrix_prod(self, temporal_input):
-        # return super().adjoint_matrix_prod(temporal_input)
-        kgrid = self.nufft.adjoint_grid_only(temporal_input, self.alphas_rescaled[None,])
-        out = self._continuous_adjoint_matrix_prod(kgrid, self.alphas_grid) * self.apod
-        
+        if self.use_KB:
+            kgrid = self.nufft.adjoint_grid_only(temporal_input, self.alphas_rescaled[None,])
+            kreq = kgrid[(slice(None),) + tuple(self.inds_required)]
+            out = self._continuous_adjoint_matrix_prod(kreq, self.alphas_required) * self.apod
+        else:
+            out = super().adjoint_matrix_prod(temporal_input)
         return out
