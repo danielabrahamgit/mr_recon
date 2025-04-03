@@ -11,6 +11,7 @@ from mr_recon.spatial import spatial_resize
 from mr_recon.imperfections.coco import coco_imperfection
 from mr_recon.imperfections.spatio_temporal_imperf import high_order_phase, alphas_phis_from_B0, alphas_phis_from_coco
 from mr_recon.imperfections.imperf_decomp import temporal_segmentation
+from mr_recon.imperfections.hofft_decomp import temporal_eigen, temporal_psf_eigen
 
 from tqdm import tqdm
 from einops import einsum, rearrange
@@ -20,7 +21,7 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 # GPU stuff
-torch_dev = torch.device(3)
+torch_dev = torch.device(5)
 # torch_dev = torch.device('cpu')
     
 # Recon Stuff
@@ -51,9 +52,12 @@ phis = spatial_resize(phis, (64,)*3, method='fourier').real
 
 
 # Subsample to smaller problem
-ros = slice(None, None, 1)
-groups = slice(None)
-trs = slice(None)
+# ros = slice(None)
+# trs = slice(None)
+# groups = slice(None)
+ros = slice(None, None, 10)
+groups = slice(2, 3)
+trs = slice(3, 4) 
 alphas = alphas[:, ros, groups, trs].reshape((alphas.shape[0], -1))
 # alphas_flt = alphas.reshape((alphas.shape[0], -1))
 # rnd_inds = torch.randperm(alphas_flt.shape[1])[9_000:10_000]
@@ -63,8 +67,8 @@ alphas = alphas[:, ros, groups, trs].reshape((alphas.shape[0], -1))
 # # Unrotate alphas via SVD
 # alphas_flt = alphas.reshape((alphas.shape[0], -1))
 # U, s, Vh = torch.linalg.svd(alphas_flt, full_matrices=False)
-# L = len(s)
-# # L = 3
+# # L = len(s)
+# L = 3
 # phis = einsum(phis, U[:, :L] * (s[:L] ** 0.5), 'Bi ... , Bi Bo -> Bo ...')
 # alphas = ((s[:L, None] ** 0.5) * Vh[:L]).reshape((L, *alphas.shape[1:]))
 
@@ -73,7 +77,9 @@ spatial_input = torch.randn(phis.shape[1:], device=torch_dev, dtype=torch.comple
 torch.cuda.synchronize()
 
 # "Better" High Order Phase Transform
-hop = high_order_phase(phis, alphas, use_KB=True, temporal_batch_size=2**10, verbose=True)
+h = temporal_psf_eigen(phis[:1], alphas[:1])
+breakpoint()
+# hop = high_order_phase(phis, alphas, use_KB=True, temporal_batch_size=2**10, verbose=True)
 quit()
 start = time.perf_counter()
 b, h = temporal_segmentation(hop, L=10, interp_type='lstsq')

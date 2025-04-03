@@ -13,6 +13,71 @@ All of these techniques are used to decompose a spatio-temporal imperfection:
     
     W(r, p(t)) = sum_{l=1}^{L} h_l(t) b_l(r)
 """
+
+def decomp_with_grappa(st_imperf: spatio_temporal,
+                       kerns: torch.Tensor,
+                       mps: torch.Tensor,
+                       L: int,
+                       niter: Optional[int] = 50,
+                       method: Optional[str] = 'svd',):
+    """
+    Decomposes residual imperfection, where some of the imperfection was removed by GRAPPA kernels.
+    
+    Parameters:
+    -----------
+    st_imperf : spatio_temporal
+        spatio temporal imperfection
+    kerns : torch.Tensor
+        GRAPPA kernels with shape (C, C, *trj_size)
+    mps : torch.Tensor
+        Multi-coil sensitivity maps with shape (C, *im_size)
+    L : int
+        Number of decomposition components
+    niter : int
+        Number of iterations for power method
+    method : str
+        'svd' - SVD formulation
+        'ts' - time segementation formulation
+    """
+    def forward(x):
+        Ax = st_imperf.forward_matrix_prod(x * mps)
+        y = einsum(kerns, Ax, 'Co Ci ..., Ci ... -> Co ...')
+        return y
+    def adjoint(y):
+        Ghy = einsum(kerns.conj(), y, 'Co Ci ..., Co ... -> Ci ...')
+        AhGhy = st_imperf.adjoint_matrix_prod(Ghy)
+        x = einsum(mps.conj(), AhGhy, 'C ..., C ... -> ...')
+        return x
+    def normal_spatial(x):
+        return adjoint(forward(x))
+    def normal_temporal(y):
+        return forward(adjoint(y))
+    
+    # Consts
+    im_size = st_imperf.im_size
+    trj_size = st_imperf.trj_size
+    C = mps.shape[0]
+    assert kerns.shape[0] == kerns.shape[1], "Kernels must be square"
+    assert list(kerns.shape[2:]) == list(trj_size), "Kernels must match trajectory size"
+    assert mps.shape[0] == kerns.shape[0], "MPS and kernels must have same coils"
+    assert list(mps.shape[1:]) == list(im_size), "MPS must match image size"
+    
+    if method == 'ts':
+        return None
+    else:
+        # SVD formulation
+        U, S, Vh = svd_power_method_tall(A=forward,
+                                         AHA=normal_spatial,
+                                         inp_dims=im_size,
+                                         rank=L,
+                                         niter=niter,
+                                         device=st_imperf.torch_dev)
+        p = 0.5
+        temporal_funcs = rearrange(U * (S ** p), '... L -> L ...')
+        spatial_funcs = einsum(Vh, (S ** (1 - p)), 'L ..., L -> L ...')
+        
+    return spatial_funcs, temporal_funcs
+        
 def svd_decomp_matrix(st_imperf: spatio_temporal,
                       L: int) -> torch.Tensor:
     """
@@ -120,65 +185,6 @@ def svd_decomp_operator(st_imperf: spatio_temporal,
         temporal_funcs = rearrange(U * (S ** 0.5), '... L -> L ...')
         spatial_funcs = einsum(Vh, (S ** 0.5), 'L ..., L -> L ...')
 
-
-    return spatial_funcs, temporal_funcs
-
-def svd_decomp_operator_coils(st_imperf: spatio_temporal,
-                              mps: torch.Tensor,
-                              L: int,
-                              fast_axis: Optional[str] = None) -> torch.Tensor:
-    """
-    Perform SVD decomposition of the spatio temporal imperfection,
-    specifically with an operator formulation.
-
-    Picks h_l(t) and b_l(r) using SVD.
-
-    Parameters:
-    -----------
-    st_imperf : spatio_temporal
-        spatio temporal imperfection
-    L : int
-        Number of decomposition components
-    fast_axis : str
-        'temporal' - temporal axis is the fast axis
-        'spatial' - spatial axis is the fast axis
-
-    Returns:
-    --------
-    spatial_funcs : torch.Tensor
-        Spatial basis functions with shape (L, *im_size)
-    temporal_funcs : torch.Tensor
-        Temporal basis functions with shape (L, *trj_size)
-    """
-
-    nvox = torch.prod(torch.tensor(st_imperf.im_size)).item()
-    ntrj = torch.prod(torch.tensor(st_imperf.trj_size)).item()
-    ncoil = mps.shape[0]
-    if nvox < ntrj:
-        fast_axis = 'spatial'
-    else:
-        fast_axis = 'temporal'
-
-    if 'temporal' in fast_axis:
-        A = lambda x: st_imperf.adjoint_matrix_prod(x)
-        AHA = lambda x: st_imperf.adjoint_forward_matrix_prod(x)
-        U, S, Vh = svd_power_method_tall(A=A, 
-                                        AHA=AHA,
-                                        inp_dims=(ncoil, *st_imperf.trj_size),
-                                        rank=L,
-                                        device=st_imperf.torch_dev)
-        spatial_funcs = rearrange(U * (S ** 0.5), '... L -> L ...').conj()
-        temporal_funcs = einsum(Vh, (S ** 0.5), 'L ..., L -> L ...').conj()
-    elif 'spatial' in fast_axis:
-        A = lambda x: st_imperf.forward_matrix_prod(x)
-        AHA = lambda x: st_imperf.adjoint_forward_matrix_prod(x)
-        U, S, Vh = svd_power_method_tall(A=A,
-                                        AHA=AHA,
-                                        inp_dims=st_imperf.im_size,
-                                        rank=L,
-                                        device=st_imperf.torch_dev)
-        temporal_funcs = rearrange(U * (S ** 0.5), '... L -> L ...')
-        spatial_funcs = einsum(Vh, (S ** 0.5), 'L ..., L -> L ...')
 
     return spatial_funcs, temporal_funcs
 

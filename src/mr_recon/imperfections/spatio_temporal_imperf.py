@@ -676,8 +676,8 @@ class high_order_phase(spatio_temporal):
         if use_KB:
             # ------------- High Order Phase Via NUFFT -------------
             # Params
-            W = 4
-            os = 2.0
+            W = 1
+            os = 1.0
             
             # Determine matrix size from extent of scaled alphas
             alphas_rescaled_max = self.alphas_rescaled.abs().view((-1, self.B)).max(dim=0).values
@@ -708,7 +708,7 @@ class high_order_phase(spatio_temporal):
             inds_upper = self.inds_required.max(dim=-1).values
             inds_range = inds_upper - inds_lower + 1
             self.grid_zeros = torch.zeros(inds_range.tolist(), device=phis.device, dtype=complex_dtype)
-            self.alphas_rescaled -= inds_lower / os
+            self.alphas_rescaled_ofs = self.alphas_rescaled - inds_lower / os
             self.inds_required = self.inds_required - inds_lower[:, None]
             req_rect = torch.prod(inds_range, dim=0).item()            
             # self.grid_zeros = torch.zeros(matrix_size_os, device=phis.device, dtype=complex_dtype)
@@ -720,27 +720,6 @@ class high_order_phase(spatio_temporal):
                 print(f'OS Matrix Size = {np.prod(matrix_size_os) * 8 / 2 ** 30:.3f}GB')
                 print(f'Rect Grid Size = {req_rect * 8 / 2 ** 30:.3f}GB')
             # -----------------------------------------------------------------
-            
-            
-            # # ------------------------------ New ------------------------------
-            # # Nufft and apod
-            # self.nufft = triton_nufft(tuple(matrix_size.tolist()), oversamp=os, width=W)
-            # self.apod = torch.prod(torch.stack([self.nufft._apodization_func(phis[i] / self.scales[i] / os) for i in range(self.B)], dim=0), dim=0)
-            
-            # # Scale and shift to match non-negative oversampled coordinates
-            # self.alphas_rescaled = (torch.rand_like(self.alphas_rescaled) - 0.5) * matrix_size[0]
-            # alphas_os_crds = self.nufft._scale_trj(self.alphas_rescaled, matrix_size)
-            
-            # # Append kernel
-            # kern = (W/2 + gen_grd((W+1,)*self.B, (W+1,)*self.B).view(-1, self.B)).to(phis.device)
-            # radius = W/2
-            # alphas_lower = (alphas_os_crds - radius).ceil().int()
-            # alphas_grid = alphas_lower[..., None, :] + kern
-            
-            # # Find only unique grid points -- since grid points are expensive to compute
-            # alphas_grid_flt = alphas_grid.reshape(-1, self.B)
-            # alphas_grid, idxs = alphas_grid_flt.int().unique(dim=0, return_inverse=True)
-            # # -----------------------------------------------------------------
             
             # import matplotlib.pyplot as plt
             # grd = (self.alphas_grid.reshape(self.B, -1).T * self.scales).T
@@ -903,14 +882,14 @@ class high_order_phase(spatio_temporal):
             grid_zeros = torch.zeros((N, *self.grid_zeros.shape), device=spatial_input.device, dtype=complex_dtype)
             tup = (slice(None),) + tuple(self.inds_required)
             grid_zeros[tup] = matmul
-            out = self.nufft.forward_interp_only(grid_zeros[None,], self.alphas_rescaled[None,])[0]
+            out = self.nufft.forward_interp_only(grid_zeros[None,], self.alphas_rescaled_ofs[None,])[0]
         else:
             out = super().forward_matrix_prod(spatial_input)
         return out
     
     def adjoint_matrix_prod(self, temporal_input):
         if self.use_KB:
-            kgrid = self.nufft.adjoint_grid_only(temporal_input, self.alphas_rescaled[None,])
+            kgrid = self.nufft.adjoint_grid_only(temporal_input[None,], self.alphas_rescaled_ofs[None,])[0]
             kreq = kgrid[(slice(None),) + tuple(self.inds_required)]
             out = self._continuous_adjoint_matrix_prod(kreq, self.alphas_required) * self.apod
         else:

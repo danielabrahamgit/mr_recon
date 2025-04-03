@@ -324,8 +324,9 @@ def power_method_operator(A: callable,
 def eigen_decomp_operator(A: callable,
                           x0: torch.Tensor,
                           num_eigen: int,
-                          num_power_iter: Optional[int] = 15,
-                          reverse_order: Optional[bool] = False,
+                          num_iter: Optional[int] = 15,
+                          tol: Optional[float] = 1e-9,
+                          lobpcg: Optional[bool] = True,
                           verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Uses power method to find largest num_erigen eigenvalues and corresponding eigenvectors
@@ -333,15 +334,19 @@ def eigen_decomp_operator(A: callable,
     Parameters:
     -----------
     A : callable
-        linear operator square shape
+        linear operator square shape, operators on batch of (N, *vec_shape) vectors (batch is N)
     x0 : torch.Tensor
         initial guess of eigenvector with shape (*vec_shape)
     num_eigen : int
         number of eigenvalues to find
-    num_power_iter : int
+    num_iter : int
         number of iterations to run power method
-    reverse_order : bool
-        toggles reverse order of eigenvalues, uses inverse power method instead.
+        OR
+        number of iterations to run lobpcg if lobpcg is True
+    tol : float
+        tolerance for convergence of lobpcg
+    lobpcg : bool
+        toggles use of lobpcg instead of power method
     verbose : bool
         toggles progress bar
     
@@ -352,47 +357,172 @@ def eigen_decomp_operator(A: callable,
     eigen_vals : torch.Tensor
         eigenvalues with shape (num_eigen,)
     """
-    eigen_vecs = torch.zeros(num_eigen, *x0.shape, device=x0.device, dtype=x0.dtype)
-    eigen_vals = torch.zeros(num_eigen, device=x0.device, dtype=x0.dtype)
-    A_clone = A
-    def A_resid_operator(x):
-        y = A_clone(x)
-        VH_x = einsum(eigen_vecs.conj(), x, 'n ..., ... -> n') * eigen_vals
-        V_diag_VH_x = einsum(eigen_vecs, VH_x, 'n ..., n -> ...')
-        y = y - V_diag_VH_x
-        return y
-    
-    for r in tqdm(range(num_eigen), 'Eigen Iterations', disable=not verbose):
-        init = torch.randn_like(x0)
-        init /= torch.linalg.norm(init)
-        if reverse_order:
-            vec, val = inverse_power_method_operator(A_resid_operator, init, 
-                                                    num_iter=num_power_iter, 
-                                                    verbose=False)
-            # # Get largest eval first
-            # if r == 0:
-            #     _, val_max = power_method_operator(A, init, 
-            #                                     num_iter=num_power_iter * 10, 
-            #                                     verbose=False)
-            #     val_max *= 1.0
-            #     A_clone = lambda x : val_max * x - A(x)
-            # vec, val = power_method_operator(A_resid_operator, init, 
-            #                                 num_iter=num_power_iter, 
-            #                                 verbose=False)
-        else:
+    if lobpcg:
+        
+        # linops
+        def matvec_batched(x_flt):
+            # x_flt (n, k) 
+            x_vec = x_flt.T.reshape((x_flt.shape[1], *x0.shape))
+            out_vec = A(x_vec) # k, *vec_shape
+            out_flt = out_vec.reshape((x_flt.shape[1], -1)).T # (n, k)
+            return out_flt
+        def matvec(x_flt):
+            # x_flt (n, k)
+            x_vec = x_flt.T.reshape((x_flt.shape[1], *x0.shape))
+            out_vec = torch.stack([A(x_vec[i]) for i in range(x_vec.shape[0])], dim=0) # k, *vec_shape
+            out_flt = out_vec.reshape((x_flt.shape[1], -1)).T # (n, k)
+            return out_flt
+            
+        # Check if A is batched, and make new operator
+        x_test = torch.repeat_interleave(x0[None,], 2, dim=0)
+        try:
+            A_test = A(x_test)
+            assert A_test.shape[0] == 2
+            assert A_test.shape[1:] == x0.shape
+            A_use = matvec_batched
+        except:
+            A_use = matvec
+        
+        # Run lobpcg
+        n = x0.numel()
+        k = num_eigen
+        X = torch.randn((n, k), device=x0.device, dtype=x0.dtype)
+        eigen_vals, eigen_vecs = lobpcg_operator(A_use, X, maxiter=num_iter, tol=tol, largest=True)
+        eigen_vecs = eigen_vecs.T.reshape((k, *x0.shape))
+        
+    else:
+        eigen_vecs = torch.zeros(num_eigen, *x0.shape, device=x0.device, dtype=x0.dtype)
+        eigen_vals = torch.zeros(num_eigen, device=x0.device, dtype=x0.dtype)
+        A_clone = A
+        
+        def A_resid_operator(x):
+            y = A_clone(x)
+            VH_x = einsum(eigen_vecs.conj(), x, 'n ..., ... -> n') * eigen_vals
+            V_diag_VH_x = einsum(eigen_vecs, VH_x, 'n ..., n -> ...')
+            y = y - V_diag_VH_x
+            return y
+        
+        for r in tqdm(range(num_eigen), 'Eigen Iterations', disable=not verbose):
+            init = torch.randn_like(x0)
+            init /= torch.linalg.norm(init)
+            
             vec, val = power_method_operator(A_resid_operator, init, 
-                                            num_iter=num_power_iter, 
+                                            num_iter=num_iter, 
                                             verbose=False)
-        eigen_vecs[r] = vec
-        eigen_vals[r] = val
-
-
-    if reverse_order:
-        # eigen_vals = val_max - eigen_vals
-        eigen_vals = 1 / eigen_vals
+            eigen_vecs[r] = vec
+            eigen_vals[r] = val
 
     return eigen_vecs, eigen_vals
-                          
+
+def lobpcg_operator(A: callable, 
+                    X: torch.Tensor, 
+                    precond: Optional[callable] = None, 
+                    maxiter: Optional[int] = 100, 
+                    tol: Optional[float] = 1e-6, 
+                    largest: Optional[bool] = True):
+    """
+    Matrix-free LOBPCG for a symmetric operator using only matvec calls.
+    
+    Thank you chatGPT
+
+    Parameters:
+    -----------
+    A : callable
+        (n, n) function that takes a tensor with shape (n, k) and return A(X) with shape (n, k).
+    X : torch.Tensor
+        Initial guess for eigenvectors, shape (n, k). (rows need not be orthonormal.)
+    precond : callable or None
+        Function that applies a preconditioner to a tensor.
+        If None, no preconditioning is applied.
+    maxiter : int
+        Maximum number of iterations.
+    tol : float
+        Tolerance for convergence based on the residual norm.
+    largest : bool
+        If True, computes the largest eigenpairs; otherwise, the smallest.
+
+    Returns:
+    --------
+    evals : torch.Tensor
+        Approximated eigenvalues with shape (k,)
+    evecs : torch.Tensor
+        Approximated eigenvectors with shape (n, k)
+    """
+    
+    # Ensure X has orthonormal columns
+    X, _ = torch.linalg.qr(X)
+    n, k = X.shape
+
+    # Compute initial A*X and perform a Rayleigh–Ritz on the subspace spanned by X.
+    AX = A(X)
+    T = X.H @ AX
+    evals, eigvecs = torch.linalg.eigh(T)
+    # torch.linalg.eigh returns eigenvalues in ascending order.
+    if largest:
+        idx = torch.argsort(evals, descending=True)
+    else:
+        idx = torch.argsort(evals)
+    evals = evals[idx]
+    eigvecs = eigvecs[:, idx]
+    X = X @ eigvecs  # new approximations for eigenvectors
+    AX = AX @ eigvecs
+
+    # Optionally store a previous search direction (for subspace expansion)
+    P = None
+
+    for it in tqdm(range(maxiter), 'LOBPCG Iteration'):
+        # Compute the residual: R = A*X - X*Lambda
+        R = AX - X * evals.unsqueeze(0)
+        res_norm = torch.linalg.norm(R, dim=0)
+        # Check convergence for each eigenpair.
+        if torch.all(res_norm < tol):
+            break
+
+        # Apply preconditioning if available.
+        if precond is not None:
+            W = precond(R)
+        else:
+            W = R
+
+        # Build an expanded search subspace.
+        if P is not None:
+            S = torch.cat([X, W, P], dim=1)
+        else:
+            S = torch.cat([X, W], dim=1)
+
+        # Orthonormalize the subspace S.
+        Q, _ = torch.linalg.qr(S)
+
+        # Compute A*Q using the matvec operator.
+        AQ = A(Q)
+        T_sub = Q.H @ AQ
+        
+        # Solve the small eigenproblem.
+        evals_sub, eigvecs_sub = torch.linalg.eigh(T_sub)
+        if largest:
+            idx = torch.argsort(evals_sub, descending=True)
+        else:
+            idx = torch.argsort(evals_sub)
+        evals_sub = evals_sub[idx]
+        eigvecs_sub = eigvecs_sub[:, idx]
+
+        # Update our approximations: choose the first k eigenpairs.
+        X_new = Q @ eigvecs_sub[:, :k]
+        AX_new = AQ @ eigvecs_sub[:, :k]
+        new_evals = evals_sub[:k]
+
+        # Optionally update the search direction with the orthogonal complement of X.
+        P = X_new - X @ (X.H @ X_new)
+        if P.shape[1] > 0:
+            P, _ = torch.linalg.qr(P)
+
+        # Update variables for the next iteration.
+        X = X_new
+        AX = AX_new
+        evals = new_evals
+
+    return evals, X
+          
 def inverse_power_method_operator(A: callable,
                                   x0: torch.Tensor,
                                   num_iter: Optional[int] = 15,
@@ -661,7 +791,9 @@ def conjugate_gradient(AHA: nn.Module,
     z = P(r)
     p = z.clone()
 
-    resids = []
+    if return_resids:
+        resids = []
+        xs = [x0.clone()]
 
     # Main loop
     for i in tqdm(range(num_iters), 'CG Iterations', disable=not verbose):
@@ -679,7 +811,9 @@ def conjugate_gradient(AHA: nn.Module,
         # Update r
         r = r - alpha * Ap
         rnrm = torch.norm(r)
-        resids.append(rnrm.item())
+        if return_resids:
+            resids.append(rnrm.item())
+            xs.append(x0.clone())
         if rnrm < tolerance:
             break
 
@@ -691,6 +825,6 @@ def conjugate_gradient(AHA: nn.Module,
         p = z + beta * p
     
     if return_resids:
-        return resids, x0
+        return resids, xs
     else:
         return x0

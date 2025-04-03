@@ -1,12 +1,14 @@
-from turtle import forward
 import torch
 import torch.nn as nn
+import numpy as np
+import sigpy as sp
 
 from dataclasses import dataclass
-from mr_recon import dtypes
+from mr_recon.dtypes import real_dtype, complex_dtype, np_complex_dtype
 from mr_recon.fourier import fft, ifft
-from mr_recon.utils import batch_iterator, gen_grd
+from mr_recon.utils import batch_iterator, gen_grd, np_to_torch, torch_to_np
 from mr_recon.pad import PadLast
+from mr_recon.spatial import resize
 from mr_recon.imperfections.imperfection import imperfection
 from mr_recon.fourier import (
     gridded_nufft,
@@ -60,6 +62,287 @@ class linop(nn.Module):
     
     def normal(self, *args):
         raise NotImplementedError
+
+class type3_nufft(linop):
+    
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 oversamp: float = 1.25,
+                 width: float = 4.0,
+                 use_toep: Optional[bool] = False):
+        """
+        type3 nuffts look like:
+            y_k = sum_n x_n e^{-j 2\pi phi_n * alpha_k}
+
+        Args:
+        -----
+        phis : torch.Tensor
+            The spatial phase maps, shape (B, *im_size)
+        alphas : torch.Tensor
+            The temporal phase coefficients, shape (B, *trj_size)
+        oversamp : float
+            The oversampling factor for spatial gridding
+        width : float
+            The width of the gridding kernel
+        use_toep : bool
+            toggles Topelitz for gram/normal/AHA operator
+        """    
+        # Consts
+        B, *im_size = phis.shape
+        B_, *trj_size = alphas.shape
+        R = np.prod(im_size)
+        T = np.prod(trj_size)
+        torch_dev = phis.device
+        assert B == B_, "phis and alphas must have same number of bases (B)"
+        assert phis.device == alphas.device, "phis and alphas must be on same device"
+        super().__init__(tuple(im_size), tuple(trj_size))
+        
+        # Flatten everything
+        phis_flt = phis.reshape((B, R))
+        alphas_flt = alphas.reshape((B, T))
+        
+        # Center alphas and phis
+        phis_mp = (phis_flt.min(dim=1).values + phis_flt.max(dim=1).values)/2
+        alphas_mp = (alphas_flt.min(dim=1).values + alphas_flt.max(dim=1).values)/2
+        phis_flt_cent = phis_flt - phis_mp[:, None]
+        alphas_flt_cent = alphas_flt - alphas_mp[:, None]
+        
+        # Rescale phis to be between [-1/2, 1/2]
+        scales = phis_flt_cent.abs().max(dim=1).values * 2
+        phis_flt_cent /= scales[:, None]
+        phis_mp /= scales
+        alphas_flt_cent *= scales[:, None]
+        alphas_mp *= scales
+        
+        # Store phis, alphas
+        self.phis = phis_flt_cent
+        self.alphas = alphas_flt_cent
+        self.phis_mp = phis_mp
+        self.alphas_mp = alphas_mp
+        self.torch_dev = torch_dev
+        self.B = B
+        
+        # Consts for gridding
+        self.grd_S = alphas_flt_cent.abs().max(dim=1).values
+        self.grd_W = width
+        self.grd_N_os = torch.ceil(2 * self.grd_S * oversamp + self.grd_W).long()
+        self.grd_os = self.grd_N_os / (self.grd_N_os / oversamp).round() # FIXME?
+        self.grd_N = self.grd_N_os / self.grd_os
+        self.grd_gamma = self.grd_N_os / (2 * self.grd_os * self.grd_S)
+        self.grd_beta = np.pi * (((self.grd_W / self.grd_os) * (self.grd_os - 0.5))**2 - 0.8)**0.5
+        self.grd_N_os = tuple((self.grd_N * self.grd_os).ceil().long().tolist())
+        self.nft = sigpy_nufft(self.grd_N_os)
+        
+        if use_toep:
+            self.kerns = self.nft.calc_teoplitz_kernels(trj=self.alphas.T[None,])
+        else:
+            self.kerns = None
+        
+    @staticmethod
+    def apod(x, beta, W):
+        a = (beta**2 - (np.pi * W * x) ** 2) ** 0.5
+        return a / torch.sinh(a)
+        
+    def forward(self,
+                x: torch.Tensor,) -> torch.Tensor:
+        """
+        Forward type 3 nufft.
+        
+        Args:
+        -----
+        x : torch.Tensor
+            The image to be transformed, shape (N, *im_size)
+        
+        Returns:
+        --------
+        y : torch.Tensor
+            The output with shape (N, *trj_size)
+        """
+        # Consts
+        N = x.shape[0]
+        
+        # ----------------- Step 0: Apply spatial midpoints -----------------
+        phz = self.phis.T @ self.alphas_mp
+        x_mp = x.reshape(N, -1) * torch.exp(-2j * torch.pi * phz)
+
+        # ----------------- Step 1: gridding in the image domain -----------------
+        # Compute shifts and scales
+        scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+        shifts = (self.grd_os * self.grd_N).ceil() // 2
+        
+        # Define output matrix size and betas
+        betas = tuple(self.grd_beta.tolist())
+
+        # Move to cupy
+        x_cp_flt = torch_to_np(x_mp)
+        dev = sp.get_device(x_cp_flt)
+        with dev:
+            
+            # Rescale trajectory
+            trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+            trj_cp = torch_to_np(trj)
+            
+            # Gridding over loop
+            output = dev.xp.zeros((N, *self.grd_N_os), dtype=np_complex_dtype)
+            for n in range(N):
+                output[n] = sp.interp.gridding(x_cp_flt[n], trj_cp, self.grd_N_os,
+                                               kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            x_grid = np_to_torch(output) / (self.grd_W ** self.B)
+            x_grid /= x[0].numel() ** 0.5 # orthogonal scaling
+            
+        # ----------------- Step 2: Call NUFFT on gridded data -----------------
+        alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
+        y_pre_apod = self.nft.forward(x_grid, alphas_rep * self.grd_gamma) # N T
+        
+        # ----------------- Step 3: Apodize -----------------
+        y = y_pre_apod * self.apod(alphas_rep * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+        
+        # ----------------- Step 4: Apply temporal midpoints -----------------
+        phz = (self.alphas.T + self.alphas_mp) @ (self.phis_mp)
+        y = y * torch.exp(-2j * torch.pi * phz)
+        
+        # ----------------- Step 5: Reshape and Pray -----------------
+        return y.reshape((N, *self.oshape))
+
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint type 3 nufft.
+        
+        Args:
+        -----
+        y : torch.Tensor
+            The k-space data to be transformed, shape (N, *trj_size)
+        
+        Returns:
+        --------
+        x : torch.Tensor
+            The output with shape (N, *im_size)
+        """
+        # Consts
+        N = y.shape[0]
+        
+        # ----------------- Step 0: Apply temporal midpoints -----------------
+        phz = self.alphas.T @ self.phis_mp
+        y_mp = y.reshape((N, -1)) * torch.exp(2j * torch.pi * phz)
+        
+        # ----------------- Step 1: Apodize -----------------
+        alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
+        y_apod = y_mp * self.apod(alphas_rep * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+        
+        # ----------------- Step 2: Call Adjoint NUFFT -----------------
+        x_grid = self.nft.adjoint(y_apod, alphas_rep * self.grd_gamma) # N *self.grd_N_os
+        
+        # ----------------- Step 3: Interpolation in the image domain -----------------
+        # Compute shifts and scales
+        scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+        shifts = (self.grd_os * self.grd_N).ceil() // 2
+        
+        # Define output matrix size and betas
+        betas = tuple(self.grd_beta.tolist())
+
+        # Move to cupy
+        x_grid_cp = torch_to_np(x_grid)
+        dev = sp.get_device(x_grid_cp)
+        with dev:
+            
+            # Rescale trajectory
+            trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+            trj_cp = torch_to_np(trj)
+            
+            # Interpolate over loop
+            output = dev.xp.zeros((N, *trj.shape[:-1]), dtype=np_complex_dtype)
+            for n in range(N):
+                output[n] = sp.interp.interpolate(x_grid_cp[n], trj_cp,
+                                                  kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            x = np_to_torch(output) / (self.grd_W ** self.B)
+            x /= x[0].numel() ** 0.5 # orthogonal scaling
+
+        # ----------------- Step 4: Apply spatial midpoints -----------------
+        phz = (self.phis.T + self.phis_mp) @ self.alphas_mp
+        x = x * torch.exp(2j * torch.pi * phz)
+        
+        # ----------------- Step 5: Reshape and pray -----------------
+        return x.reshape((N, *self.ishape))
+
+    def normal(self,
+               x: torch.Tensor) -> torch.Tensor:
+        if self.kerns is None:
+            return self.adjoint(self.forward(x))
+        else:
+            # Consts
+            N = x.shape[0]
+            B = self.phis.shape[0]
+            
+            # ----------------- Step 0: Apply spatial midpoints -----------------
+            phz = self.phis.T @ self.alphas_mp
+            x_mp = x.reshape(N, -1) * torch.exp(-2j * torch.pi * phz)
+
+            # ----------------- Step 1: gridding in the image domain -----------------
+            # Compute shifts and scales
+            scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+            shifts = (self.grd_os * self.grd_N).ceil() // 2
+            
+            # Define output matrix size and betas
+            betas = tuple(self.grd_beta.tolist())
+
+            # Move to cupy
+            x_cp_flt = torch_to_np(x_mp)
+            dev = sp.get_device(x_cp_flt)
+            with dev:
+                
+                # Rescale trajectory
+                trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+                trj_cp = torch_to_np(trj)
+                
+                # Gridding over loop
+                output = dev.xp.zeros((N, *self.grd_N_os), dtype=np_complex_dtype)
+                for n in range(N):
+                    output[n] = sp.interp.gridding(x_cp_flt[n], trj_cp, self.grd_N_os,
+                                                kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                x_grid = np_to_torch(output) / (self.grd_W ** self.B)
+                x_grid /= x[0].numel() ** 0.5 # orthogonal scaling
+                
+            # ----------------- Step 2: Apply toeplitz kernels -----------------
+            x_zp = resize(x_grid, [N,] + [self.grd_N_os[i] * 2 for i in range(B)])
+            x_ft = fft(x_zp, dim=tuple(range(-B, 0)))
+            x_tp = x_ft * self.kerns
+            x_ift = ifft(x_tp, dim=tuple(range(-B, 0)))
+            x_crp = resize(x_ift, (N, *self.grd_N_os))
+            x_grid = x_crp
+            
+            # ----------------- Step 3: Interpolation in the image domain -----------------
+            # Compute shifts and scales
+            scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+            shifts = (self.grd_os * self.grd_N).ceil() // 2
+            
+            # Define output matrix size and betas
+            betas = tuple(self.grd_beta.tolist())
+
+            # Move to cupy
+            x_grid_cp = torch_to_np(x_grid)
+            dev = sp.get_device(x_grid_cp)
+            with dev:
+                
+                # Rescale trajectory
+                trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+                trj_cp = torch_to_np(trj)
+                
+                # Interpolate over loop
+                output = dev.xp.zeros((N, *trj.shape[:-1]), dtype=np_complex_dtype)
+                for n in range(N):
+                    output[n] = sp.interp.interpolate(x_grid_cp[n], trj_cp,
+                                                    kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                x = np_to_torch(output) / (self.grd_W ** self.B)
+                x /= x[0].numel() ** 0.5 # orthogonal scaling
+
+            # ----------------- Step 4: Apply spatial midpoints -----------------
+            phz = (self.phis.T + self.phis_mp) @ self.alphas_mp
+            x = x * torch.exp(2j * torch.pi * phz)
+            
+            # ----------------- Step 5: Reshape and pray -----------------
+            return x.reshape((N, *self.ishape))
 
 class imperf_coil_lowrank(linop):
     """
@@ -398,6 +681,179 @@ class multi_chan_linop(linop):
             img_hat[i] = self.A.normal(img[i])
         return img_hat
 
+class experimental_sense_coil(linop):
+    
+    def __init__(self,
+                 trj: torch.Tensor,
+                 spatial_funcs: torch.Tensor,
+                 temporal_coil_funcs: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 nufft: Optional[NUFFT] = None,
+                 use_toeplitz: Optional[bool] = False,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Parameters
+        ----------
+        trj : torch.tensor <float> | GPU
+            The k-space trajectory with shape (*trj_size, d). 
+                we assume that trj values are in [-n/2, n/2] (for nxn grid)
+        spatial_funcs : torch.tensor <complex> | GPU
+            the spatial functions for imperfection models with shape (L, *im_size)
+        temporal_coil_funcs : torch.tensor <complex> | GPU
+            the temporal functions for imperfection models with shape (L, C, *trj_size)
+        dcf : torch.tensor <float> | GPU
+            the density comp. functon with shape (*trj_size)
+        nufft : NUFFT
+            the nufft object, defaults to torchkbnufft
+        use_toeplitz : bool
+            toggles toeplitz normal operator
+        bparams : batching_params
+            contains various batch sizes
+        """
+        im_size = spatial_funcs.shape[1:]
+        trj_size = trj.shape[:-1]
+        C = temporal_coil_funcs.shape[1]
+        super().__init__(im_size, (C, *trj_size))
+
+        # Consts
+        torch_dev = trj.device
+        assert spatial_funcs.device == torch_dev
+        assert temporal_coil_funcs.device == torch_dev
+        assert temporal_coil_funcs.shape[0] == spatial_funcs.shape[0]
+
+        # Default params
+        if nufft is None:
+            nufft = sigpy_nufft(im_size)
+        if dcf is None:
+            dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+        else:
+            assert dcf.device == torch_dev
+        
+        # Rescale and change types
+        trj = nufft.rescale_trajectory(trj).type(real_dtype)
+        dcf = dcf.type(real_dtype)
+        
+        # Compute toeplitz kernels
+        if use_toeplitz:
+            raise NotImplementedError("Toeplitz kernels not implemented for coil imperfection models")
+
+        # Save
+        self.b = spatial_funcs
+        self.h = temporal_coil_funcs
+        self.im_size = im_size
+        self.trj_size = trj_size
+        self.trj = trj
+        self.dcf = dcf
+        self.nufft = nufft
+        self.bparams = bparams
+        self.torch_dev = torch_dev
+
+    def forward(self,
+                img: torch.Tensor) -> torch.Tensor:
+        """
+        Forward call of this linear model.
+
+        Parameters
+        ----------
+        img : torch.tensor <complex> | GPU
+            the image with shape (*im_size)
+        
+        Returns
+        ---------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (C, *trj_size)
+        """
+
+        # Useful constants
+        L = self.b.shape[0]
+        C = self.h.shape[1]
+        coil_batch_size = self.bparams.coil_batch_size
+        seg_batch_size = self.bparams.field_batch_size
+
+        # Result array
+        ksp = torch.zeros((C, *self.trj_size), dtype=complex_dtype, device=self.torch_dev)
+
+        # Batch over segments 
+        for l1, l2 in batch_iterator(L, seg_batch_size):    
+            
+            # Apply spatial functions
+            Bx = self.b[l1:l2] * img # L *im_size
+
+            # NUFFT
+            FBx = self.nufft.forward(Bx[None,], self.trj[None, ...])[0] # L *trj_size
+            
+            # Batch over coils ??
+            # Apply temporal functions
+            HFBx = (FBx[:, None] * self.h[l1:l2]).sum(dim=0) # C *trj_size
+            
+            # Append to k-space
+            ksp += HFBx
+
+        return ksp
+    
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint call of this linear model.
+
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        
+        Returns
+        ---------
+        img : torch.tensor <complex> | GPU
+            the image with shape (*im_size)
+        """
+
+        # Useful constants
+        L = self.b.shape[0]
+        C = self.h.shape[1]
+        coil_batch_size = self.bparams.coil_batch_size
+        seg_batch_size = self.bparams.field_batch_size
+
+        # Result image
+        img = torch.zeros(self.im_size, dtype=complex_dtype, device=self.torch_dev)
+        
+        # Apply DCF
+        Wy = (ksp * self.dcf) # C *trj_size
+            
+        # Batch over segments
+        for l1, l2 in batch_iterator(L, seg_batch_size):
+            
+            # batch over coils?    
+            # Apply temporal functions
+            HWy = (Wy * self.h.conj()[l1:l2, :]).sum(dim=1) # L *trj_size
+            
+            # Adjoint NUFFT
+            FHWy = self.nufft.adjoint(HWy[None, ...], self.trj[None, ...])[0] # L *im_size
+
+            # Adjoint spatial functions
+            BFHWy = (FHWy * self.b.conj()[l1:l2]).sum(dim=0) # im_size
+
+            # Append to image
+            img += BFHWy
+
+        return img
+    
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+        """
+        Gram/normal call of this linear model (A.H (A (x))).
+
+        Parameters
+        ----------
+        img : torch.tensor <complex> | GPU
+            the image with shape (*im_size)
+        
+        Returns
+        ---------
+        img_hat : torch.tensor <complex> | GPU
+            the ouput image with shape (*im_size)
+        """
+        return self.adjoint(self.forward(img))
+
 class experimental_sense(linop):
     """
     Linop for sense models with optional imperfection modeling
@@ -506,7 +962,7 @@ class experimental_sense(linop):
         Returns
         ---------
         ksp : torch.tensor <complex> | GPU
-            the k-space data with shape (nc, *trj_size)
+            the k-space data with shape (C, *trj_size)
         """
 
         # Useful constants

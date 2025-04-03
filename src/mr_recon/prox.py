@@ -233,7 +233,7 @@ class LocallyLowRank(nn.Module):
         x = rearrange(x, 'n a b ... -> n b a (...)')
 
         # Take SVD
-        U, S, Vh = torch.linalg.svd(x, full_matrices=False)
+        U, S, Vh = torch.linalg.svd(x, full_matrices=False, driver='gesvda')
 
         # Threshold
         S = S - self.hparams.threshold
@@ -241,7 +241,7 @@ class LocallyLowRank(nn.Module):
         S = S.type(U.dtype)
 
         # Recompose blocks
-        x = U @ torch.diag_embed(S) @ Vh
+        x = U @ (S[..., None] * Vh)
 
         # Unblock and normalize
         x = rearrange(x, 'n b a x -> n a b x')

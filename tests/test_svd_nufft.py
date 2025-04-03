@@ -8,6 +8,7 @@ import numpy as np
 import sigpy as sp
 import sigpy.mri as mri
 
+from mr_recon.algs import density_compensation
 from mr_recon.linops import sense_linop, batching_params
 from mr_recon.utils import np_to_torch, normalize
 from mr_recon.recons import CG_SENSE_recon
@@ -30,12 +31,12 @@ im_size = (220, 220, 220)
 z_slc = 110
 ninter = 16
 ncoil = 6
-R = 4
-L = 7
+R = 2
+L = 12
 lamda_l2 = 1e-3 * 0
 max_iter = 10
 max_eigen = 0.4
-device_idx = 5
+device_idx = 2
 os_grid = 1.0
 try: 
 	torch_dev = torch.device(device_idx)
@@ -45,7 +46,7 @@ except:
 # Gen data
 phantom = sp.shepp_logan(im_size)
 # trj = mri.spiral(fov=1,
-# 				 N=220,
+# 				 N=im_size[0],
 # 				 f_sampling=.05,
 # 				 R=1.0,
 # 				 ninterleaves=ninter,
@@ -53,9 +54,12 @@ phantom = sp.shepp_logan(im_size)
 # 				 gm=40e-3,
 # 				 sm=100)
 # trj = trj.reshape((-1, ninter, 2), order='F')[:, ::round(R), :]
-trj = np.load('../../mr_data/threeT/data/trj.npy')
-dcf = np.load('../../mr_data/threeT/data/dcf.npy')
 mps = mri.birdcage_maps((ncoil, *im_size), r=1.0)
+ros = slice(None)
+grps = slice(None)
+trs = slice(None)
+trj = np.load('../../mr_data/threeT/data/trj.npy')[ros, grps, trs, :]
+dcf = np.load('../../mr_data/threeT/data/dcf.npy')[ros, grps, trs]
 # dcf = sp.to_device(mri.pipe_menon_dcf(trj, im_size, device=sp.Device(device_idx)))
 dcf /= dcf.max()
 
@@ -176,6 +180,14 @@ plt.legend()
 plt.figure(figsize=figsize)
 plt.title(f'Nufft Recon T = {t_nufft:.2f} s')
 img = np.abs(img_nufft)
+vmax = np.median(img) + 3 * np.std(img)
+plt.imshow(img[z_slc], cmap='gray', vmin=0, vmax=vmax)
+plt.axis('off')
+plt.tight_layout()
+
+plt.figure(figsize=figsize)
+plt.title(f'SVD_nufft Recon T = {t_imperf:.2f} s (L = {L})')
+img = np.abs(imgs_imperf[-1])
 vmax = np.median(img) + 3 * np.std(img)
 plt.imshow(img[z_slc], cmap='gray', vmin=0, vmax=vmax)
 plt.axis('off')

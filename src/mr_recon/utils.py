@@ -123,9 +123,9 @@ def quantize_data(data: torch.Tensor,
         # Pick clusters
         centers = torch.zeros((K, d), dtype=data.dtype, device=data.device)
         lin = torch.linspace(start=data_flt[:, 0].min(), 
-                                end=data_flt[:, 0].max(), 
-                                steps=K + 1, 
-                                device=torch_dev)
+                             end=data_flt[:, 0].max(), 
+                             steps=K + 1, 
+                             device=torch_dev)
         centers[:, 0] = (lin[:-1] + lin[1:]) / 2
 
         # indices

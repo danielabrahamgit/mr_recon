@@ -9,19 +9,19 @@ from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, svd_nufft, torchkb_nu
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
 from einops import rearrange, einsum
 
-# Random seeds
-np.random.seed(0)
-torch.manual_seed(0)
+# # Random seeds
+# np.random.seed(0)
+# torch.manual_seed(0)
 
 # Params
-device_idx = 5
+device_idx = 2
 grd_os = 2.0
 try:
     torch_dev = torch.device(device_idx)
 except:
     torch_dev = torch.device('cpu')
 d = 2
-im_size = (50,)*d
+im_size = (6,)*d
 rtol = 5e-2 
 eps = 1e-2
 
@@ -29,19 +29,21 @@ eps = 1e-2
 grd = gen_grd(im_size).to(torch_dev)
 crds = (torch.rand((1000, d), dtype=torch.float32, device=torch_dev) - 0.5)
 for i in range(d):
-    crds[..., i] *= im_size[i]
-# crds = torch.round(crds * grd_os) / grd_os
+    crds[..., i] *= im_size[i] * .9
+crds = torch.round(crds * grd_os) / grd_os
 img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
 img = torch.randn_like(img)
 
 # Create nuffts
-# grd_nufft = gridded_nufft(im_size, grd_os)
+grd_nufft = gridded_nufft(im_size, grd_os)
 sp_nufft = sigpy_nufft(im_size)
 tr_nufft = triton_nufft(im_size)
-nuffts = [sp_nufft, tr_nufft]
-names = ['sigpy_nufft', 'triton_nufft']
+# sv_nufft = svd_nufft(im_size, n_svd=16, svd_mx_size=(35,)*d)
+nuffts = [sp_nufft, tr_nufft, grd_nufft]
+names = ['sigpy_nufft', 'triton_nufft', 'grd_nufft']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
+    plt.ylim(-.2, 1.2)
     plt.show()
 def plot_err_img(err):
     plt.imshow(err.cpu())
