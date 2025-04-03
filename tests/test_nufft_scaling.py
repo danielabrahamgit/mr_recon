@@ -29,7 +29,7 @@ eps = 1e-2
 grd = gen_grd(im_size).to(torch_dev)
 crds = (torch.rand((1000, d), dtype=torch.float32, device=torch_dev) - 0.5)
 for i in range(d):
-    crds[..., i] *= im_size[i] * .9
+    crds[..., i] *= im_size[i] #* .9
 crds = torch.round(crds * grd_os) / grd_os
 img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
 img = torch.randn_like(img)

@@ -134,23 +134,40 @@ def temporal_psf_eigen(phis: torch.Tensor,
         a = torch.exp(-2j * np.pi * phz) # T R
         return a.H @ y
     
-    t3n = type3_nufft(phis_flt, alphas_flt, oversamp=2.0, width=4, use_toep=True)
+    t3n = type3_nufft(phis_flt, alphas_flt, oversamp=2.0, width=3, use_toep=True)
+    bs = 20
+    def normal_batched(x):
+        # x is N, *im_size
+        for n1 in range(0, x.shape[0], bs):
+            n2 = min(n1 + bs, x.shape[0])
+            x_n = x[n1:n2]
+            y_n = t3n.normal(x_n)
+            if n1 == 0:
+                y = y_n
+            else:
+                y = torch.cat((y, y_n), dim=0)
+        return y
+    eigen_decomp_operator(normal_batched, torch.randn_like(inp), num_eigen=20, num_iter=100)
+    # quit()
     
-    eigen_decomp_operator(lambda x : t3n.normal(x), torch.randn_like(inp), num_eigen=20, num_iter=100)
-    quit()
-    
-    out = t3n.forward(inp[None,])[0]
-    out_gt = A_gt(inp)
+    # out = t3n.forward(inp[None,])[0]
+    # out_gt = A_gt(inp)
     # out = t3n.adjoint(inp_t[None,])[0]
     # out_gt = AH_gt(inp_t)
+    out = t3n.normal(inp[None,])[0]
+    out_gt = AH_gt(A_gt(inp))
     scale = (out.conj() * out_gt).sum() / (out.conj() * out).sum()
     out *= scale
+    inds = slice(0, 1000)
     
     import matplotlib.pyplot as plt
     
-    plt.plot(out.real.cpu())
+    print((out - out_gt).norm() / out_gt.norm())
+    quit()
+    
+    plt.plot(out.real.cpu()[inds])
     # plt.figure()
-    plt.plot(out_gt.real.cpu(), ls='--')
+    plt.plot(out_gt.real.cpu()[inds], ls='--')
     plt.show()
     quit()
     
