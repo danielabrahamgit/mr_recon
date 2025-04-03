@@ -72,8 +72,18 @@ class type3_nufft(linop):
                  width: float = 4.0,
                  use_toep: Optional[bool] = False):
         """
+        KB implimentation of the type-3 nufft as described in:
+        "A PARALLEL NONUNIFORM FAST FOURIER TRANSFORM LIBRARY 
+        BASED ON AN ``EXPONENTIAL OF SEMICIRCLE" KERNEL - Barnett et. al.
+        "https://epubs.siam.org/doi/pdf/10.1137/18M120885X
+        
         type3 nuffts look like:
             y_k = sum_n x_n e^{-j 2\pi phi_n * alpha_k}
+            
+        TODO list: 
+        1. Fix KB beta calculation -- beatty is not good for large oversamp factors
+        2. Update gridding/interp functions to something faster
+        3. Update gridding/interp functions to be n-dimensional (currently up to 5d)
 
         Args:
         -----
@@ -115,7 +125,7 @@ class type3_nufft(linop):
         alphas_flt_cent *= scales[:, None]
         alphas_mp *= scales
         
-        # Store phis, alphas
+        # Store phis, alphas, other constants
         self.phis = phis_flt_cent
         self.alphas = alphas_flt_cent
         self.phis_mp = phis_mp
@@ -128,6 +138,7 @@ class type3_nufft(linop):
         self.grd_W = width
         self.grd_N_os = torch.ceil(2 * self.grd_S * oversamp + self.grd_W).long()
         self.grd_os = self.grd_N_os / (self.grd_N_os / oversamp).round() # FIXME?
+        print(f'Actual oversamplings = {self.grd_os}')
         self.grd_N = self.grd_N_os / self.grd_os
         self.grd_gamma = self.grd_N_os / (2 * self.grd_os * self.grd_S)
         self.grd_beta = np.pi * (((self.grd_W / self.grd_os) * (self.grd_os - 0.5))**2 - 0.8)**0.5
@@ -135,7 +146,8 @@ class type3_nufft(linop):
         self.nft = sigpy_nufft(self.grd_N_os)
         
         if use_toep:
-            self.kerns = self.nft.calc_teoplitz_kernels(trj=self.alphas.T[None,])
+            apod_weights = self.apod(self.alphas.T * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+            self.kerns = self.nft.calc_teoplitz_kernels(trj=self.alphas.T[None,] * self.grd_gamma, weights=apod_weights[None,] ** 2)
         else:
             self.kerns = None
         
@@ -183,13 +195,13 @@ class type3_nufft(linop):
             trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
             trj_cp = torch_to_np(trj)
             
-            # Gridding over loop
-            output = dev.xp.zeros((N, *self.grd_N_os), dtype=np_complex_dtype)
-            for n in range(N):
-                output[n] = sp.interp.gridding(x_cp_flt[n], trj_cp, self.grd_N_os,
-                                               kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            # Gridding
+            output = sp.interp.gridding(x_cp_flt, trj_cp, (N,) + self.grd_N_os,
+                                        kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            
+            # Orthogonal scaling
             x_grid = np_to_torch(output) / (self.grd_W ** self.B)
-            x_grid /= x[0].numel() ** 0.5 # orthogonal scaling
+            x_grid /= x[0].numel() ** 0.5
             
         # ----------------- Step 2: Call NUFFT on gridded data -----------------
         alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
@@ -251,13 +263,13 @@ class type3_nufft(linop):
             trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
             trj_cp = torch_to_np(trj)
             
-            # Interpolate over loop
-            output = dev.xp.zeros((N, *trj.shape[:-1]), dtype=np_complex_dtype)
-            for n in range(N):
-                output[n] = sp.interp.interpolate(x_grid_cp[n], trj_cp,
-                                                  kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            # Interpolate
+            output = sp.interp.interpolate(x_grid_cp, trj_cp,
+                                           kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            
+            # Orthogonal scaling
             x = np_to_torch(output) / (self.grd_W ** self.B)
-            x /= x[0].numel() ** 0.5 # orthogonal scaling
+            x /= x[0].numel() ** 0.5
 
         # ----------------- Step 4: Apply spatial midpoints -----------------
         phz = (self.phis.T + self.phis_mp) @ self.alphas_mp
@@ -268,6 +280,19 @@ class type3_nufft(linop):
 
     def normal(self,
                x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies normal operator
+        
+        Args:
+        -----
+        x : torch.Tensor
+            The image to be transformed, shape (N, *im_size)
+            
+        Returns:
+        --------
+        torch.Tensor
+            The output with shape (N, *im_size)
+        """
         if self.kerns is None:
             return self.adjoint(self.forward(x))
         else:
@@ -296,13 +321,13 @@ class type3_nufft(linop):
                 trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
                 trj_cp = torch_to_np(trj)
                 
-                # Gridding over loop
-                output = dev.xp.zeros((N, *self.grd_N_os), dtype=np_complex_dtype)
-                for n in range(N):
-                    output[n] = sp.interp.gridding(x_cp_flt[n], trj_cp, self.grd_N_os,
+                # Gridding
+                output = sp.interp.gridding(x_cp_flt, trj_cp, (N,) + self.grd_N_os,
                                                 kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                
+                # Orthogonal Scaling
                 x_grid = np_to_torch(output) / (self.grd_W ** self.B)
-                x_grid /= x[0].numel() ** 0.5 # orthogonal scaling
+                x_grid /= x[0].numel() ** 0.5
                 
             # ----------------- Step 2: Apply toeplitz kernels -----------------
             x_zp = resize(x_grid, [N,] + [self.grd_N_os[i] * 2 for i in range(B)])
@@ -329,13 +354,13 @@ class type3_nufft(linop):
                 trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
                 trj_cp = torch_to_np(trj)
                 
-                # Interpolate over loop
-                output = dev.xp.zeros((N, *trj.shape[:-1]), dtype=np_complex_dtype)
-                for n in range(N):
-                    output[n] = sp.interp.interpolate(x_grid_cp[n], trj_cp,
-                                                    kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                # Interpolate
+                output = sp.interp.interpolate(x_grid_cp, trj_cp,
+                                               kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                
+                # Orthogonal scaling
                 x = np_to_torch(output) / (self.grd_W ** self.B)
-                x /= x[0].numel() ** 0.5 # orthogonal scaling
+                x /= x[0].numel() ** 0.5
 
             # ----------------- Step 4: Apply spatial midpoints -----------------
             phz = (self.phis.T + self.phis_mp) @ self.alphas_mp

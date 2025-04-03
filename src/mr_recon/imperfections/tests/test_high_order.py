@@ -77,7 +77,7 @@ spatial_input = torch.randn(phis.shape[1:], device=torch_dev, dtype=torch.comple
 torch.cuda.synchronize()
 
 # "Better" High Order Phase Transform
-h = temporal_psf_eigen(phis[:1], alphas[:1])
+h = temporal_psf_eigen(phis, alphas)
 breakpoint()
 # hop = high_order_phase(phis, alphas, use_KB=True, temporal_batch_size=2**10, verbose=True)
 quit()

@@ -919,19 +919,17 @@ class gridded_nufft(NUFFT):
                  im_size: tuple,
                  grid_oversamp: Optional[float] = 1.0):
         super().__init__(im_size)
-        grog_os_size = tuple([round(i * grid_oversamp) for i in self.im_size])
+        self.im_size_os = tuple([round(i * grid_oversamp) for i in self.im_size])
         self.grid_oversamp = grid_oversamp
-        self.grog_padder = PadLast(grog_os_size, im_size)
     
     def rescale_trajectory(self,
                            trj: torch.Tensor) -> torch.Tensor:
         
         # Clamp each dimension
         trj_rs = trj * self.grid_oversamp
-        grid_os_size = self.grog_padder.pad_im_size
         for i in range(trj_rs.shape[-1]):
-            n_over_2 = grid_os_size[i]/2
-            trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, grid_os_size[i]-1)
+            n_over_2 = self.im_size_os[i]/2
+            trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, self.im_size_os[i]-1)
         trj_rs = torch.round(trj_rs).type(torch.int32)
 
         return trj_rs
@@ -939,12 +937,15 @@ class gridded_nufft(NUFFT):
     def forward_FT_only(self,
                         img: torch.Tensor) -> torch.Tensor:
         
+        # Consts
+        d = len(self.im_size)
+        
         # To torch
         img_torch = np_to_torch(img)
 
         # Oversampled FFT
-        img_os = self.grog_padder.forward(img_torch)
-        ksp_os = fft(img_os, dim=tuple(range(-len(self.im_size), 0)))
+        img_os = resize(img_torch, tuple(img.shape[:-d]) + self.im_size_os)
+        ksp_os = fft(img_os, dim=tuple(range(-d, 0)))
         
         return ksp_os
     
@@ -971,7 +972,7 @@ class gridded_nufft(NUFFT):
         
         # iFFT and crop
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
-        img = self.grog_padder.adjoint(img_os)
+        img = resize(img_os, tuple(img_os.shape[:-d]) + self.im_size)
         
         return img * self.grid_oversamp
     
@@ -984,13 +985,12 @@ class gridded_nufft(NUFFT):
         # Consts
         d = trj.shape[-1]
         N = trj.shape[0]
-        grid_os_size = self.grog_padder.pad_im_size
 
         # Adjoint NUFFT
-        ksp_os = torch.zeros((*ksp.shape[:-(trj.ndim - 2)], *grid_os_size), 
+        ksp_os = torch.zeros((*ksp.shape[:-(trj.ndim - 2)], *self.im_size_os), 
                              dtype=complex_dtype, device=ksp_torch.device)
         for i in range(N):
-            ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), grid_os_size)
+            ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), self.im_size_os)
             
         return ksp_os
     
