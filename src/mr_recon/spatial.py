@@ -1,8 +1,10 @@
 import torch
+import numpy as np
 import sigpy as sp
 
 from typing import Optional
 from torch.nn.functional import conv1d
+from cupyx.scipy.ndimage import map_coordinates
 from einops import rearrange
 from mr_recon.fourier import fft, ifft
 from mr_recon.utils import gen_grd, torch_to_np, np_to_torch, apply_window, resize
@@ -221,3 +223,55 @@ def spatial_resize(x: torch.Tensor,
     
     x_rs = x_rs_flt.reshape((*orig_batch, *im_size))
     return x_rs
+
+def spatial_interp(spatial_input: torch.Tensor, 
+                   coords: torch.Tensor, 
+                   order: Optional[int] = 3, 
+                   mode: Optional[str] = 'nearest') -> torch.Tensor:
+    """
+    Perform polynomial interpolation on the spatial dimensions of a tensor
+    at specified coordinates.
+    
+    Parameters:
+    -----------
+    spatial_input : torch.Tensor
+        Input tensor of shape (N, d0, d1, ..., d_{K-1}).
+    coords : torch.Tensor
+        target coordinates with shape (M, K)
+    order : int, optional
+        The order of the spline interpolation (default is cubic, order=3).
+    mode : str, optional
+        How to handle points outside the boundaries (default 'nearest').
+    
+    Returns:
+    --------
+    out : torch.Tensor
+        An array of interpolated values with shape (N, M). That is, for each
+        batch element, the tensor is evaluated at the provided coordinates.
+    """
+    # Convert to cupy
+    torch_dev = spatial_input.device
+    spatial_input_cp = torch_to_np(spatial_input)
+    crds_flt_cp = torch_to_np(coords).reshape((-1, coords.shape[-1]))  # Flatten for map_coordinates
+    dev = sp.get_device(spatial_input_cp)
+    xp = dev.xp
+    
+    # Consts
+    with dev:
+        M, K = crds_flt_cp.shape
+        N = spatial_input_cp.shape[0]
+        out = xp.empty((N, M), dtype=spatial_input_cp.dtype)
+        assert spatial_input_cp.ndim == K + 1, "Input tensor must have K spatial dimensions."
+        
+        # Loop over batch elements.
+        for i in range(N):
+            interp_vals = map_coordinates(
+                spatial_input_cp[i], crds_flt_cp.T, order=order, mode=mode
+            )
+            out[i] = interp_vals
+    
+    # Convert back to torch
+    out = np_to_torch(out).to(torch_dev)
+    out = out.reshape((N, *coords.shape[:-1]))  # Reshape to (N, *crds_size)
+    
+    return out

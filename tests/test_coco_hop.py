@@ -7,11 +7,19 @@ import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
+from einops import einsum, rearrange
+
 from mr_recon.imperfections.spatio_temporal_imperf import high_order_phase
-from mr_recon.imperfections.imperf_decomp import svd_decomp_operator, temporal_segmentation, svd_decomp_matrix
-from mr_recon.linops import batching_params, experimental_sense
+from mr_recon.imperfections.imperf_decomp import svd_decomp_operator, temporal_segmentation, svd_decomp_matrix, decomp_with_grappa
+from mr_recon.linops import batching_params, experimental_sense, experimental_sense_coil
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.imperfections.coco import coco_imperfection
+from mr_recon.calib import synth_cal
+from mr_recon.fourier import ifft
+
+from igrog.grogify import spatio_temporal_implicit_grogify
+from igrog.gridding import gridding_params
+from igrog.training import training_params
 
 # Set seeds
 torch.manual_seed(0)
@@ -26,14 +34,21 @@ fpath = '/local_mount/space/mayday/data/users/abrahamd/hofft/coco_spiral/best_sl
 kwargs = {'map_location': torch_dev, 'weights_only': True}
 b0 = torch.load(f'{fpath}b0.pt', **kwargs).type(torch.float32)
 mps = torch.load(f'{fpath}mps.pt', **kwargs).type(torch.complex64)
-ksp = torch.load(f'{fpath}ksp.pt', **kwargs)[:, :, ::R].type(torch.complex64)
-trj = torch.load(f'{fpath}trj.pt', **kwargs)[:, ::R].type(torch.float32)
-dcf = torch.load(f'{fpath}dcf.pt', **kwargs)[:, ::R].type(torch.float32)
 img_gt = torch.load(f'{fpath}img_gt.pt', **kwargs).type(torch.complex64)
+ksp_fs = torch.load(f'{fpath}ksp.pt', **kwargs).type(torch.complex64)
+trj_fs = torch.load(f'{fpath}trj.pt', **kwargs).type(torch.float32)
+dcf_fs = torch.load(f'{fpath}dcf.pt', **kwargs).type(torch.float32)
+ksp = ksp_fs[..., ::R]
+trj = trj_fs[:, ::R]
+dcf = dcf_fs[:, ::R]
 C = ksp.shape[0]
 im_size = img_gt.shape
 msk = 1 * (mps.abs().sum(dim=0) > 0).to(torch_dev)
 # msk = None
+
+# Calib data
+ksp_cal = synth_cal(ksp_fs, (32, 32), trj_fs, dcf_fs, num_iter=1)
+img_cal = ifft(ksp_cal, dim=[-2,-1], oshape=mps.shape)
 
 # Get phis and alphas 
 coco_imperf = coco_imperfection(trj, im_size, fov=(0.22,)*2, dt=dt, B0=3.0, z_ofs=0.0, rotations=(0,)*2,
@@ -56,6 +71,7 @@ print(f'alphas.shape: {alphas.shape}')
 max_iter = 10
 lamda_l2 = 1e-5
 max_eigen = 1.0
+max_eigen = None
 verbose = False
 
 # Scale b0
@@ -63,58 +79,42 @@ b0_scaled = b0 * trj.shape[0] * dt
 ts_scaled = (torch.arange(trj.shape[0], device=torch_dev, dtype=torch.float32) + (6.5e-3 / dt)) / trj.shape[0]
 phis = torch.cat([phis, b0_scaled[None,]], dim=0)
 alphas = torch.cat([alphas, ts_scaled[None, :, None]], dim=0)
-# phis = phis[-1:]
-# alphas = alphas[-1:]
 
-# plt.imshow(b0_scaled.cpu().T)
-# plt.show()
-# quit()
+# GROG data
+hop = high_order_phase(phis, alphas, use_KB=True)
+gparams = gridding_params(num_inputs=1,
+                          kern_width=2,
+                          interp_readout=True,
+                          grid=False)
+tparams = training_params(epochs=15*2,
+                          l2_reg=0.0,
+                          loss=lambda x, y : (x - y).abs().square().mean(),
+                        #   show_loss=True,
+                          float_precision='medium')
+grd_data = spatio_temporal_implicit_grogify(ksp, trj, img_cal, hop,
+                                            # spatial_funcs=b,
+                                            # temporal_funcs=h,
+                                            grid_params=gparams,
+                                            train_params=tparams,)
+ksp = grd_data['ksp_grd']
+kerns = grd_data['model'].forward_kernel(grd_data['feats'])
+kerns = rearrange(kerns, '... Co Ci -> Co Ci ...')
+kerns = kerns.reshape((C, C, *dcf.shape))
 
-# u, s, vh = torch.linalg.svd(alphas.reshape((alphas.shape[0], -1)), full_matrices=False)
-# # comp = u[:, :3].T
-# comp = torch.eye(alphas.shape[0], device=torch_dev)
-# phis = einsum(comp, phis, 'Bo Bi, Bi ... -> Bo ...')
-# alphas = einsum(comp, alphas, 'Bo Bi, Bi ... -> Bo ...')
+# b = einsum(b, bcc, 'L1 ..., L2 ... -> L1 L2 ...').reshape((-1, *im_size))
+# h = einsum(h, hcc, 'L1 ..., L2 ... -> L1 L2 ...').reshape((-1, *dcf.shape))
 
-# Compute bases using HOP model
-from mr_recon.spatial import spatial_resize
-L = 10
-# phis = spatial_resize(phis, (100,)*2, method='bicubic')
-hop = high_order_phase(phis, alphas, use_KB=True)#, spatial_batch_size=im_size[0] * 20)
-# b, h = svd_decomp_matrix(hop, L=L)
-b, h = svd_decomp_operator(hop, L=L, fast_axis='spatial')
-# b, h = temporal_segmentation(hop, L=L, interp_type='lstsq')
-b = spatial_resize(b, im_size, method='bicubic')
-
-# plt.figure(figsize=(14,7))
-# for l in range(L):
-#     plt.subplot(2,5,l+1)
-#     plt.title(f'l = {l+1}')
-#     plt.imshow(b[l].cpu().angle(), cmap='jet')#, vmin=0, vmax=2.0)
-#     plt.axis('off')
-# plt.subplots_adjust(wspace=0.0, hspace=0.0)
-# plt.tight_layout()
-# plt.show()
-# quit()
-    
-
-# plt.figure(figsize=(14,7))
-# h /= h.abs().max().item() * 1.5
-# for l in range(L):
-#     plt.axhline(l+1, color='black', alpha=0.3)
-#     # plt.plot(h[l].cpu().abs() + l + 1)
-#     p = plt.plot(h[l].cpu().real + l+1)
-#     plt.plot(h[l].cpu().imag + l+1, ls='--', color=p[0].get_color())
-# plt.yticks(range(1, L+1), [f'l = {l}' for l in range(1, L+1)])
-# plt.show()
-# quit()
+# Spatio-temporal decomposition
+# kerns = torch.zeros((C, C, *dcf.shape), dtype=torch.complex64, device=torch_dev)
+# tup = (slice(None),)*2 + (None,) * dcf.ndim
+# kerns[...] = torch.eye(C, dtype=torch.complex64, device=torch_dev)[tup]
+b, h = decomp_with_grappa(hop, kerns, mps, L=50, niter=50)
+# b, h = svd_decomp_operator(hop, L=8)
 
 # Apply bases to A and reconstruct
-bparams = batching_params(C * 0 + 1)
-A = experimental_sense(trj, mps, dcf, 
-                       spatial_funcs=b, 
-                       temporal_funcs=h,
-                       bparams=bparams,)
+bparams = batching_params(field_batch_size=1,)
+A = experimental_sense_coil(trj, b, h, dcf, bparams=bparams)
+# A = experimental_sense(trj, mps, dcf, spatial_funcs=b, temporal_funcs=h, bparams=bparams)
 img_recon = CG_SENSE_recon(A, ksp, max_iter, lamda_l2, max_eigen, verbose).cpu().T
 
 plt.figure(figsize=(7,7))

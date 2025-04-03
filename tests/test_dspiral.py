@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use('Webagg')
 import matplotlib.pyplot as plt
 
+from mr_recon.imperfections.estimation.eddy_focus import build_alpha_trajectory, normalize_phis, lowpass_filter_torch
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.utils import gen_grd, np_to_torch, torch_to_np
 from mr_recon.spatial import spatial_resize
@@ -79,9 +80,7 @@ A_eddy = experimental_sense(trj, mps, dcf,
                             bparams=bparams)
 
 # B0
-db0 = (1_000 - (hop_eddy.phis[3] + hop_eddy.phis[4] - hop_eddy.phis[8])) * (mps[0].abs() > 0)
-db0 = 25 * db0 / db0.abs().max()
-a_b0, p_b0 = alphas_phis_from_B0(b0 + db0, trj.shape[:-1], dt)
+a_b0, p_b0 = alphas_phis_from_B0(b0, trj.shape[:-1], dt)
 hop_b0 = high_order_phase(p_b0, a_b0, 
                           use_KB=False, temporal_batch_size=2**4)
 b0_segs = temporal_segmentation(hop_b0, L=20, interp_type='lstsq')
@@ -89,76 +88,58 @@ A_b0 = experimental_sense(trj, mps, dcf,
                           spatial_funcs=b0_segs[0],
                           temporal_funcs=b0_segs[1],
                           bparams=bparams)
+# ----------------------------------------------------
 
-# Both
+
+# -------------- Estimate Eddy Currents --------------
+# Recon with just b0
+img_recon = CG_SENSE_recon(A_b0, ksp, max_iter, lamda_l2, 1.0)
+
+# Est background phase and remove it
+img_recon = spatial_resize(img_recon, (32, 32), method='fourier')
+img_recon = spatial_resize(img_recon, im_size, method='fourier')
+mps = mps * torch.exp(1j * img_recon.angle())
+A_b0.mps = mps
+img_recon = CG_SENSE_recon(A_b0, ksp, max_iter, lamda_l2, 1.0)
+
+# phis = normalize_phis(p_eddy.clone())
+phi_scales = p_eddy.abs().view(p_eddy.shape[0], -1).max(dim=-1).values * 2 # B 
+p_eddy /= phi_scales[:, None, None]
+a_eddy *= phi_scales[:, None]
+# alphas_recon = a_eddy.clone()
+alphas_recon = build_alpha_trajectory(img_recon,
+                                       p_eddy,
+                                       trj,
+                                       window_size=500,
+                                       num_guesses=50,
+                                       noise_scale=.1).T
+
+# Lowpass filter the result to 15e3
+alphas_recon = lowpass_filter_torch(alphas_recon, 1e3, fs=1/dt, dim=1, kernel_size=101)
+
+# Show the estimate of alphas
+for i in range(a_eddy.shape[0]):
+    plt.figure()
+    plt.title(f'sph coeff {i}')
+    plt.plot(alphas_recon[i].cpu())
+    plt.plot(a_eddy[i].cpu())
+# ----------------------------------------------------
+
+# -------------- Recon and plot --------------
 hop = high_order_phase(torch.cat([p_b0, p_eddy], dim=0), 
-                       torch.cat([a_b0, a_eddy], dim=0), 
+                       torch.cat([a_b0, alphas_recon], dim=0), 
                        use_KB=False, temporal_batch_size=2**4)
 segs = temporal_segmentation(hop, L=30, interp_type='lstsq')
 A_both = experimental_sense(trj, mps, dcf, 
                             spatial_funcs=segs[0],
                             temporal_funcs=segs[1],
                             bparams=bparams)
-# ----------------------------------------------------
+img_recon = CG_SENSE_recon(A_both, ksp, max_iter, lamda_l2, 1.0).cpu()
+img_recon = spatial_resize(img_recon, (500, 500), method='fourier')
 
-# Auto-focus center of k-space 
-recon = lambda k, A : CG_SENSE_recon(A, k, max_iter=7, lamda_l2=0.0, max_eigen=1.0, verbose=False)
-freqs = torch.linspace(-db0.abs().max(), db0.abs().max(), 11, device=torch_dev)
-imgs = []
-imgs_lowres = []
-t = torch.arange(0, trj.shape[0], device=torch_dev) * dt
-for freq in tqdm(freqs, 'Multi-Freq Recons'):
-    phz = torch.exp(-2j * torch.pi * freq * t)
-    imgs.append(recon(ksp * phz, A_both))
-    ro_inds = slice(0, 2_000)
-    A_lowres = experimental_sense(trj[ro_inds], mps, dcf[ro_inds], 
-                            spatial_funcs=segs[0],
-                            temporal_funcs=segs[1][:, ro_inds],
-                            bparams=bparams)
-    imgs_lowres.append(recon((ksp * phz)[:, ro_inds], A_lowres))
-imgs = torch.stack(imgs, dim=0)
-imgs_lowres = torch.stack(imgs_lowres, dim=0)
-
-# Estimate field map
-imgs_pc = imgs * torch.exp(-1j * imgs_lowres.angle())
-metric = imgs_pc.imag.abs()
-W = 15
-d = 2
-metric = torch.nn.functional.conv2d(
-        metric[:, None],
-        torch.ones(1, 1, *([W] * d), device=torch_dev) / W**d, 
-        padding=W // 2
-    ).view(imgs.shape[0], *im_size).abs()
-idxs = torch.argmin(metric, dim=0)
-field_map = freqs[idxs]
-
-# from pyeyes import ComparativeViewer
-# cv = ComparativeViewer({'field_map': field_map.cpu(), 'db0': db0.cpu()},
-#                        ['X', 'Y'], ['X', 'Y'])
-# cv.launch()
-# quit()
-
-# Show
-plt.figure(figsize=(14, 7))
-plt.subplot(121)
-plt.imshow(field_map.cpu(), cmap='jet', vmin=freqs.min(), vmax=freqs.max())
-plt.axis('off')
-plt.subplot(122)
-plt.imshow(db0.cpu(), cmap='jet', vmin=freqs.min(), vmax=freqs.max())
+plt.figure(figsize=(7, 7))
+plt.imshow(img_recon.abs().cpu(), cmap='gray')
 plt.axis('off')
 plt.tight_layout()
-
-for i in range(len(freqs)):
-    plt.figure(figsize=(14, 7))
-    plt.suptitle(f'Freq = {freqs[i].item():.2f}Hz')
-    plt.subplot(131)
-    plt.imshow(imgs[i].abs().cpu(), cmap='gray')
-    plt.axis('off')
-    plt.subplot(132)
-    plt.imshow(imgs_pc[i].angle().cpu(), cmap='jet', vmin=-np.pi, vmax=np.pi)
-    plt.axis('off')
-    plt.subplot(133)
-    plt.imshow(metric[i].abs().cpu(), vmin=0, vmax=metric.max())
-    plt.axis('off')
-    plt.tight_layout()
 plt.show()
+# ----------------------------------------------------
