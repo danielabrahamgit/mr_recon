@@ -79,6 +79,7 @@ def CG_SENSE_recon(A: linop,
                    lamda_l2: Optional[float] = 0.0,
                    max_eigen: Optional[float] = None,
                    tolerance: Optional[float] = 1e-8,
+                   weights: Optional[torch.Tensor] = None,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run CG SENSE recon:
@@ -140,6 +141,7 @@ def CG_SENSE_recon(A: linop,
                                num_iters=max_iter,
                                lamda_l2=lamda_l2,
                                tolerance=tolerance,
+                               weights=weights,
                                verbose=verbose)
     
     return recon
@@ -174,22 +176,6 @@ def coil_combine(multi_chan_img: torch.Tensor,
         img_comb = multi_chan_img.abs().square().sum(0).sqrt()
     
     return img_comb
-
-def SPIRIT_recon(A: linop,
-                 ksp: torch.Tensor,
-                 ksp_cal: torch.Tensor,
-                 max_iter: Optional[int] = 15,
-                 lamda_l2: Optional[float] = 0.0,
-                 max_eigen: Optional[float] = None,
-                 verbose: Optional[bool] = True) -> torch.Tensor:
-    """
-    Run SPIRIT recon:
-    recon = (AHA + lamda_l2I)^-1 AHb
-
-
-    
-    """
-    return None
 
 def FISTA_recon(A: linop,
                 ksp: torch.Tensor,

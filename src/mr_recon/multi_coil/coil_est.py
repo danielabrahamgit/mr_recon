@@ -9,7 +9,7 @@ from mr_recon.dtypes import complex_dtype
 from mr_recon.algs import power_method_matrix
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
-from mr_recon.multi_coil.grappa_est import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
+from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
 
 def csm_from_espirit(ksp_cal: torch.Tensor,
                      im_size: tuple,
@@ -90,8 +90,12 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         aH = ifft(kernel, oshape=(num_coils, *im_size),
                                 dim=tuple(range(-img_ndim, 0)))
         aH = rearrange(aH, 'nc ... -> ... nc 1')
-        a = aH.swapaxes(-1, -2).conj()
-        AHA += aH @ a
+        # a = aH.swapaxes(-1, -2).conj()
+        # AHA += aH @ a
+        bs = 1
+        for c1 in range(0, num_coils, bs):
+            c2 = min(num_coils, c1 + bs)
+            AHA[..., c1:c2, :] += aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj()
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
     # Get eigenvalues and eigenvectors
@@ -108,7 +112,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
             mps *= eigen_vals > crp
         
         # Update AHA
-        AHA -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
+        if sets_of_maps > 1:
+            AHA -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
         mps_all.append(mps)
         evals_all.append(eigen_vals)
         

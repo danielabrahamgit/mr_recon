@@ -14,7 +14,7 @@ from mr_recon.fourier import ifft
 from mr_recon.imperfections.spatio_temporal_imperf import high_order_phase, B0, alphas_phis_from_B0, phis_from_spha
 from mr_recon.imperfections.imperf_decomp import temporal_segmentation, svd_decomp_matrix, svd_decomp_operator
 from mr_recon.linops import batching_params, experimental_sense
-from mr_recon.calib import synth_cal
+from mr_recon.multi_coil.calib import synth_cal
 
 from tqdm import tqdm
 from einops import einsum, rearrange

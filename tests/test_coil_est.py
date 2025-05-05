@@ -8,7 +8,7 @@ import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
-from mr_recon.calib import calc_coil_subspace
+from mr_recon.multi_coil.calib import calc_coil_subspace
 from mr_recon.utils import np_to_torch, normalize
 from mr_recon.multi_coil.coil_est import csm_from_grappa, csm_from_espirit
 

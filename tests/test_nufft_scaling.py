@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import sigpy as sp
-from mr_recon.fourier import chebyshev_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft, triton_nufft
+from mr_recon.fourier import chebyshev_nufft, matrix_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft, triton_nufft
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
 from einops import rearrange, einsum
 
@@ -21,7 +21,7 @@ try:
 except:
     torch_dev = torch.device('cpu')
 d = 2
-im_size = (6,)*d
+im_size = (64,)*d
 rtol = 5e-2 
 eps = 1e-2
 
@@ -38,9 +38,10 @@ img = torch.randn_like(img)
 grd_nufft = gridded_nufft(im_size, grd_os)
 sp_nufft = sigpy_nufft(im_size)
 tr_nufft = triton_nufft(im_size)
+mx_nufft = matrix_nufft(im_size)
 # sv_nufft = svd_nufft(im_size, n_svd=16, svd_mx_size=(35,)*d)
-nuffts = [sp_nufft, tr_nufft, grd_nufft]
-names = ['sigpy_nufft', 'triton_nufft', 'grd_nufft']
+nuffts = [sp_nufft, tr_nufft, mx_nufft,]
+names = ['sigpy_nufft', 'triton_nufft', 'matrix_nufft']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.ylim(-.2, 1.2)
