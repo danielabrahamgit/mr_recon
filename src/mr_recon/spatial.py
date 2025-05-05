@@ -2,9 +2,11 @@ import torch
 import numpy as np
 import sigpy as sp
 
+from tqdm import tqdm
 from typing import Optional
 from torch.nn.functional import conv1d
 from cupyx.scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates as map_coordinates_cpu
 from einops import rearrange
 from mr_recon.fourier import fft, ifft
 from mr_recon.utils import gen_grd, torch_to_np, np_to_torch, apply_window, resize
@@ -214,15 +216,62 @@ def spatial_resize(x: torch.Tensor,
         grd -= 1
         grd = grd.flip(-1)
         grd = grd[None,]
+        kwargs = {'mode': method, 'padding_mode': 'border', 'align_corners': True, 'grid': grd}
         if torch.is_complex(x):
-            x_rs_flt = torch.nn.functional.grid_sample(x_flt.real[None,], grd, align_corners=True, mode=method) + \
-                    1j * torch.nn.functional.grid_sample(x_flt.imag[None,], grd, align_corners=True, mode=method)
+            x_rs_flt = torch.nn.functional.grid_sample(x_flt.real[None,], **kwargs) + \
+                    1j * torch.nn.functional.grid_sample(x_flt.imag[None,], **kwargs)
         else:
             x_rs_flt = torch.nn.functional.grid_sample(x_flt[None,], grd, align_corners=True, mode=method)
         x_rs_flt = x_rs_flt[0]
     
     x_rs = x_rs_flt.reshape((*orig_batch, *im_size))
     return x_rs
+
+def spatial_resize_poly(x: torch.Tensor,
+                        im_size: tuple, 
+                        order: Optional[int] = 1,
+                        mode: Optional[str] = 'nearest') -> torch.Tensor:
+    """
+    Resize a spatial tensor to a new spatial size.
+
+    Parameters:
+    -----------
+    x : (torch.Tensor)
+        The input tensor with shape (..., *inp_im_size)
+    im_size : (tuple)
+        The size of the image to resize to
+    order : int, optional
+        The order of the spline interpolation (default is cubic, order=3).
+    mode : str, optional
+        How to handle points outside the boundaries (default 'nearest').
+    
+    Returns:
+    --------
+    x_rs : (torch.Tensor)
+        The resized tensor with shape (..., *im_size)
+    """
+    # Handle batch dims
+    if x.ndim == len(im_size):
+        x = x[None,]
+        squeeze = True
+        oshape = (1, *im_size)
+    else:
+        oshape = (*x.shape[:-len(im_size)], *im_size)
+        x = x.reshape((-1, *x.shape[-len(im_size):]))
+        squeeze = False
+        
+    # Call spatial interpolation
+    inp_size = x.shape[-len(im_size):]
+    kwargs = {'order': order, 'mode': mode}
+    inp_size_tensor = torch.tensor(inp_size).to(x.device)
+    spatial_crds = (gen_grd(im_size, balanced=True).to(x.device) + 0.5) * (inp_size_tensor - 1)
+    x_rs = spatial_interp(x, spatial_crds, **kwargs).reshape(oshape)
+    
+    # Reshape to original batch dims
+    if squeeze:
+        return x_rs[0]
+    else:
+        return x_rs
 
 def spatial_interp(spatial_input: torch.Tensor, 
                    coords: torch.Tensor, 
@@ -251,6 +300,10 @@ def spatial_interp(spatial_input: torch.Tensor,
     """
     # Convert to cupy
     torch_dev = spatial_input.device
+    if torch_dev == torch.device('cpu'):
+        map_crds = map_coordinates_cpu
+    else:
+        map_crds = map_coordinates
     spatial_input_cp = torch_to_np(spatial_input)
     crds_flt_cp = torch_to_np(coords).reshape((-1, coords.shape[-1]))  # Flatten for map_coordinates
     dev = sp.get_device(spatial_input_cp)
@@ -265,7 +318,7 @@ def spatial_interp(spatial_input: torch.Tensor,
         
         # Loop over batch elements.
         for i in range(N):
-            interp_vals = map_coordinates(
+            interp_vals = map_crds(
                 spatial_input_cp[i], crds_flt_cp.T, order=order, mode=mode
             )
             out[i] = interp_vals

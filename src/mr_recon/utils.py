@@ -72,8 +72,8 @@ def quantize_data(data: torch.Tensor,
     """
     Given data of shape (..., d), finds K 'clusters' with shape (K, d)
 
-    Parameters:
-    -----------
+    Args:
+    -----
     data : torch.Tensor
         data to quantize with shape (..., d)
     K : int

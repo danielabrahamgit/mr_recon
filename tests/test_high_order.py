@@ -11,7 +11,7 @@ from mr_recon.spatial import spatial_resize
 from mr_recon.imperfections.coco import coco_imperfection
 from mr_recon.imperfections.spatio_temporal_imperf import high_order_phase, alphas_phis_from_B0, alphas_phis_from_coco
 from mr_recon.imperfections.imperf_decomp import temporal_segmentation
-from mr_recon.imperfections.hofft_decomp import temporal_eigen, temporal_psf_eigen
+from mr_recon.linops import type3_nufft
 
 from tqdm import tqdm
 from einops import einsum, rearrange
@@ -21,7 +21,7 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 # GPU stuff
-torch_dev = torch.device(5)
+torch_dev = torch.device(0)
 # torch_dev = torch.device('cpu')
     
 # Recon Stuff
@@ -48,49 +48,21 @@ a2, p2 = alphas_phis_from_B0(b0, trj.shape[:-1], dt)
 a2 = a2.expand((1, *a1.shape[1:]))
 alphas = torch.cat([a1, a2], dim=0)
 phis = torch.cat([p1, p2], dim=0)
-phis = spatial_resize(phis, (64,)*3, method='fourier').real
-
 
 # Subsample to smaller problem
-# ros = slice(None)
-# trs = slice(None)
-# groups = slice(None)
+ros = slice(None)
+trs = slice(None)
+groups = slice(None)
 ros = slice(None, None, 10)
-groups = slice(2, 3)
-trs = slice(3, 4) 
+# groups = slice(2, 3)
+# trs = slice(3, 4) 
 alphas = alphas[:, ros, groups, trs].reshape((alphas.shape[0], -1))
 # alphas_flt = alphas.reshape((alphas.shape[0], -1))
 # rnd_inds = torch.randperm(alphas_flt.shape[1])[9_000:10_000]
 # alphas = alphas_flt[:, rnd_inds]
 # alphas = alphas.reshape((alphas.shape[0], -1))
 
-# # Unrotate alphas via SVD
-# alphas_flt = alphas.reshape((alphas.shape[0], -1))
-# U, s, Vh = torch.linalg.svd(alphas_flt, full_matrices=False)
-# # L = len(s)
-# L = 3
-# phis = einsum(phis, U[:, :L] * (s[:L] ** 0.5), 'Bi ... , Bi Bo -> Bo ...')
-# alphas = ((s[:L, None] ** 0.5) * Vh[:L]).reshape((L, *alphas.shape[1:]))
-
-# Fake input
-spatial_input = torch.randn(phis.shape[1:], device=torch_dev, dtype=torch.complex64)
-torch.cuda.synchronize()
-
-# "Better" High Order Phase Transform
-h = temporal_psf_eigen(phis, alphas)
-breakpoint()
-# hop = high_order_phase(phis, alphas, use_KB=True, temporal_batch_size=2**10, verbose=True)
-quit()
-start = time.perf_counter()
-b, h = temporal_segmentation(hop, L=10, interp_type='lstsq')
-torch.cuda.synchronize()
-end = time.perf_counter()
-print(f'\nBetter Time = {end - start}')
-
-# Naive High Order Phase Transform
-start = time.perf_counter()
-hop = high_order_phase(phis, alphas, use_KB=False, temporal_batch_size=2**10, verbose=True)
-bnaive, hnaive = temporal_segmentation(hop, L=10, interp_type='lstsq', L_batch_size=1)
-torch.cuda.synchronize()
-end = time.perf_counter()
-print(f'Naive Time = {end - start}')
+from mr_recon.imperfections.field import alpha_phi_svd, alpha_segementation
+phis = spatial_resize(phis, (64,)*3, method='fourier').real
+# alpha_phi_svd(phis, alphas, L=10, L_batch_size=10, num_iter=15//5)
+alpha_segementation(phis[:4], alphas[:4], L=10, L_batch_size=10, interp_type='lstsq')

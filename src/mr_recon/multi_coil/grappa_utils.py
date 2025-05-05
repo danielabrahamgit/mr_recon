@@ -1,7 +1,7 @@
 import torch
 import sigpy as sp
 
-from mr_recon.fourier import fft
+from mr_recon.fourier import fft, ifft
 from mr_recon.algs import lin_solve
 from mr_recon import dtypes
 from mr_recon.utils import gen_grd, np_to_torch, torch_to_np, rotation_matrix
@@ -251,6 +251,62 @@ def rect_trj(cal_shape: tuple,
 
     return trj_rect
 
+def grappa_AHA_AHb_img(img_cal: torch.Tensor, 
+                       source_vectors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes AHA and AHb matrices for grappa kernel estimation using
+    NUFFT interpolation on the calibration
+    
+    Parameters:
+    -----------
+    img_cal: torch.Tensor
+        calibration image with shape (nc, *cal_size)
+    source_vectors : torch.Tensor
+        Coordinates of source relative to target with shape (nkerns, ninputs, d)
+    
+    Returns:
+    ----------
+    AHA: np.ndarray <complex>
+        grappa calibration gram matrix with shape (nkerns, nc * ninputs, nc * ninputs) 
+    AHb: np.ndarray <complex>
+        grappa adjoint calibration times target poitns with shape (nkerns, nc * ninputs, nc)
+    """
+    
+    # Consts
+    device = img_cal.device
+    cal_size = img_cal.shape[1:]
+    C = img_cal.shape[0]
+    N, S, d = source_vectors.shape
+    assert device == source_vectors.device
+    
+    # Buid B matrix
+    B = img_cal.reshape((C, -1)).T # R C
+    
+    # Build A matrix
+    rs = gen_grd(img_cal.shape[1:]).to(device).reshape(-1, d) # R d
+    A = torch.exp(-2j * torch.pi * (source_vectors @ rs.T)) # N S R
+    A = einsum(A, B, 'N S R, R C -> N R C S')
+    A = rearrange(A, 'N R C S -> N R (C S)')
+    
+    # # TODO replace this part with compact conv in image domain
+    # from mr_recon.fourier import fft
+    # from mr_recon.utils import resize
+    # mask = torch.ones((cal_size[0]-2, cal_size[1]-2), device=device, dtype=real_dtype)
+    # mask = resize(mask, cal_size)
+    # B = ifft(fft(img_cal, dim=tuple(range(-d, 0))) * mask, dim=tuple(range(-d, 0))).reshape((C, -1)).T # R C
+    # rs = gen_grd(img_cal.shape[1:]).to(device) # R d
+    # A = torch.exp(-2j * torch.pi * einsum(source_vectors, rs, 'N S d, ... d -> N S ...'))
+    # A = einsum(A, img_cal, 'N S ..., C ... -> N C S ...')
+    # A = ifft(fft(A, dim=tuple(range(-d, 0))) * mask, dim=tuple(range(-d, 0))).reshape((N , (C * S), -1)) # N CS R
+    # # A = einsum(A.reshape((N, S, -1)), B, 'N S R, R C -> N C S R').reshape((N, C * S, -1)) # N CS R
+    # A = rearrange(A, 'N CS R -> N R CS')
+    
+    # Compute AHA and AHb
+    AHA = einsum(A.conj(), A, 'N R CS1, N R CS2 -> N CS1 CS2')
+    AHb = einsum(A.conj(), B, 'N R CS, R C -> N CS C')
+
+    return AHA, AHb
+
 def grappa_AHA_AHb(img_cal: torch.Tensor, 
                    source_vectors: torch.Tensor,
                    width: Optional[int] = 6,
@@ -423,8 +479,8 @@ def grappa_AHA_AHb_fast(img_cal: torch.Tensor,
 def train_kernels(img_cal: torch.Tensor,
                   source_vectors: torch.Tensor,
                   lamda_tikonov: Optional[float] = 1e-3,
-                  solver: Optional[str] = 'pinv',
-                  fast_method: Optional[bool] = False,
+                  solver: Optional[str] = 'solve',
+                  method: Optional[str] = 'slow',
                   return_errors: Optional[bool] = False) -> torch.Tensor:
     """
     Trains grappa kernels given calib image and source vectors
@@ -439,8 +495,13 @@ def train_kernels(img_cal: torch.Tensor,
         tikonov regularization parameter
     solver : str
         linear system solver from ['lstsq_torch', 'lstsq', 'pinv', 'inv']
-    fast_method : bool
-        toggles fast AHA AHb computation, only worth it for large calib
+    method : str
+        'slow' - uses KB NUFFT to synthesize training data (uses grappa_AHA_AHb)
+               - has a high accuracy but is slow
+        'med'  - trains kernels in the imag domain (uses grappa_AHA_AHb_img)
+                - has a medium accuracy and is mediumly fast
+        'fast' - uses KB kernels in a fast way (uses grappa_AHA_AHb_fast)
+               - has a lowest accuracy but is fast
     return_errors : bool
         returns errors if True
     
@@ -459,15 +520,14 @@ def train_kernels(img_cal: torch.Tensor,
     assert device == source_vectors.device
 
     # Compute AHA and AHb
-    if fast_method:
+    if method == 'fast':
         AHA, AHb = grappa_AHA_AHb_fast(img_cal, source_vectors)
-    else:
+    elif method == 'med':
+        AHA, AHb = grappa_AHA_AHb_img(img_cal, source_vectors)
+    elif method == 'slow':
         AHA, AHb = grappa_AHA_AHb(img_cal, source_vectors)
-        
-    # conds = torch.linalg.cond(AHA)# + lamda_tikonov * torch.eye(AHA.shape[-1], device=device))
-    # print(conds.shape)
-    # print(conds.min(), conds.max())
-    # quit()
+    else:
+        raise NotImplementedError(f'Unknown method {method}')
     
     # Solve
     AHA_old = AHA.clone()

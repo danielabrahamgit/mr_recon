@@ -8,8 +8,14 @@ from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon import dtypes
 from sigpy.mri import pipe_menon_dcf
-from cupyx.scipy.sparse.linalg import eigsh
-from logging import warning
+
+def soft_thresh(x: torch.Tensor,
+                lamda: float) -> torch.Tensor:
+    """
+    Soft thresholding operator for complex numbers.
+    """
+    x = torch.sgn(x) * torch.maximum(x.abs() - lamda, x.abs() * 0)
+    return x
 
 def density_compensation(trj: torch.Tensor,
                          im_size: tuple,
@@ -98,6 +104,77 @@ def density_compensation(trj: torch.Tensor,
         
     dcf /= dcf.max()
     return dcf
+
+def svd_operator(A: callable,
+                 AHA: callable,
+                 inp_example: torch.Tensor,
+                 rank: int,
+                 num_iter: Optional[int] = 15,
+                 tol: Optional[float] = 1e-9,
+                 lobpcg: Optional[bool] = True,
+                 verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Uses power method or lobpcg to to eigen-step in SVD on a matrix operator.
+
+    Parameters:
+    -----------
+    A : callable
+        linear operator mapping from (N, *inp_shape) to (N, *out_shape)
+        where N is a batch dimension
+    AHA : callable
+        linear operator square shape mapping from (N, *inp_shape) to (N, *inp_shape)
+    inp_example : torch.Tensor
+        example input tensor with shape (*inp_shape) (also contains device and dtype info)
+    rank : int
+        number of ordered svd terms
+    num_iter : int
+        number of iterations to run power method
+        OR
+        number of iterations to run lobpcg if lobpcg is True
+    tol : float
+        tolerance for convergence of lobpcg
+    lobpcg : bool
+        toggles use of lobpcg instead of power method
+    verbose : bool
+        toggles progress bar
+    
+    Returns:
+    --------
+    U : torch.Tensor
+        left vectors with shape (*out_shape, rank)
+    S : torch.Tensor
+        singular values with shape (rank,)
+    Vh : torch.Tensor
+        right vectors with shape (rank, *inp_shape)
+    """
+    
+    # Compute right singular vectors via eigen decomposition of AHA
+    V, S = eigen_decomp_operator(AHA, inp_example, num_eigen=rank, num_iter=num_iter, tol=tol, lobpcg=lobpcg, verbose=verbose)
+    
+    # Sort by singular values
+    idx = torch.argsort(S, descending=True)
+    V = V[idx]
+    S = S[idx] ** 0.5
+    U = None
+    
+    # Clear GPU mem
+    import gc
+    gc.collect()
+    with torch.cuda.device(inp_example.device):
+        torch.cuda.empty_cache()
+    
+    # Compute left singular vectors
+    bs = rank
+    for l1 in tqdm(range(0, rank, bs), 'Calculating Left Singular Vectors', disable=not verbose):
+        l2 = min(l1 + bs, rank)
+        u = A(V[l1:l2])
+        u = u.moveaxis(0, -1) / S[l1:l2]
+        if U is None:
+            U = u
+        else:
+            U = torch.cat((U, u), dim=-1)
+    
+    return U, S, V.conj()
 
 def svd_power_method_tall(A: callable,
                           AHA: callable,
@@ -327,14 +404,16 @@ def eigen_decomp_operator(A: callable,
                           num_iter: Optional[int] = 15,
                           tol: Optional[float] = 1e-9,
                           lobpcg: Optional[bool] = True,
+                          largest: Optional[bool] = True,
                           verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Uses power method to find largest num_erigen eigenvalues and corresponding eigenvectors
+    Uses power method to find largest num_eigen eigenvalues and corresponding eigenvectors
 
     Parameters:
     -----------
     A : callable
-        linear operator square shape, operators on batch of (N, *vec_shape) vectors (batch is N)
+        linear operator mapping from (N, *vec_shape) to (N, *vec_shape)
+        where N is a batch dimension
     x0 : torch.Tensor
         initial guess of eigenvector with shape (*vec_shape)
     num_eigen : int
@@ -347,6 +426,8 @@ def eigen_decomp_operator(A: callable,
         tolerance for convergence of lobpcg
     lobpcg : bool
         toggles use of lobpcg instead of power method
+    largest : bool
+        If True, computes the largest eigenpairs; otherwise, the smallest.
     verbose : bool
         toggles progress bar
     
@@ -360,43 +441,26 @@ def eigen_decomp_operator(A: callable,
     if lobpcg:
         
         # linops
-        def matvec_batched(x_flt):
+        def matvec(x_flt):
             # x_flt (n, k) 
             x_vec = x_flt.T.reshape((x_flt.shape[1], *x0.shape))
             out_vec = A(x_vec) # k, *vec_shape
             out_flt = out_vec.reshape((x_flt.shape[1], -1)).T # (n, k)
             return out_flt
-        def matvec(x_flt):
-            # x_flt (n, k)
-            x_vec = x_flt.T.reshape((x_flt.shape[1], *x0.shape))
-            out_vec = torch.stack([A(x_vec[i]) for i in range(x_vec.shape[0])], dim=0) # k, *vec_shape
-            out_flt = out_vec.reshape((x_flt.shape[1], -1)).T # (n, k)
-            return out_flt
-            
-        # Check if A is batched, and make new operator
-        x_test = torch.repeat_interleave(x0[None,], 2, dim=0)
-        try:
-            A_test = A(x_test)
-            assert A_test.shape[0] == 2
-            assert A_test.shape[1:] == x0.shape
-            A_use = matvec_batched
-        except:
-            A_use = matvec
         
         # Run lobpcg
         n = x0.numel()
         k = num_eigen
         X = torch.randn((n, k), device=x0.device, dtype=x0.dtype)
-        eigen_vals, eigen_vecs = lobpcg_operator(A_use, X, maxiter=num_iter, tol=tol, largest=True)
+        eigen_vals, eigen_vecs = lobpcg_operator(matvec, X, maxiter=num_iter, tol=tol, largest=largest, verbose=verbose)
         eigen_vecs = eigen_vecs.T.reshape((k, *x0.shape))
-        
     else:
         eigen_vecs = torch.zeros(num_eigen, *x0.shape, device=x0.device, dtype=x0.dtype)
         eigen_vals = torch.zeros(num_eigen, device=x0.device, dtype=x0.dtype)
         A_clone = A
         
         def A_resid_operator(x):
-            y = A_clone(x)
+            y = A_clone(x[None,])[0]
             VH_x = einsum(eigen_vecs.conj(), x, 'n ..., ... -> n') * eigen_vals
             V_diag_VH_x = einsum(eigen_vecs, VH_x, 'n ..., n -> ...')
             y = y - V_diag_VH_x
@@ -419,7 +483,8 @@ def lobpcg_operator(A: callable,
                     precond: Optional[callable] = None, 
                     maxiter: Optional[int] = 100, 
                     tol: Optional[float] = 1e-6, 
-                    largest: Optional[bool] = True):
+                    largest: Optional[bool] = True,
+                    verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Matrix-free LOBPCG for a symmetric operator using only matvec calls.
     
@@ -440,6 +505,8 @@ def lobpcg_operator(A: callable,
         Tolerance for convergence based on the residual norm.
     largest : bool
         If True, computes the largest eigenpairs; otherwise, the smallest.
+    verbose : bool
+        If True, shows progress bar.
 
     Returns:
     --------
@@ -457,6 +524,7 @@ def lobpcg_operator(A: callable,
     AX = A(X)
     T = X.H @ AX
     evals, eigvecs = torch.linalg.eigh(T)
+    
     # torch.linalg.eigh returns eigenvalues in ascending order.
     if largest:
         idx = torch.argsort(evals, descending=True)
@@ -470,10 +538,11 @@ def lobpcg_operator(A: callable,
     # Optionally store a previous search direction (for subspace expansion)
     P = None
 
-    for it in tqdm(range(maxiter), 'LOBPCG Iteration'):
+    for it in tqdm(range(maxiter), 'LOBPCG Iteration', disable=not verbose):
         # Compute the residual: R = A*X - X*Lambda
         R = AX - X * evals.unsqueeze(0)
         res_norm = torch.linalg.norm(R, dim=0)
+        
         # Check convergence for each eigenpair.
         if torch.all(res_norm < tol):
             break
@@ -523,49 +592,6 @@ def lobpcg_operator(A: callable,
 
     return evals, X
           
-def inverse_power_method_operator(A: callable,
-                                  x0: torch.Tensor,
-                                  num_iter: Optional[int] = 15,
-                                  n_cg_iter: Optional[int] = 12,
-                                  lamda_l2: Optional[float] = 0.0,
-                                  verbose: Optional[bool] = True) -> Tuple[torch.Tensor, float]:
-    """
-    Uses power method to find largest eigenvalue and corresponding eigenvector
-    of A^-1
-
-    Parameters:
-    -----------
-    A : callable
-        linear operator
-    x0 : torch.Tensor
-        initial guess of eigenvector with shape (*vec_shape)
-    num_iter : int
-        number of iterations to run power method
-    n_cg_iter : int
-        number of iterations to run conjugate gradient
-    verbose : bool
-        toggles progress bar
-    
-    Returns:
-    --------
-    eigen_vec : torch.Tensor
-        eigenvector with shape (*vec_shape)
-    eigen_val : float
-        eigenvalue
-    """
-    
-    # ray = lambda x : (x.conj() * A(x)).sum() / ((x.norm() ** 2))
-    for _ in tqdm(range(num_iter), 'Max Eigenvalue', disable=not verbose):
-        # mu = ray(x0)
-        z = conjugate_gradient(A, x0, num_iters=n_cg_iter, verbose=False, lamda_l2=0)
-        ll = z.norm()
-        x0 = z / ll
-    # ll = (x0.conj() * A(x0)).sum()
-    if verbose:
-        print(f'Max Eigenvalue = {ll}')
-    
-    return x0, ll.item()
-
 def lin_solve(AHA: torch.Tensor, 
               AHb: torch.Tensor, 
               lamda: Optional[float] = 0.0, 
@@ -594,10 +620,10 @@ def lin_solve(AHA: torch.Tensor,
     x : torch.Tensor
         solution with shape (..., n, m)
     """
-    I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
-    tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
     solver = solver.lower()
     if lamda > 0:
+        I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
+        tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
         AHA += lamda * I[tup]
     if solver == 'lstsq_torch':
         x = torch.linalg.lstsq(AHA, AHb).solution
@@ -745,6 +771,7 @@ def conjugate_gradient(AHA: nn.Module,
                        lamda_l2: Optional[float] = 0.0,
                        tolerance: Optional[float] = 1e-8,
                        return_resids: Optional[bool] = False,
+                       weights: Optional[torch.Tensor] = None,
                        verbose=True) -> torch.Tensor:
     """Conjugate gradient for complex numbers. The output is also complex.
     Solve for argmin ||Ax - b||^2. Inspired by sigpy!
@@ -779,7 +806,10 @@ def conjugate_gradient(AHA: nn.Module,
         P = lambda x : x
     
     # Tikonov regularization
-    AHA_wrapper = lambda x : AHA(x) + lamda_l2 * x
+    if weights:
+        AHA_wrapper = lambda x : AHA(x) + lamda_l2 * weights * x
+    else:
+        AHA_wrapper = lambda x : AHA(x) + lamda_l2 * x
 
     # Start at AHb
     x0 = AHb.clone()

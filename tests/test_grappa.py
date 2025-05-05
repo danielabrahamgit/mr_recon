@@ -7,7 +7,8 @@ matplotlib.use('webagg')
 import matplotlib.pyplot as plt
 
 from mr_recon.fourier import fft, ifft
-from mr_recon.utils import np_to_torch
+from mr_recon.recons import coil_combine
+from mr_recon.utils import np_to_torch, normalize
 from sigpy.mri import birdcage_maps
 from einops import rearrange
 
@@ -68,24 +69,43 @@ ksp_grappa[..., ::R] = ksp
 ksp_grappa[:, (kern_size[0]//2):-(kern_size[0]//2), 1:im_size[1]-1:R] = target
 
 # iFFT Recon to image and square root sum squares over coil dimension
-img_grappa = ifft(ksp_grappa, dim=[-2, -1]).abs().square().sum(dim=0).sqrt()
-img_zero_filled = ifft(ksp_zero_filled, dim=[-2, -1]).abs().square().sum(dim=0).sqrt()
+img_grappa = ifft(ksp_grappa, dim=[-2, -1])
+img_zero_filled = ifft(ksp_zero_filled, dim=[-2, -1])
+img_grappa = coil_combine(img_grappa, mps).cpu()
+img_zero_filled = coil_combine(img_zero_filled, mps).cpu()
+img = img.cpu()
+img_grappa = normalize(img_grappa, img)
+img_zero_filled = normalize(img_zero_filled, img)
+
+# ------------------ Plot ------------------
+
+
 
 # ------------------ Plot ------------------
 vmin = 0
 vmax = img.abs().max().item()
+M = 10
 plt.figure(figsize=(14,7))
-plt.subplot(131)
+plt.subplot(231)
 plt.title(f'Ground Truth')
-plt.imshow(img.abs().cpu(), cmap='gray', vmin=vmin, vmax=vmax)
+plt.imshow(img.abs(), cmap='gray', vmin=vmin, vmax=vmax)
 plt.axis('off')
-plt.subplot(132)
+plt.subplot(232)
 plt.title(f'Naive Recon (zero filled)')
-plt.imshow(img_zero_filled.cpu(), cmap='gray', vmin=vmin, vmax=vmax)
+plt.imshow(img_zero_filled.abs(), cmap='gray', vmin=vmin, vmax=vmax)
 plt.axis('off')
-plt.subplot(133)
+plt.subplot(233)
 plt.title(f'GRAPPA Recon')
-plt.imshow(img_grappa.cpu(), cmap='gray', vmin=vmin, vmax=vmax)
+plt.imshow(img_grappa.abs(), cmap='gray', vmin=vmin, vmax=vmax)
+plt.axis('off')
+plt.subplot(234)
+plt.imshow((img - img).abs(), cmap='gray', vmin=vmin, vmax=vmax/M)
+plt.axis('off')
+plt.subplot(235)
+plt.imshow((img_zero_filled - img).abs(), cmap='gray', vmin=vmin, vmax=vmax/M)
+plt.axis('off')
+plt.subplot(236)
+plt.imshow((img_grappa - img).abs(), cmap='gray', vmin=vmin, vmax=vmax/M)
 plt.axis('off')
 plt.tight_layout()
 plt.show()

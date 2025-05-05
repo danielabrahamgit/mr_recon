@@ -10,7 +10,7 @@ from mr_recon import dtypes
 from mr_recon.algs import power_method_matrix
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
-from mr_recon.multi_coil.grappa_est import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
+from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
 
 def csm_from_espirit(ksp_cal: torch.Tensor,
                      im_size: tuple,
@@ -103,17 +103,13 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         aH = ifft(kernel, oshape=(num_coils, *im_size),
                                 dim=tuple(range(-img_ndim, 0)))
         aH = rearrange(aH, 'nc ... -> ... nc 1')
-        a = aH.swapaxes(-1, -2).conj()
-
-        # batch over second coil dimension
         for ci in range(0, num_coils, coil_batch_size):
             cf = min(num_coils, ci + coil_batch_size)
-            AHA[..., ci:cf] += aH @ a[..., ci:cf]
-
+            AHA[..., ci:cf, :] += aH[..., ci:cf, :] @ aH.swapaxes(-1, -2).conj()
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
     # cleanup
-    del a, aH
+    del aH
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -134,7 +130,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
             mps *= eigen_vals > crp
         
         # Update AHA
-        if sets_of_maps > 1: # becasue this is memory-intensive. TODO: fix this problem in general.
+        if sets_of_maps > 1:
             AHA -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
         mps_all.append(mps)
         evals_all.append(eigen_vals)
