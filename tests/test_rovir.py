@@ -38,6 +38,7 @@ im_size = img.shape
 # Fourier kernel to mps
 kern_size = (3, 3)
 kerns = gen_grd(kern_size).to(torch_dev).reshape((-1, 2)) * 1.0
+# kerns = torch.tensor([0, 0], dtype=torch.float32, device=torch_dev)[None, :]
 rs = gen_grd(im_size).to(torch_dev)
 harms = torch.exp(-2j * torch.pi * (rs @ kerns.T)).moveaxis(-1, 0)
 mps = (mps[:, None] * harms[None,]).reshape((-1, *im_size))

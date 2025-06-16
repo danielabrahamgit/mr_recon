@@ -275,7 +275,8 @@ def alpha_segementation(phis: torch.Tensor,
                         L_batch_size: Optional[int] = 1,
                         interp_type: Optional[str] = 'zero',
                         use_type3: Optional[bool] = True,
-                        manual_spatial_funcs: Optional[torch.Tensor] = None) -> torch.Tensor:
+                        manual_spatial_funcs: Optional[torch.Tensor] = None,
+                        verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Performs the following decomposition:
     
@@ -357,7 +358,7 @@ def alpha_segementation(phis: torch.Tensor,
                 
         # Next compute AHy, which is essentially int_r W(r, t) * b_l(r).conj() dr
         AHy = torch.zeros((L, *trj_size), device=torch_dev, dtype=complex_dtype)
-        for l1 in tqdm(range(0, L, L_batch_size), 'Least Squares Forward Pass'):
+        for l1 in tqdm(range(0, L, L_batch_size), 'Least Squares Forward Pass', disable=not verbose):
             l2 = min(l1 + L_batch_size, L)
             AHy[l1:l2, ...] = t3n.forward(spatial_funcs[l1:l2].conj()) / np.prod(im_size)
 

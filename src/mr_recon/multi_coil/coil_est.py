@@ -6,7 +6,7 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.dtypes import complex_dtype
-from mr_recon.algs import power_method_matrix
+from mr_recon.algs import power_method_matrix, lobpcg_operator
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
 from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
@@ -18,6 +18,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
                      crp: Optional[float] = None,
                      sets_of_maps: Optional[int] = 1,
                      max_iter: Optional[int] = 100,
+                     lobpcg_iter: Optional[int] = None,
+                     cpu_last_part: Optional[bool] = False,
                      verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Copy of sigpy implementation of ESPIRiT calibration, but in torch:
@@ -39,6 +41,9 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         number of sets of maps to compute
     max_iter : int
         number of iterations to run power method
+    lobpcg_iter : int
+        number of iterations to run lobpcg
+        if given, uses lobpcg instead of svd for first part
     verbose : bool
         toggles progress bar
 
@@ -72,7 +77,17 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     if verbose:
         print('Computing SVD on calibration matrix: ', end='')
         start = time.perf_counter()
-    _, S, VH = torch.linalg.svd(mat, full_matrices=False)
+    
+    if lobpcg_iter is not None:
+        AHA = mat.H @ mat
+        A_op = lambda x : AHA @ x
+        num_eigen = min(AHA.shape[1], 5000)
+        X = torch.randn((AHA.shape[0], num_eigen), dtype=AHA.dtype, device=AHA.device)
+        evals, evecs = lobpcg_operator(A_op, X, maxiter=lobpcg_iter)
+        S = evals.abs() ** 0.5
+        VH = evecs.H
+    else:
+        _, S, VH = torch.linalg.svd(mat, full_matrices=False)
     VH = VH[S > thresh * S.max(), :]
     if verbose:
         end = time.perf_counter()
@@ -84,15 +99,18 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         [num_kernels, num_coils] + [kernel_width] * img_ndim)
 
     # Get covariance matrix in image domain
+    if cpu_last_part:
+        device = torch.device('cpu')
     AHA = torch.zeros(im_size + (num_coils, num_coils), 
                         dtype=ksp_cal.dtype, device=device)
+    kernels = kernels.to(device)
     for kernel in tqdm(kernels, 'Computing covariance matrix', disable=not verbose):
         aH = ifft(kernel, oshape=(num_coils, *im_size),
                                 dim=tuple(range(-img_ndim, 0)))
         aH = rearrange(aH, 'nc ... -> ... nc 1')
         # a = aH.swapaxes(-1, -2).conj()
         # AHA += aH @ a
-        bs = 1
+        bs = 2
         for c1 in range(0, num_coils, bs):
             c2 = min(num_coils, c1 + bs)
             AHA[..., c1:c2, :] += aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj()

@@ -99,7 +99,7 @@ def quantize_data(data: torch.Tensor,
     if method == 'cluster':
         max_iter = 1000
         mode = 'euclidean'
-        verbose = 1
+        verbose = 0
         # mode = 'cosine'
         if (torch_dev.index == -1) or (torch_dev.index is None):
             kmeans = KMeans(n_clusters=K,
