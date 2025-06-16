@@ -1110,7 +1110,8 @@ class gridded_nufft(NUFFT):
         trj_rs = trj * self.grid_oversamp
         for i in range(trj_rs.shape[-1]):
             n_over_2 = self.im_size_os[i]/2
-            trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, self.im_size_os[i]-1)
+            trj_rs[..., i] = (trj_rs[..., i] + n_over_2) % self.im_size_os[i] # $25 to Yonatan
+            # trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, self.im_size_os[i]-1)
         trj_rs = torch.round(trj_rs).type(torch.int32)
 
         return trj_rs
@@ -1145,7 +1146,7 @@ class gridded_nufft(NUFFT):
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
         
-        return ksp * self.grid_oversamp
+        return ksp * (self.grid_oversamp ** (d/2))
 
     def adjoint_iFT_only(self, 
                          ksp_os: torch.Tensor) -> torch.Tensor:
@@ -1156,7 +1157,7 @@ class gridded_nufft(NUFFT):
         img_os = ifft(ksp_os, dim=tuple(range(-d, 0)))
         img = resize(img_os, tuple(img_os.shape[:-d]) + self.im_size)
         
-        return img * self.grid_oversamp
+        return img
     
     def adjoint_grid_only(self, 
                           ksp: torch.Tensor, 
@@ -1174,7 +1175,7 @@ class gridded_nufft(NUFFT):
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), self.im_size_os)
             
-        return ksp_os
+        return ksp_os * (self.grid_oversamp ** (d/2))
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,

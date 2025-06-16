@@ -156,7 +156,7 @@ def laplacian(u: torch.Tensor,
     # Restore batch dim
     return lap.reshape(u.shape)
 
-def fourier_resize(x, new_shape, window='hamming'):
+def fourier_resize(x, new_shape, window='boxcar'):
 
     # FFT
     ndim = len(new_shape)

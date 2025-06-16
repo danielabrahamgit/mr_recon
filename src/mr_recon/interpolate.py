@@ -141,8 +141,6 @@ def optimize_hyper(model: BatchedOutputGPModel,
 
     return model
 
-
-
 def apply_interp_kernel(xs: torch.Tensor,
                         x: torch.Tensor,
                         kern_weights: torch.Tensor,
@@ -220,8 +218,10 @@ def get_interp_kernel(xs: torch.Tensor,
     
     Returns:
     --------
-    y : (torch.Tensor)
-        The interpolated tensor with shape (..., n)
+    kern_weights : (torch.Tensor)
+        The kernel weights with shape (K, n)
+    kern_func : (callable)
+        The kernel function to use for interpolation, maps (x1, x2) -> scalar 'distance'
     """
     # Consts
     K = xs.shape[0]
@@ -246,7 +246,7 @@ def get_interp_kernel(xs: torch.Tensor,
     A = kern_func(xs[:, None], xs[None, :]).type(ys.dtype)  # K M
     
     # Build target matrix
-    B = ys
+    B = ys # K n
     
     # Solve
     kern_weights = lin_solve(A.H @ A, A.H @ B, lamda=lamda, solver='solve') # K n

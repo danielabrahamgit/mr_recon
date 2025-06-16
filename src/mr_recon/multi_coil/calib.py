@@ -9,6 +9,43 @@ from mr_recon.recons import CG_SENSE_recon
 from einops import rearrange, einsum
 from typing import Optional, Union
 
+def whiten_data(noise_mat: torch.Tensor,
+                *args):
+    """
+    Whiten data using calibration noisy data
+
+    Args:
+    -----
+    noise_mat : torch.Tensor
+        matrix with just noise, shape (C, ...)
+    *args : list[torch.Tensor]
+        additional tensors to whiten, shape (C, ...)
+
+    Returns:
+    --------
+    psi_half_inv : torch.Tensor
+        whitening matrix, shape (C, C)
+    args : list[torch.Tensor]
+        whitened tensors, shape (C, ...)
+    """
+    C = noise_mat.shape[0]
+    noise_mat = noise_mat.reshape((C, -1))
+    cov_mat = noise_mat @ noise_mat.H
+    cov_mat /= noise_mat.abs().max()
+    vals, vecs = torch.linalg.eigh(cov_mat)
+    psi_half_inv = (vecs * (vals ** (-0.5))) @ vecs.H
+    
+    whitened = []
+    for arg in args:
+        arg_whitened = einsum(arg, psi_half_inv, 'C ..., Co C -> Co ...')
+        whitened.append(arg_whitened)
+
+    if len(whitened) == 0:
+        return psi_half_inv
+
+    else:
+        return [psi_half_inv] + whitened
+
 def calc_coil_subspace(ksp_mat: torch.Tensor,
                        new_coil_size: Union[int, float],
                        *args):

@@ -14,8 +14,8 @@ from einops import rearrange, einsum
 # torch.manual_seed(0)
 
 # Params
-device_idx = 2
-grd_os = 2.0
+device_idx = 4
+grd_os = 1.5
 try:
     torch_dev = torch.device(device_idx)
 except:
@@ -40,8 +40,8 @@ sp_nufft = sigpy_nufft(im_size)
 tr_nufft = triton_nufft(im_size)
 mx_nufft = matrix_nufft(im_size)
 # sv_nufft = svd_nufft(im_size, n_svd=16, svd_mx_size=(35,)*d)
-nuffts = [sp_nufft, tr_nufft, mx_nufft,]
-names = ['sigpy_nufft', 'triton_nufft', 'matrix_nufft']
+nuffts = [grd_nufft, sp_nufft,]
+names = ['gridded_nufft', 'sigpy_nufft']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.ylim(-.2, 1.2)

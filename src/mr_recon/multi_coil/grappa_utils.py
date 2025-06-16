@@ -1,7 +1,7 @@
 import torch
 import sigpy as sp
 
-from mr_recon.fourier import fft, ifft
+from mr_recon.fourier import fft, ifft, sigpy_nufft
 from mr_recon.algs import lin_solve
 from mr_recon import dtypes
 from mr_recon.utils import gen_grd, np_to_torch, torch_to_np, rotation_matrix
@@ -306,6 +306,60 @@ def grappa_AHA_AHb_img(img_cal: torch.Tensor,
     AHb = einsum(A.conj(), B, 'N R CS, R C -> N CS C')
 
     return AHA, AHb
+
+def grappa_src_trg(img_cal: torch.Tensor,
+                   source_vectors: torch.Tensor,
+                   width: Optional[int] = 6,
+                   oversamp: Optional[float] = 1.25) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes source and target matrices for grappa kernel estimation using
+    NUFFT interpolation on the calibration
+    
+    Args:
+    -----
+    img_cal: torch.Tensor
+        calibration image with shape (C, *cal_size)
+    source_vectors : torch.Tensor
+        Coordinates of source relative to target with shape (N, S, d)
+    width: int
+        kaiser bessel kernel width
+    oversamp: float
+        kaiser bessel oversampling ratio
+    
+    Returns:
+    --------
+    Asrc: np.ndarray <complex>
+        grappa source calibration matrix with shape (N, M, S * C) 
+        where M is the number of calib points
+    Btrg: np.ndarray <complex>
+        grappa target calibration matrix with shape (M, C)
+        where M is the number of calib points. Note target points dont depend on N.
+    """
+    # Consts
+    torch_dev = img_cal.device
+    cal_size = img_cal.shape[1:]
+    C = img_cal.shape[0]
+    N, S, d = source_vectors.shape
+    assert torch_dev == source_vectors.device
+    nufft = sigpy_nufft(cal_size, width=width, oversamp=oversamp)
+    
+    # Build target points
+    max_width = source_vectors.abs().reshape((-1, d)).max(dim=0).values
+    cal_size_new = tuple([int((cal_size[i] - 2 * max_width[i]).floor().item() // 2) * 2 for i in range(d)])
+    # print(f'Old Cal Size: {cal_size}\nNew Cal Size: {cal_size_new}')
+    trj_trg = gen_grd((cal_size_new), cal_size_new).reshape((-1, d)).to(torch_dev) # M d
+    Btrg = nufft(img_cal[None,], trj_trg[None,])[0] # C M
+    
+    # Build source points
+    trj_src = trj_trg[None, :, None, :] + source_vectors[:, None, :, :] # N M S d
+    Asrc = nufft(img_cal[None,], trj_src[None,])[0] # C N M S
+    
+    # Reshape
+    Btrg = rearrange(Btrg, 'C M -> M C')
+    Asrc = rearrange(Asrc, 'C N M S -> N M (S C)')
+    
+    return Asrc, Btrg
+    
 
 def grappa_AHA_AHb(img_cal: torch.Tensor, 
                    source_vectors: torch.Tensor,

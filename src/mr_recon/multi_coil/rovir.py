@@ -81,8 +81,8 @@ def apply_rovir(img_cal: torch.Tensor,
     weights = torch.linalg.qr(weights, mode='reduced')[0]
     
     import matplotlib.pyplot as plt
-    plt.plot(pcnt_signal.cpu().numpy()[:32], label='Signal')
-    plt.plot(pcnt_interf.cpu().numpy()[:32], label='Interference')
+    plt.plot(pcnt_signal.cpu().numpy(), label='Signal')
+    plt.plot(pcnt_interf.cpu().numpy(), label='Interference')
     plt.axvline(signal_cutoff, color='r', linestyle='--')
     plt.ylim(-.05, 1.05)
     plt.legend()

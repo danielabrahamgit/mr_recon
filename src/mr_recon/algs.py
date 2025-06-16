@@ -493,7 +493,7 @@ def lobpcg_operator(A: callable,
     Parameters:
     -----------
     A : callable
-        (n, n) function that takes a tensor with shape (n, k) and return A(X) with shape (n, k).
+        (n --> n) function that takes a tensor with shape (n, k) and return A(X) with shape (n, k).
     X : torch.Tensor
         Initial guess for eigenvectors, shape (n, k). (rows need not be orthonormal.)
     precond : callable or None
@@ -589,6 +589,7 @@ def lobpcg_operator(A: callable,
         X = X_new
         AX = AX_new
         evals = new_evals
+        
 
     return evals, X
           
