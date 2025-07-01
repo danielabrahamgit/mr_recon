@@ -2,6 +2,7 @@ import time
 import torch
 import sigpy as sp
 import gc
+import gc
 
 from tqdm import tqdm
 from typing import Optional, Tuple
@@ -19,6 +20,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
                      crp: Optional[float] = None,
                      sets_of_maps: Optional[int] = 1,
                      max_iter: Optional[int] = 100,
+                     coil_batch_size: Optional[int] = None,
+                     return_AHA: Optional[bool] = False,
                      coil_batch_size: Optional[int] = None,
                      return_AHA: Optional[bool] = False,
                      lobpcg_iter: Optional[int] = None,
@@ -49,6 +52,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     lobpcg_iter : int
         number of iterations to run lobpcg
         if given, uses lobpcg instead of svd for first part
+    coil_batch_size : int
+        Batches computation of covariance matrix over second coil dimension
     verbose : bool
         toggles progress bar
 
