@@ -1,9 +1,12 @@
 import gc
+from turtle import forward
 import torch
 import torch.nn as nn
 import numpy as np
 import sigpy as sp
 import torch.fft as fft_torch
+import cufinufft
+
 
 from typing import Optional
 from torchkbnufft import KbNufft, KbNufftAdjoint
@@ -488,16 +491,8 @@ class triton_nufft(NUFFT):
         N = trj.shape[0]    
 
         # Interpolate
-        dev = sp.get_device(trj_cp)
-        with dev:
-            trj_cp = _scale_coord(trj_cp, img_shape, oversamp)
-            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.np_complex_dtype)
-            for i in range(N):
-                ksp_ret[i] = sp.interp.interpolate(
-                        ksp_os_cp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
-            ksp_ret /= width ** ndim
         trj = self._scale_trj(trj, img_shape)
-        ksp_ret = torch.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=complex_dtype, device=ksp_os.device)
+        ksp_ret = torch.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.complex_dtype, device=ksp_os.device)
         for i in range(N):
             ksp_ret[i] = interpolate(ksp_os[i], trj[i], width=(width,)*ndim, 
                                      kernel='kaiser_bessel', 
@@ -544,7 +539,7 @@ class triton_nufft(NUFFT):
 
         # Gridding
         trj = self._scale_trj(trj, oshape)
-        output = torch.zeros(os_shape, dtype=complex_dtype, device=ksp.device)
+        output = torch.zeros(os_shape, dtype=dtypes.complex_dtype, device=ksp.device)
         for i in range(N):
             output[i] = interpolate_adjoint(ksp[i], trj[i], os_shape[-ndim:], 
                                             kernel='kaiser_bessel', width=(width,)*ndim, kernel_params={'beta':beta},
@@ -632,7 +627,7 @@ class matrix_nufft(NUFFT):
         rs = gen_grd(im_size).to(torch_dev).reshape((-1, d)) 
         
         # Return this
-        ksp = torch.zeros((N, *img_batch, *trj_size), dtype=complex_dtype, device=torch_dev)
+        ksp = torch.zeros((N, *img_batch, *trj_size), dtype=dtypes.complex_dtype, device=torch_dev)
         
         for n in range(N):
             # Create encoding matrix over batch
@@ -683,7 +678,7 @@ class matrix_nufft(NUFFT):
         rs = gen_grd(im_size).to(torch_dev).reshape((-1, d)) 
         
         # Return this
-        img = torch.zeros((N, *ksp_batch, R), dtype=complex_dtype, device=torch_dev)
+        img = torch.zeros((N, *ksp_batch, R), dtype=dtypes.complex_dtype, device=torch_dev)
         
         for n in range(N):
             # Create encoding matrix over batch
@@ -874,58 +869,10 @@ class sigpy_nufft(NUFFT):
         # Interpolate
         dev = sp.get_device(ksp_os_cp)
         with dev:
-            trj_cp = _scale_coord(trj_cp, img_shape, oversamp)
-            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.np_complex_dtype)
+            ksp_ret = dev.xp.zeros((N, *img_shape[1:-ndim], *trj_cp.shape[1:-1]), dtype=dtypes.np_complex_dtype)
             for i in range(N):
                 ksp_ret[i] = sp.interp.interpolate(
                         ksp_os_cp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
-            ksp_ret /= width ** ndim
-        return np_to_torch(ksp_ret)
-
-    def forward(self, 
-                img: torch.Tensor, 
-                trj: torch.Tensor) -> torch.Tensor:
-        """
-        Figured I should explain myself before commiting this code crime.
-        I want to batch the NUFFT, and this can be done by modifying the 
-        final KB interpolation step. So I am just going to copy the sigpy
-        NUFFT implimentation, which feels so very wrong, and then augment 
-        the KB inerpolate part :')
-        """
-        return self.forward_interp_only(self.forward_FT_only(img), trj)
-        # Convert to cupy first
-        img_cp, trj_cp = torch_to_np(img, trj)
-        
-        # Consts
-        width = self.width
-        oversamp = self.oversamp
-        beta = self.beta
-        ndim = trj_cp.shape[-1]
-        os_shape = _get_oversamp_shape(img_cp.shape, ndim, oversamp)
-        N = trj.shape[0]
-
-        dev = sp.get_device(trj_cp)
-        with dev:
-        
-            ksp = img_cp.copy()
-
-            # Apodize
-            if self.apodize:
-                _apodize(ksp, ndim, oversamp, width, beta)
-
-            # Zero-pad
-            ksp /= sp.util.prod(img_cp.shape[-ndim:])**0.5
-            ksp = sp.util.resize(ksp, os_shape)
-
-            # FFT
-            ksp = torch_to_np(fft(np_to_torch(ksp), dim=tuple(range(-ndim, 0)), norm=None))
-
-            # Interpolate
-            trj_cp = _scale_coord(trj_cp, img_cp.shape, oversamp)
-            ksp_ret = dev.xp.zeros((N, *img_cp.shape[1:-ndim], *trj.shape[1:-1]), dtype=dtypes.np_complex_dtype)
-            for i in range(N):
-                ksp_ret[i] = sp.interp.interpolate(
-                        ksp[i], trj_cp[i], kernel='kaiser_bessel', width=width, param=beta)
             ksp_ret /= width ** ndim
         return np_to_torch(ksp_ret)
 
@@ -1051,7 +998,7 @@ class torchkb_nufft(NUFFT):
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
         ksp = self.kb_ob(image=img_torchkb, omega=omega, norm='ortho')
         ksp = ksp.reshape((N, *img.shape[1:-d], *trj.shape[1:-1]))
-        return ksp * np.sqrt(self.oversamp) # NOTE: scaling updated as sqrt to match sigpy scaling
+        return ksp * self.oversamp
 
     def adjoint(self,
                 ksp: torch.Tensor,
@@ -1069,7 +1016,7 @@ class torchkb_nufft(NUFFT):
         omega = trj_torch.reshape((N, -1, d)).swapaxes(-2, -1)
         img = self.kb_adj_ob(data=ksp_torch_kb, omega=omega, norm='ortho')
         img = img.reshape((N, *ksp.shape[1:-(trj.ndim - 2)], *im_size))
-        return img * np.sqrt(self.oversamp)
+        return img * self.oversamp
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
@@ -1102,6 +1049,157 @@ class torchkb_nufft(NUFFT):
 
         return calc_toep_kernel_helper(nufft_os.adjoint, trj, weights) * (os_factor ** len(self.im_size))
     
+class cufi_nufft(NUFFT):
+    
+    def __init__(self,
+                 im_size: tuple,
+                 eps: Optional[float] = 1e-4):
+        """
+        Uses the cufi-nufft library to perform the NUFFT.
+        
+        Args:
+        -----
+        im_size : tuple
+            The size of the image to be transformed.
+        eps : float, optional
+            The epsilon value for the cufi-nufft library, default is 1e-4.
+        """
+        super().__init__(im_size)
+        self.eps = eps
+
+    def forward(self,
+                img: torch.Tensor, 
+                trj: torch.Tensor) -> torch.Tensor:
+        N = trj.shape[0]
+        d = trj.shape[-1]
+        
+        ksp = torch.zeros((N, *img.shape[1:-len(trj.shape[1:-1])], *trj.shape[1:-1]), 
+                          dtype=dtypes.complex_dtype, device=img.device)
+        
+        for n in range(N):
+            if d == 1:
+                ksp[n] = self.frw_1d(img[n], trj[n], self.eps, self.im_size) 
+            elif d == 2:
+                ksp[n] = self.frw_2d(img[n], trj[n], self.eps, self.im_size)
+            elif d == 3:
+                ksp[n] = self.frw_3d(img[n], trj[n], self.eps, self.im_size)
+            else:
+                raise ValueError(f"Unsupported trajectory dimension: {d}. Only 1D, 2D, and 3D are supported.")
+        
+        return ksp
+    
+    def adjoint(self,
+                ksp: torch.Tensor,
+                trj: torch.Tensor) -> torch.Tensor:
+        N = trj.shape[0]
+        d = trj.shape[-1]
+        
+        img = torch.zeros((N, *ksp.shape[1:-len(trj.shape[1:-1])], *self.im_size), 
+                          dtype=dtypes.complex_dtype, device=ksp.device) 
+        for n in range(N):
+            if d == 1:
+                img[n] = self.adj_1d(ksp[n], trj[n], self.eps, self.im_size)
+            elif d == 2:
+                img[n] = self.adj_2d(ksp[n], trj[n], self.eps, self.im_size)
+            elif d == 3:
+                img[n] = self.adj_3d(ksp[n], trj[n], self.eps, self.im_size)
+            else:
+                raise ValueError(f"Unsupported trajectory dimension: {d}. Only 1D, 2D, and 3D are supported.")
+        
+        return img
+
+    @staticmethod
+    def frw_1d(img: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
+        trj_size = trj.shape[:-1]
+        trj_flt = trj.reshape((trj.shape[0], 1))
+        img_flt = img.reshape((-1, *im_size))
+        trj_cp = torch_to_np(trj_flt)
+        img_cp = torch_to_np(img_flt)
+        ksp = np_to_torch(cufinufft.nufft1d2(trj_cp[:, 0], img_cp, 
+                                                eps=eps,
+                                                isign=-1))
+        return ksp.reshape((*img.shape[:-1], *trj_size))
+    
+    @staticmethod
+    def adj_1d(ksp: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
+        trj_size = trj.shape[:-1]
+        ksp_size = ksp.shape[:-len(trj_size)]
+        trj_flt = trj.reshape((trj.shape[0], 1))
+        ksp_flt = ksp.reshape((-1, trj_flt.shape[0]))
+        trj_cp = torch_to_np(trj_flt)
+        ksp_cp = torch_to_np(ksp_flt)
+        img = np_to_torch(cufinufft.nufft1d1(trj_cp[:, 0], ksp_cp, 
+                                                eps=eps,
+                                                isign=1,
+                                                n_modes=im_size[0]))
+        return img.reshape((*ksp_size, *im_size))
+    
+    @staticmethod
+    def frw_2d(img: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
+        trj_size = trj.shape[:-1]
+        trj_flt = trj.reshape((trj.shape[0], 2))
+        img_flt = img.reshape((-1, *im_size))
+        trj_cp = torch_to_np(trj_flt)
+        img_cp = torch_to_np(img_flt)
+        ksp = np_to_torch(cufinufft.nufft2d2(trj_cp[:, 0], trj_cp[:, 1], 
+                                             img_cp, 
+                                             eps=eps,
+                                             isign=-1))
+        return ksp.reshape((*img.shape[:-1], *trj_size))    
+    
+    @staticmethod
+    def adj_2d(ksp: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
+        trj_size = trj.shape[:-1]
+        ksp_size = ksp.shape[:-len(trj_size)]
+        trj_flt = trj.reshape((trj.shape[0], 2))
+        ksp_flt = ksp.reshape((-1, trj_flt.shape[0]))
+        trj_cp = torch_to_np(trj_flt)
+        ksp_cp = torch_to_np(ksp_flt)
+        img = np_to_torch(cufinufft.nufft2d1(trj_cp[:, 0], trj_cp[:, 1],
+                                             ksp_cp, 
+                                             eps=eps,
+                                             isign=1,
+                                             n_modes=im_size))
+        return img.reshape((*ksp_size, *im_size))
+    
+    @staticmethod
+    def frw_3d(img: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
+        trj_size = trj.shape[:-1]
+        trj_flt = trj.reshape((trj.shape[0], 3))
+        img_flt = img.reshape((-1, *im_size))
+        trj_cp = torch_to_np(trj_flt)
+        img_cp = torch_to_np(img_flt)
+        ksp = np_to_torch(cufinufft.nufft3d2(trj_cp[:, 0], trj_cp[:, 1], trj_cp[:, 2],
+                                             img_cp, 
+                                             eps=eps,
+                                             isign=-1))
+        return ksp.reshape((*img.shape[:-1], *trj_size))    
+    
+    @staticmethod
+    def adj_3d(ksp: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
+        trj_size = trj.shape[:-1]
+        ksp_size = ksp.shape[:-len(trj_size)]
+        trj_flt = trj.reshape((trj.shape[0], 3))
+        ksp_flt = ksp.reshape((-1, trj_flt.shape[0]))
+        trj_cp = torch_to_np(trj_flt)
+        ksp_cp = torch_to_np(ksp_flt)
+        img = np_to_torch(cufinufft.nufft3d1(trj_cp[:, 0], trj_cp[:, 1], trj_cp[:, 2],
+                                             ksp_cp, 
+                                             eps=eps,
+                                             isign=1,
+                                             n_modes=im_size))
+        return img.reshape((*ksp_size, *im_size))
+
+    def rescale_trajectory(self,
+                           trj: torch.Tensor) -> torch.Tensor:
+        
+        # Rescale to -pi, pi
+        im_size_arr = torch.tensor(self.im_size).to(trj.device)
+        tup = (None,) * (trj.ndim - 1) + (slice(None),)
+        trj_rs = torch.pi * trj / (im_size_arr[tup] / 2)
+
+        return trj_rs 
+
 class gridded_nufft(NUFFT):
 
     def __init__(self,
@@ -1118,9 +1216,9 @@ class gridded_nufft(NUFFT):
         trj_rs = trj * self.grid_oversamp
         for i in range(trj_rs.shape[-1]):
             n_over_2 = self.im_size_os[i]/2
-            trj_rs[..., i] = (trj_rs[..., i] + n_over_2) % self.im_size_os[i] # $25 to Yonatan
+            trj_rs[..., i] = (trj_rs[..., i] + n_over_2).round() % self.im_size_os[i] # $25 to Yonatan
             # trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, self.im_size_os[i]-1)
-        trj_rs = torch.round(trj_rs).type(torch.int32)
+        trj_rs = trj_rs.type(torch.int32)
 
         return trj_rs
 
@@ -1149,7 +1247,7 @@ class gridded_nufft(NUFFT):
         
         # Return k-space
         ksp = torch.zeros((*ksp_os.shape[:-d], *trj.shape[1:-1]), 
-                          dtype=complex_dtype, device=ksp_os.device)
+                          dtype=dtypes.complex_dtype, device=ksp_os.device)
         
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
@@ -1179,7 +1277,7 @@ class gridded_nufft(NUFFT):
 
         # Adjoint NUFFT
         ksp_os = torch.zeros((*ksp.shape[:-(trj.ndim - 2)], *self.im_size_os), 
-                             dtype=complex_dtype, device=ksp_torch.device)
+                             dtype=dtypes.complex_dtype, device=ksp_torch.device)
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), self.im_size_os)
             
@@ -1315,7 +1413,7 @@ class svd_nufft(NUFFT):
         # Build matrix
         n, _ = rs.shape
         m, _ = ks.shape
-        mx = torch.zeros((m, n), dtype=complex_dtype, device=torch_dev)
+        mx = torch.zeros((m, n), dtype=dtypes.complex_dtype, device=torch_dev)
         if batch_size is None:
             batch_size = m
         for m1 in range(0, m, batch_size):
@@ -1339,7 +1437,7 @@ class svd_nufft(NUFFT):
             return out.T.reshape((k, *svd_size))
             
         # eigen-decomp
-        x0 = torch.ones(svd_size, dtype=complex_dtype, device=torch_dev)
+        x0 = torch.ones(svd_size, dtype=dtypes.complex_dtype, device=torch_dev)
         evecs, _ = eigen_decomp_operator(gram, x0, num_eigen=self.n_svd, num_iter=100, lobpcg=True)
         temp_evecs = forward(evecs)
         

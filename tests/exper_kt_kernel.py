@@ -13,7 +13,7 @@ from mr_recon.utils import batch_iterator, gen_grd, normalize
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.algs import density_compensation
 from mr_recon.fourier import sigpy_nufft, NUFFT, svd_nufft
-from mr_recon.dtypes import complex_dtype, real_dtype
+from mr_recon import dtypes
 from mr_recon.linops import batching_params, experimental_sense, linop
 from mr_recon.imperfections.imperf_decomp import temporal_segmentation
 from mr_recon.imperfections.spatio_temporal_imperf import high_order_phase
@@ -98,13 +98,13 @@ class kt_3d(linop):
         if nufft is None:
             nufft = sigpy_nufft(im_size, oversamp=os, width=W)
         if dcf is None:
-            dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+            dcf = torch.ones(trj_size, dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
         
         # Rescale and change types
-        trj = nufft.rescale_trajectory(trj).type(real_dtype)
-        dcf = dcf.type(real_dtype)
+        trj = nufft.rescale_trajectory(trj).type(dtypes.real_dtype)
+        dcf = dcf.type(dtypes.real_dtype)
         
         # Compute 3D trajectory 
         b0_scale = b0.abs().max() * 2
@@ -116,7 +116,7 @@ class kt_3d(linop):
         
         T_size = 2 * (ts.max().ceil().int().item() + W)
         self.nufft_3d = sigpy_nufft((*im_size, T_size), width=W, oversamp=os)
-        zeros = torch.zeros((*im_size, T_size), dtype=complex_dtype, device=torch_dev)
+        zeros = torch.zeros((*im_size, T_size), dtype=dtypes.complex_dtype, device=torch_dev)
         self.kgrid = self.nufft_3d.forward_FT_only(zeros)
         self.tsegs = gen_grd((self.kgrid.shape[-1],),(self.kgrid.shape[-1],))[:, 0].to(torch_dev) / self.nufft_3d.oversamp
         # self.tmask = torch.ones_like(self.tsegs)
@@ -161,7 +161,7 @@ class kt_3d(linop):
         coil_batch_size = self.bparams.coil_batch_size
 
         # Result array
-        ksp = torch.zeros((C, *self.trj_size), dtype=complex_dtype, device=self.torch_dev)
+        ksp = torch.zeros((C, *self.trj_size), dtype=dtypes.complex_dtype, device=self.torch_dev)
 
         # Batch over coils 
         for c1, c2 in batch_iterator(C, coil_batch_size): 
@@ -203,7 +203,7 @@ class kt_3d(linop):
         coil_batch_size = self.bparams.coil_batch_size
 
         # Result image
-        img = torch.zeros(self.im_size, dtype=complex_dtype, device=self.torch_dev)
+        img = torch.zeros(self.im_size, dtype=dtypes.complex_dtype, device=self.torch_dev)
         
         # Apply DCF
         Wy = (ksp * self.dcf) # C *trj_size
