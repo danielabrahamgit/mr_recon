@@ -165,10 +165,10 @@ def svd_power_method_tall(A: callable,
             y = y - rank1_op
         return y
     
-    for r in tqdm(range(rank), 'SVD Iterations', disable=not verbose):
+    for r in tqdm(range(rank), 'SVD Iterations', disable=not verbose, leave=False):
         # Power method to calc u_i sigma_i v_i
         x0 = torch.randn(inp_dims, device=device, dtype=inp_dtype)
-        v, _ = power_method_operator(AHA_resid_operator, x0, num_iter=niter, verbose=True)
+        v, _ = power_method_operator(AHA_resid_operator, x0, num_iter=niter, verbose=False)
         v = v / torch.linalg.norm(v)
         u = A_resid_operator(v)
         sigma = torch.linalg.norm(u)
@@ -219,7 +219,7 @@ def power_method_matrix(M: torch.Tensor,
         eigen_vec = vec_init[..., None]
     else:
         eigen_vec = torch.ones((*M.shape[:-1], 1), device=M.device, dtype=M.dtype)
-    for i in tqdm(range(num_iter), 'Power Iterations', disable=not verbose):
+    for i in tqdm(range(num_iter), 'Power Iterations', disable=not verbose, leave=False):
         eigen_vec = M @ eigen_vec
         eigen_val = torch.linalg.norm(eigen_vec, axis=-2, keepdims=True)
         eigen_vec = eigen_vec / eigen_val
@@ -253,7 +253,7 @@ def power_method_operator(A: callable,
         eigenvalue
     """
     
-    for _ in tqdm(range(num_iter), 'Max Eigenvalue', disable=not verbose):
+    for _ in tqdm(range(num_iter), 'Max Eigenvalue', disable=not verbose, leave=False):
         
         z = A(x0)
         ll = torch.norm(z)

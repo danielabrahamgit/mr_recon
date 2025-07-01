@@ -1,6 +1,7 @@
 import time
 import torch
 import sigpy as sp
+import gc
 
 from tqdm import tqdm
 from typing import Optional, Tuple
@@ -18,6 +19,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
                      crp: Optional[float] = None,
                      sets_of_maps: Optional[int] = 1,
                      max_iter: Optional[int] = 100,
+                     coil_batch_size: Optional[int] = None,
+                     return_AHA: Optional[bool] = False,
                      verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Copy of sigpy implementation of ESPIRiT calibration, but in torch:
@@ -39,6 +42,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         number of sets of maps to compute
     max_iter : int
         number of iterations to run power method
+    coil_batch_size : int
+        Batches computation of covariance matrix over second coil dimension
     verbose : bool
         toggles progress bar
 
@@ -54,6 +59,9 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     img_ndim = len(im_size)
     num_coils = ksp_cal.shape[0]
     device = ksp_cal.device
+
+    if coil_batch_size is None:
+        coil_batch_size = num_coils
 
     # TODO torch this part
     # Get calibration matrix.
@@ -78,6 +86,11 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         end = time.perf_counter()
         print(f'{end - start:.3f}s')
 
+    # memory management
+    del mat
+    torch.cuda.empty_cache()
+    gc.collect()
+
     # Get kernels
     num_kernels = len(VH)
     kernels = VH.reshape(
@@ -86,14 +99,27 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     # Get covariance matrix in image domain
     AHA = torch.zeros(im_size + (num_coils, num_coils), 
                         dtype=ksp_cal.dtype, device=device)
-    for kernel in tqdm(kernels, 'Computing covariance matrix', disable=not verbose):
+    for kernel in tqdm(kernels, 'Computing ESPIRIT covariance matrix', disable=not verbose, leave=False):
         aH = ifft(kernel, oshape=(num_coils, *im_size),
                                 dim=tuple(range(-img_ndim, 0)))
         aH = rearrange(aH, 'nc ... -> ... nc 1')
         a = aH.swapaxes(-1, -2).conj()
-        AHA += aH @ a
+
+        # batch over second coil dimension
+        for ci in range(0, num_coils, coil_batch_size):
+            cf = min(num_coils, ci + coil_batch_size)
+            AHA[..., ci:cf] += aH @ a[..., ci:cf]
+
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
+    # cleanup
+    del a, aH
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    if return_AHA:
+        return AHA
+
     # Get eigenvalues and eigenvectors
     mps_all = []
     evals_all = []
@@ -108,7 +134,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
             mps *= eigen_vals > crp
         
         # Update AHA
-        AHA -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
+        if sets_of_maps > 1: # becasue this is memory-intensive. TODO: fix this problem in general.
+            AHA -= einsum(mps * eigen_vals, mps.conj(), 'Cl ..., Cr ... -> ... Cl Cr')
         mps_all.append(mps)
         evals_all.append(eigen_vals)
         
@@ -118,6 +145,11 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     else:
         mps = torch.stack(mps_all, dim=0)
         eigen_vals = torch.stack(evals_all, dim=0)
+
+    # final cleanup
+    del AHA
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return mps, eigen_vals
 

@@ -60,9 +60,55 @@ def calc_coil_subspace(ksp_mat: torch.Tensor,
         new_coil_size = n_coil
     elif type(new_coil_size) is float:
         cmsm = torch.cumsum(s, dim=0)
-        n_coil = torch.argwhere(cmsm > new_coil_size * cmsm[-1]).squeeze()[0]
+        n_coil = torch.argwhere(cmsm > new_coil_size * cmsm[-1]).flatten()[0].item()
     elif type(new_coil_size) is int:
         n_coil = new_coil_size
+    n_coil = max(n_coil, 1)
+    coil_subspace = u[:, :n_coil] #/ s[:n_coil]
+    coil_subspace.imag *= -1 # conj without .conj() for weird numpy conversion reasons
+
+    comps = []
+    for arg in args:
+        arg_torch = np_to_torch(arg)
+        arg_compressed = einsum(arg_torch, coil_subspace, 'nc ..., nc nc2 -> nc2 ...')
+        if np_flag:
+            arg_compressed = torch_to_np(arg_compressed)
+        comps.append(arg_compressed)
+
+    if len(comps) == 0:
+        return coil_subspace
+
+    else:
+        return [coil_subspace] + comps
+
+
+def calc_coil_subspace_gram(ksp_mat: torch.Tensor,
+                       new_coil_size: Union[int, float],
+                       *args):
+    """
+    SVD on the gram matrix instead
+    """
+
+    # Move to torch
+    np_flag = type(ksp_mat) is np.ndarray
+    ksp_mat = np_to_torch(ksp_mat)
+
+    # Estimate coil subspace
+    n_coil = ksp_mat.shape[0]
+
+    ksp_flat = ksp_mat.reshape((n_coil, -1))
+    AAH = ksp_flat @ ksp_flat.conj().T
+    u, s, _ = torch.linalg.svd(AAH, full_matrices=False)
+    s = torch.sqrt(s)
+
+    if new_coil_size is None:
+        new_coil_size = n_coil
+    elif type(new_coil_size) is float:
+        cmsm = torch.cumsum(s, dim=0)
+        n_coil = torch.argwhere(cmsm > new_coil_size * cmsm[-1]).flatten()[0].item()
+    elif type(new_coil_size) is int:
+        n_coil = new_coil_size
+    n_coil = max(n_coil, 1)
     coil_subspace = u[:, :n_coil] #/ s[:n_coil]
     coil_subspace.imag *= -1 # conj without .conj() for weird numpy conversion reasons
 
