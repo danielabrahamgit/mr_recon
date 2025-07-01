@@ -30,7 +30,7 @@ def whiten_data(noise_mat: torch.Tensor,
     """
     C = noise_mat.shape[0]
     noise_mat = noise_mat.reshape((C, -1))
-    cov_mat = noise_mat @ noise_mat.H
+    cov_mat = (noise_mat @ noise_mat.H)
     cov_mat /= noise_mat.abs().max()
     vals, vecs = torch.linalg.eigh(cov_mat)
     psi_half_inv = (vecs * (vals ** (-0.5))) @ vecs.H

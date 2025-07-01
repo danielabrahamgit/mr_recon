@@ -25,6 +25,7 @@ class batching_params:
     sub_batch_size: Optional[int] = 1
     field_batch_size: Optional[int] = 1
     toeplitz_batch_size: Optional[int] = 1
+    img_batch_size: Optional[int] = 1
 
 class linop(nn.Module):
     """
@@ -1201,6 +1202,193 @@ class sense_linop(linop):
         
         return img_hat
 
+class sense_linop_noise_cov(linop):
+    
+    def __init__(self,
+                 noise_cov,
+                 **sense_args):
+        """
+        Args:
+        -----
+        noise_cov : torch.tensor
+            the k-space noise covariance matrix with shape (..., nc, nc)
+        **sense_args : dict
+            the arguments for the sense_linop constructor
+        """
+        im_size = sense_args['mps'].shape[1:]
+        trj_size = sense_args['trj'].shape[:-1]
+        C = sense_args['mps'].shape[0]
+        super().__init__(im_size, (C, *trj_size))
+        
+        self.set_noise_cov(noise_cov)
+        self.A = sense_linop(**sense_args)
+    
+    def apply_kspace_coil_mat(self,
+                              ksp: torch.Tensor,
+                              ksp_coil_mat: torch.Tensor) -> torch.Tensor:
+        """
+        Applies a coil matrix to each point in kspace
+        
+        Parameters
+        ----------
+        ksp : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size)
+        ksp_coil_mat : torch.tensor <complex> | GPU
+            the coil matrix with shape (*trj_size, nc, nc)
+        
+        Returns
+        ---------
+        ksp_new : torch.tensor <complex> | GPU
+            the k-space data with shape (nc, *trj_size) after applying the coil matrix
+        """
+        ksp_new = torch.zeros_like(ksp)
+        first_coil_batch = self.A.bparams.coil_batch_size
+        for c1, c2 in batch_iterator(ksp.shape[0], first_coil_batch):
+            second_coil_batch = ksp.shape[0]
+            for d1, d2 in batch_iterator(ksp.shape[0], second_coil_batch):
+                ksp_new[c1:c2] = einsum(ksp[d1:d2], ksp_coil_mat[..., c1:c2, d1:d2], 'ci ..., ... co ci -> co ...')
+        # ksp_new = einsum(ksp, ksp_coil_mat, 'ci ..., ... co ci -> co ...')
+        return ksp_new  
+    
+    def set_noise_cov(self, noise_cov: torch.Tensor):
+        if noise_cov is None:
+            self.inv_noise_cov = None
+        else:
+            self.inv_noise_cov = torch.zeros_like(noise_cov)
+            for i in range(noise_cov.shape[0]):
+                self.inv_noise_cov[i] = torch.linalg.inv(noise_cov[i])
+            
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        return self.A.forward(img)
+    
+    def adjoint(self, ksp: torch.Tensor) -> torch.Tensor:
+        if self.inv_noise_cov is not None:
+            ksp_new = self.apply_kspace_coil_mat(ksp, self.inv_noise_cov)
+        else:
+            ksp_new = ksp
+        return self.A.adjoint(ksp_new)
+    
+    def normal(self, img: torch.Tensor) -> torch.Tensor:
+        return self.adjoint(self.forward(img))
+
+class subspace_linop_new(linop):
+    
+    def __init__(self,
+                 trj: torch.Tensor,
+                 mps: torch.Tensor,
+                 phi: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 nufft: Optional[NUFFT] = None,
+                 use_toeplitz: Optional[bool] = False,
+                 spatial_funcs: Optional[torch.Tensor] = None,
+                 temporal_funcs: Optional[torch.Tensor] = None,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Parameters
+        ----------
+        trj : torch.tensor 
+            The k-space trajectory with shape (*trj_size, d)
+            trj_size = (..., T), the T is the number of time points for subspace
+        phi : torch.tensor
+            subspace basis with shape (K, T)
+        mps : torch.tensor
+            sensititvity maps with shape (C, *im_size)
+        dcf : torch.tensor <float> | GPU
+            the density comp. functon with shape (*trj_size)
+        nufft : NUFFT
+            the nufft object, defaults to sigpy_nufft
+        use_toeplitz : bool
+            toggles toeplitz normal operator
+        spatial_funcs : torch.tenso
+            the spatial functions for imperfection models with shape (L, *im_size)
+        temporal_funcs : torch.tensor
+            the temporal functions for imperfection models with shape (L, *trj_size)
+        bparams : batching_params
+            contains the batch sizes for the coils, subspace coeffs, and field segments
+        """
+        im_size = mps.shape[1:]
+        ishape = (phi.shape[0], *im_size)
+        oshape = (mps.shape[0], *trj.shape[:-1])
+        super().__init__(ishape, oshape)
+        
+        if use_toeplitz is True:
+            raise NotImplementedError("Toeplitz normal operator not implemented for subspace models")
+        
+        assert phi.shape[1] == trj.shape[-2]
+        self.A = sense_linop(trj=trj, mps=mps, dcf=dcf, 
+                             nufft=nufft,
+                             use_toeplitz=False,
+                             spatial_funcs=spatial_funcs,
+                             temporal_funcs=temporal_funcs,
+                             bparams=bparams)
+        self.phi = phi
+        
+    def forward(self,
+                alphas: torch.Tensor) -> torch.Tensor:
+        """
+        Forward call of this linear model.
+
+        Parameters
+        ----------
+        alphas : torch.tensor 
+            the subspace coefficient volumes with shape (K, *im_size)
+        
+        Returns
+        ---------
+        ksp : torch.tensor
+            the k-space data with shape (C, *trj_size)
+        """
+        K = self.phi.shape[0]
+        ksp = torch.zeros(self.oshape, dtype=complex_dtype, device=alphas.device)
+        
+        # Apply linop to images
+        for k in range(K):
+            ksp += self.A.forward(alphas[k]) * self.phi[k]
+            
+        return ksp
+    
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint call of this linear model.
+
+        Parameters
+        ----------
+        ksp : torch.tensor
+            the k-space data with shape (C, *trj_size)
+        
+        Returns
+        ---------
+        img : torch.tensor
+            the image with shape (*im_size)
+        """
+        K = self.phi.shape[0]
+        img = torch.zeros(self.ishape, dtype=complex_dtype, device=ksp.device)
+        
+        # Apply linop to kspace
+        for k in range(K):
+            img[k] = self.A.adjoint(ksp * self.phi[k].conj())
+        
+        return img
+
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+        """
+        Gram/normal call of this linear model (A.H (A (x))).
+
+        Parameters
+        ----------
+        img : torch.tensor
+            the image with shape (*im_size)
+        
+        Returns
+        ---------
+        img_hat : torch.tensor
+            the ouput image with shape (*im_size)
+        """
+        return self.adjoint(self.forward(img))
+        
+
 class subspace_linop(linop):
     """
     Linop for subspace models
@@ -1258,6 +1446,10 @@ class subspace_linop(linop):
             dcf = torch.ones(trj.shape[:-1], dtype=real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
+        if spatial_funcs is None:
+            spatial_funcs = torch.ones((1,)*(len(ishape)), dtype=complex_dtype, device=torch_dev)
+        if temporal_funcs is None:
+            temporal_funcs = torch.ones((1,)*(len(oshape)), dtype=complex_dtype, device=torch_dev)
         
         # Rescale and type cast
         trj = nufft.rescale_trajectory(trj).type(real_dtype)
@@ -1273,7 +1465,7 @@ class subspace_linop(linop):
             weights = rearrange(phis, 'nsub1 nsub2 ntr -> (nsub1 nsub2) 1 1 ntr')
             weights = weights * dcf
 
-            if spatial_funcs is not None:
+            if np.prod(spatial_funcs.shape) > 1:
                 raise NotImplementedError
 
             # Compute kernels
@@ -1290,16 +1482,6 @@ class subspace_linop(linop):
         else:
             self.toep_kerns = None
         
-        if spatial_funcs is not None:
-            assert temporal_funcs is not None
-            assert spatial_funcs.shape[1:] == im_size
-            assert temporal_funcs.shape[1:] == trj.shape[:-1]
-            self.spatial_funcs = spatial_funcs
-            self.temporal_funcs = temporal_funcs
-        else:
-            spatial_funcs = torch.ones((1,)*(len(im_size)+1), dtype=complex_dtype, device=torch_dev)
-            spatial_funcs = torch.ones((1,)*(len(dcf)+1), dtype=complex_dtype, device=torch_dev)
-
         # Save
         self.im_size = im_size
         self.use_toeplitz = use_toeplitz
@@ -1310,6 +1492,8 @@ class subspace_linop(linop):
         self.nufft = nufft
         self.bparams = bparams
         self.torch_dev = torch_dev
+        self.spatial_funcs = spatial_funcs
+        self.temporal_funcs = temporal_funcs
 
     def forward(self,
                 alphas: torch.Tensor) -> torch.Tensor:
@@ -1350,7 +1534,7 @@ class subspace_linop(linop):
 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, sub_batch_size):
-                    Sx = einsum(mps_weighted, alphas[a:b], 'nc nsub nseg ..., nsub ... -> nc nsub nseg ...')
+                    Sx = einsum(mps_weighted, alphas[a:b], 'nc nseg ..., nsub ... -> nc nsub nseg ...')
 
                     # NUFFT and phi
                     FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]
@@ -1383,7 +1567,7 @@ class subspace_linop(linop):
         """
 
         # Useful constants
-        imperf_rank = self.imperf_rank
+        imperf_rank = self.spatial_funcs.shape[0]
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
         coil_batch_size = self.bparams.coil_batch_size

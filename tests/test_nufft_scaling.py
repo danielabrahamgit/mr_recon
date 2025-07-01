@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import sigpy as sp
-from mr_recon.fourier import chebyshev_nufft, matrix_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft, triton_nufft
+from mr_recon.fourier import chebyshev_nufft, cufi_nufft, matrix_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft, triton_nufft
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
 from einops import rearrange, einsum
 
@@ -30,7 +30,7 @@ grd = gen_grd(im_size).to(torch_dev)
 crds = (torch.rand((1000, d), dtype=torch.float32, device=torch_dev) - 0.5)
 for i in range(d):
     crds[..., i] *= im_size[i] #* .9
-crds = torch.round(crds * grd_os) / grd_os
+# crds = torch.round(crds * grd_os) / grd_os
 img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
 img = torch.randn_like(img)
 
@@ -39,9 +39,10 @@ grd_nufft = gridded_nufft(im_size, grd_os)
 sp_nufft = sigpy_nufft(im_size)
 tr_nufft = triton_nufft(im_size)
 mx_nufft = matrix_nufft(im_size)
+cf_nufft = cufi_nufft(im_size, 1e-6)
 # sv_nufft = svd_nufft(im_size, n_svd=16, svd_mx_size=(35,)*d)
-nuffts = [grd_nufft, sp_nufft,]
-names = ['gridded_nufft', 'sigpy_nufft']
+nuffts = [cf_nufft, sp_nufft,]
+names = ['cufi_nufft', 'sigpy_nufft']
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.ylim(-.2, 1.2)

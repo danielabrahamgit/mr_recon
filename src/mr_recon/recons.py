@@ -1,3 +1,4 @@
+import gc
 import torch
 import time
 
@@ -128,7 +129,8 @@ def CG_SENSE_recon(A: linop,
         return AHb
 
     # Clear data (we dont need it anymore)
-    y = y.cpu()
+    del y
+    gc.collect()
     with device:
         torch.cuda.empty_cache()
 
@@ -226,7 +228,8 @@ def FISTA_recon(A: linop,
         print(f'AHb took {end-start:.3f}(s)')
 
     # Clear data (we dont need it anymore)
-    y = y.cpu()
+    del y
+    gc.collect()
     with device:
         torch.cuda.empty_cache()
 
