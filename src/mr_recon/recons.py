@@ -4,7 +4,7 @@ import time
 
 from tqdm import tqdm
 from typing import Optional
-from mr_recon.dtypes import complex_dtype
+from mr_recon import dtypes
 from mr_recon.linops import linop
 from mr_recon.utils import np_to_torch, torch_to_np
 from mr_recon.algs import (
@@ -51,7 +51,7 @@ def min_norm_recon(A: linop,
 
     # Estimate largest eigenvalue so that lambda max of AHA is 1
     if max_eigen is None:
-        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
+        x0 = torch.randn(A.ishape, dtype=dtypes.complex_dtype, device=device)
         _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
         max_eigen *= 1.01
 
@@ -60,7 +60,7 @@ def min_norm_recon(A: linop,
 
     # Run CG
     y = conjugate_gradient(AHA=AAH, 
-                           AHb=ksp.type(complex_dtype),
+                           AHb=ksp.type(dtypes.complex_dtype),
                            lamda_l2=lamda_l2,
                            num_iters=max_iter,
                            verbose=verbose)
@@ -114,13 +114,13 @@ def CG_SENSE_recon(A: linop,
 
     # Estimate largest eigenvalue so that lambda max of AHA is 1
     if max_eigen is None:
-        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
+        x0 = torch.randn(A.ishape, dtype=dtypes.complex_dtype, device=device)
         _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
         max_eigen *= 1.01
     
     # Starting with AHb
     start = time.perf_counter()
-    y = ksp.type(complex_dtype)
+    y = ksp.type(dtypes.complex_dtype)
     AHb = A.adjoint(y) / (max_eigen ** 0.5)
     end = time.perf_counter()
     if verbose:
@@ -215,13 +215,13 @@ def FISTA_recon(A: linop,
 
     # Estimate largest eigenvalue so that lambda max of AHA is 1
     if max_eigen is None:
-        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
+        x0 = torch.randn(A.ishape, dtype=dtypes.complex_dtype, device=device)
         _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
         max_eigen *= 1.01
     
     # Starting with AHb
     start = time.perf_counter()
-    y = ksp.type(complex_dtype)
+    y = ksp.type(dtypes.complex_dtype)
     AHb = A.adjoint(y) / (max_eigen ** 0.5)
     end = time.perf_counter()
     if verbose:
@@ -237,6 +237,6 @@ def FISTA_recon(A: linop,
     AHA = lambda x : A.normal(x) / max_eigen
 
     # Run FISTA
-    recon = FISTA(AHA, AHb, proxg, max_iter)
+    recon = FISTA(AHA, AHb, proxg, max_iter, verbose=verbose)
 
     return recon
