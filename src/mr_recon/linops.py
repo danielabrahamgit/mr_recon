@@ -4,9 +4,9 @@ import numpy as np
 import sigpy as sp
 
 from dataclasses import dataclass
-from mr_recon.dtypes import real_dtype, complex_dtype, np_complex_dtype
+from mr_recon import dtypes
 from mr_recon.fourier import fft, ifft
-from mr_recon.utils import batch_iterator, gen_grd, np_to_torch, torch_to_np
+from mr_recon.utils import batch_iterator, np_to_torch, torch_to_np
 from mr_recon.pad import PadLast
 from mr_recon.spatial import resize
 from mr_recon.fourier import (
@@ -473,15 +473,15 @@ class imperf_coil_lowrank(linop):
         if nufft is None:
             nufft = sigpy_nufft(im_size)
         if dcf is None:
-            dcf = torch.ones(trj.shape[:-1], dtype=real_dtype, device=torch_dev)
+            dcf = torch.ones(trj.shape[:-1], dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
         
         # Rescale and change types
-        trj = nufft.rescale_trajectory(trj).type(real_dtype)
-        dcf = dcf.type(real_dtype)
-        spatial_funcs = spatial_funcs.type(complex_dtype)
-        temporal_funcs = temporal_funcs.type(complex_dtype)
+        trj = nufft.rescale_trajectory(trj).type(dtypes.real_dtype)
+        dcf = dcf.type(dtypes.real_dtype)
+        spatial_funcs = spatial_funcs.type(dtypes.complex_dtype)
+        temporal_funcs = temporal_funcs.type(dtypes.complex_dtype)
         
         # Compute toeplitz kernels
         if use_toeplitz:
@@ -536,7 +536,7 @@ class imperf_coil_lowrank(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result array
-        ksp = torch.zeros((C, *self.trj.shape[:-1]), dtype=complex_dtype, device=self.torch_dev)
+        ksp = torch.zeros((C, *self.trj.shape[:-1]), dtype=dtypes.complex_dtype, device=self.torch_dev)
 
         # Batch over segments
         for l1, l2 in batch_iterator(L, seg_batch_size):
@@ -579,7 +579,7 @@ class imperf_coil_lowrank(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result image
-        img = torch.zeros(self.im_size, dtype=complex_dtype, device=self.torch_dev)
+        img = torch.zeros(self.im_size, dtype=dtypes.complex_dtype, device=self.torch_dev)
 
         # Batch over coils
         for c1, c2 in batch_iterator(C, coil_batch_size):
@@ -701,7 +701,7 @@ class multi_chan_linop(linop):
         oshape = (out_size[0], *trj.shape[:-1])
         super().__init__(ishape, oshape)
 
-        mps_dummy = torch.ones((1, *out_size[1:]), dtype=complex_dtype, device=trj.device)
+        mps_dummy = torch.ones((1, *out_size[1:]), dtype=dtypes.complex_dtype, device=trj.device)
         self.A = sense_linop(trj, mps_dummy, dcf, nufft, 
                              spatial_funcs=spatial_funcs,
                              temporal_funcs=temporal_funcs,
@@ -722,7 +722,7 @@ class multi_chan_linop(linop):
         ksp : torch.tensor <complex> | GPU
             the k-space data with shape (nc, *trj_size)
         """
-        ksp = torch.zeros(self.oshape, dtype=complex_dtype, device=img.device)
+        ksp = torch.zeros(self.oshape, dtype=dtypes.complex_dtype, device=img.device)
         for i in range(self.ishape[0]):
             ksp[i] = self.A.forward(img[i])[0]
         return ksp
@@ -742,7 +742,7 @@ class multi_chan_linop(linop):
         img : torch.tensor <complex> | GPU
             the multi channel image with shape (nc, *im_size)
         """
-        img = torch.zeros(self.ishape, dtype=complex_dtype, device=ksp.device)
+        img = torch.zeros(self.ishape, dtype=dtypes.complex_dtype, device=ksp.device)
         for i in range(self.ishape[0]):
             img[i] = self.A.adjoint(ksp[i][None,])
         return img
@@ -762,7 +762,7 @@ class multi_chan_linop(linop):
         img_hat : torch.tensor <complex> | GPU
             the ouput image with shape (*im_size)
         """
-        img_hat = torch.zeros(self.ishape, dtype=complex_dtype, device=img.device)
+        img_hat = torch.zeros(self.ishape, dtype=dtypes.complex_dtype, device=img.device)
         for i in range(self.ishape[0]):
             img_hat[i] = self.A.normal(img[i])
         return img_hat
@@ -811,13 +811,13 @@ class coil_spatiotemporal_linp(linop):
         if nufft is None:
             nufft = sigpy_nufft(im_size)
         if dcf is None:
-            dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+            dcf = torch.ones(trj_size, dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
         
         # Rescale and change types
-        trj = nufft.rescale_trajectory(trj).type(real_dtype)
-        dcf = dcf.type(real_dtype)
+        trj = nufft.rescale_trajectory(trj).type(dtypes.real_dtype)
+        dcf = dcf.type(dtypes.real_dtype)
         
         # Compute toeplitz kernels
         if use_toeplitz:
@@ -857,7 +857,7 @@ class coil_spatiotemporal_linp(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result array
-        ksp = torch.zeros((C, *self.trj_size), dtype=complex_dtype, device=self.torch_dev)
+        ksp = torch.zeros((C, *self.trj_size), dtype=dtypes.complex_dtype, device=self.torch_dev)
 
         # Batch over segments 
         for l1, l2 in batch_iterator(L, seg_batch_size):    
@@ -900,7 +900,7 @@ class coil_spatiotemporal_linp(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result image
-        img = torch.zeros(self.im_size, dtype=complex_dtype, device=self.torch_dev)
+        img = torch.zeros(self.im_size, dtype=dtypes.complex_dtype, device=self.torch_dev)
         
         # Apply DCF
         Wy = (ksp * self.dcf) # C *trj_size
@@ -988,18 +988,18 @@ class sense_linop(linop):
         if nufft is None:
             nufft = sigpy_nufft(im_size)
         if dcf is None:
-            dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+            dcf = torch.ones(trj_size, dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
         if spatial_funcs is None:
-            spatial_funcs = torch.ones((1,)*(len(im_size)+1), dtype=complex_dtype, device=torch_dev)
+            spatial_funcs = torch.ones((1,)*(len(im_size)+1), dtype=dtypes.complex_dtype, device=torch_dev)
         if temporal_funcs is None:
-            temporal_funcs = torch.ones((1,)*(len(trj_size)+1), dtype=complex_dtype, device=torch_dev)
+            temporal_funcs = torch.ones((1,)*(len(trj_size)+1), dtype=dtypes.complex_dtype, device=torch_dev)
         
         # Rescale and change types
-        trj = nufft.rescale_trajectory(trj).type(real_dtype)
-        dcf = dcf.type(real_dtype)
-        mps = mps.type(complex_dtype)
+        trj = nufft.rescale_trajectory(trj).type(dtypes.real_dtype)
+        dcf = dcf.type(dtypes.real_dtype)
+        mps = mps.type(dtypes.complex_dtype)
         
         # Compute toeplitz kernels
         if use_toeplitz:
@@ -1058,7 +1058,7 @@ class sense_linop(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result array
-        ksp = torch.zeros((nc, *self.trj_size), dtype=complex_dtype, device=self.torch_dev)
+        ksp = torch.zeros((nc, *self.trj_size), dtype=dtypes.complex_dtype, device=self.torch_dev)
 
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
@@ -1104,7 +1104,7 @@ class sense_linop(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result image
-        img = torch.zeros(self.im_size, dtype=complex_dtype, device=self.torch_dev)
+        img = torch.zeros(self.im_size, dtype=dtypes.complex_dtype, device=self.torch_dev)
             
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
@@ -1339,7 +1339,7 @@ class subspace_linop_new(linop):
             the k-space data with shape (C, *trj_size)
         """
         K = self.phi.shape[0]
-        ksp = torch.zeros(self.oshape, dtype=complex_dtype, device=alphas.device)
+        ksp = torch.zeros(self.oshape, dtype=dtypes.complex_dtype, device=alphas.device)
         
         # Apply linop to images
         for k in range(K):
@@ -1363,7 +1363,7 @@ class subspace_linop_new(linop):
             the image with shape (*im_size)
         """
         K = self.phi.shape[0]
-        img = torch.zeros(self.ishape, dtype=complex_dtype, device=ksp.device)
+        img = torch.zeros(self.ishape, dtype=dtypes.complex_dtype, device=ksp.device)
         
         # Apply linop to kspace
         for k in range(K):
@@ -1443,19 +1443,15 @@ class subspace_linop(linop):
         if nufft is None:
             nufft = torchkb_nufft(im_size, torch_dev.index)
         if dcf is None:
-            dcf = torch.ones(trj.shape[:-1], dtype=real_dtype, device=torch_dev)
+            dcf = torch.ones(trj.shape[:-1], dtype=dtypes.real_dtype, device=torch_dev)
         else:
             assert dcf.device == torch_dev
-        if spatial_funcs is None:
-            spatial_funcs = torch.ones((1,)*(len(ishape)), dtype=complex_dtype, device=torch_dev)
-        if temporal_funcs is None:
-            temporal_funcs = torch.ones((1,)*(len(oshape)), dtype=complex_dtype, device=torch_dev)
         
         # Rescale and type cast
-        trj = nufft.rescale_trajectory(trj).type(real_dtype)
-        dcf = dcf.type(real_dtype)
-        mps = mps.type(complex_dtype)
-        phi = phi.type(complex_dtype)
+        trj = nufft.rescale_trajectory(trj).type(dtypes.real_dtype)
+        dcf = dcf.type(dtypes.real_dtype)
+        mps = mps.type(dtypes.complex_dtype)
+        phi = phi.type(dtypes.complex_dtype)
         
         # Compute toeplitz kernels
         if use_toeplitz:
@@ -1465,7 +1461,7 @@ class subspace_linop(linop):
             weights = rearrange(phis, 'nsub1 nsub2 ntr -> (nsub1 nsub2) 1 1 ntr')
             weights = weights * dcf
 
-            if np.prod(spatial_funcs.shape) > 1:
+            if spatial_funcs is not None:
                 raise NotImplementedError
 
             # Compute kernels
@@ -1473,7 +1469,7 @@ class subspace_linop(linop):
             for a, b in batch_iterator(weights.shape[0], batching_params.toeplitz_batch_size):
                 kerns = nufft.calc_teoplitz_kernels(trj[None,], weights[None, a:b])[0]
                 if toep_kerns is None:
-                    toep_kerns = torch.zeros((weights.shape[0], *kerns.shape[1:]), dtype=complex_dtype, device=torch_dev)
+                    toep_kerns = torch.zeros((weights.shape[0], *kerns.shape[1:]), dtype=dtypes.complex_dtype, device=torch_dev)
                 toep_kerns[a:b] = kerns
 
             # Reshape 
@@ -1482,6 +1478,16 @@ class subspace_linop(linop):
         else:
             self.toep_kerns = None
         
+        if spatial_funcs is not None:
+            assert temporal_funcs is not None
+            assert spatial_funcs.shape[1:] == im_size
+            assert temporal_funcs.shape[1:] == trj.shape[:-1]
+            self.spatial_funcs = spatial_funcs
+            self.temporal_funcs = temporal_funcs
+        else:
+            spatial_funcs = torch.ones((1,)*(len(im_size)+1), dtype=dtypes.complex_dtype, device=torch_dev)
+            spatial_funcs = torch.ones((1,)*(len(dcf)+1), dtype=dtypes.complex_dtype, device=torch_dev)
+
         # Save
         self.im_size = im_size
         self.use_toeplitz = use_toeplitz
@@ -1492,8 +1498,6 @@ class subspace_linop(linop):
         self.nufft = nufft
         self.bparams = bparams
         self.torch_dev = torch_dev
-        self.spatial_funcs = spatial_funcs
-        self.temporal_funcs = temporal_funcs
 
     def forward(self,
                 alphas: torch.Tensor) -> torch.Tensor:
@@ -1520,7 +1524,7 @@ class subspace_linop(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result array
-        ksp = torch.zeros((nc, *self.trj.shape[:-1]), dtype=complex_dtype, device=self.torch_dev)
+        ksp = torch.zeros((nc, *self.trj.shape[:-1]), dtype=dtypes.complex_dtype, device=self.torch_dev)
 
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):
@@ -1534,7 +1538,7 @@ class subspace_linop(linop):
 
                 # Batch over subspace
                 for a, b in batch_iterator(nsub, sub_batch_size):
-                    Sx = einsum(mps_weighted, alphas[a:b], 'nc nseg ..., nsub ... -> nc nsub nseg ...')
+                    Sx = einsum(mps_weighted, alphas[a:b], 'nc nsub nseg ..., nsub ... -> nc nsub nseg ...')
 
                     # NUFFT and phi
                     FSx = self.nufft.forward(Sx[None,], self.trj[None, ...])[0]
@@ -1567,7 +1571,7 @@ class subspace_linop(linop):
         """
 
         # Useful constants
-        imperf_rank = self.spatial_funcs.shape[0]
+        imperf_rank = self.imperf_rank
         nsub = self.phi.shape[0]
         nc = self.mps.shape[0]
         coil_batch_size = self.bparams.coil_batch_size
@@ -1575,7 +1579,7 @@ class subspace_linop(linop):
         seg_batch_size = self.bparams.field_batch_size
 
         # Result subspace coefficients
-        alphas = torch.zeros((nsub, *self.im_size), dtype=complex_dtype, device=self.torch_dev)
+        alphas = torch.zeros((nsub, *self.im_size), dtype=dtypes.complex_dtype, device=self.torch_dev)
         
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):

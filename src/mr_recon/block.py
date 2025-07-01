@@ -3,7 +3,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mr_recon.dtypes import complex_dtype
+from mr_recon import dtypes
 from einops import rearrange
 from typing import Tuple, Optional
 
@@ -16,7 +16,7 @@ class Block(nn.Module):
         """
         """
         super().__init__()
-        self.input_type = input_type if input_type is not None else complex_dtype
+        self.input_type = input_type if input_type is not None else dtypes.complex_dtype
         self.dim = len(block_size)
         self.block_size = block_size
         self.stride = block_stride

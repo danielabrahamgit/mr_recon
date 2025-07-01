@@ -4,7 +4,7 @@ import numpy as np
 from typing import Optional
 from einops import rearrange, einsum
 from tqdm import tqdm
-from mr_recon.dtypes import real_dtype, complex_dtype
+from mr_recon import dtypes
 from mr_recon.utils import quantize_data
 from mr_recon.linops import type3_nufft, type3_nufft_naive
 from mr_recon.algs import svd_operator
@@ -88,7 +88,7 @@ def b0_to_phis_alphas(b0_map: torch.Tensor,
     phis = b0_map / scale
     
     # Make alphas
-    ts = torch.arange(trj_size[ro_dim], device=b0_map.device, dtype=real_dtype) * dt * scale
+    ts = torch.arange(trj_size[ro_dim], device=b0_map.device, dtype=dtypes.real_dtype) * dt * scale
     tup = (slice(None),) + (None,) * (len(trj_size) - 1)
     alphas = ts[tup].moveaxis(0, ro_dim)
     
@@ -132,7 +132,7 @@ def coco_to_phis_alphas(trj: torch.Tensor,
     assert d == spatial_crds.shape[-1]
 
     # Get gradient from trj
-    trj = trj.type(real_dtype)
+    trj = trj.type(dtypes.real_dtype)
     g = torch.diff(trj, dim=0) / (dt * gamma_bar)
     g = torch.cat((g, g[-1:]), dim=0)
     
@@ -327,7 +327,7 @@ def alpha_segementation(phis: torch.Tensor,
         # alpha_cents, inds = quantize_data(alphas.moveaxis(0, -1), L, method='cluster')
 
     # Compute spatial basis functions
-    spatial_funcs = torch.zeros(L, *im_size, device=torch_dev, dtype=complex_dtype)
+    spatial_funcs = torch.zeros(L, *im_size, device=torch_dev, dtype=dtypes.complex_dtype)
     for i in range(L):
         spatial_funcs[i, ...] = torch.exp(-2j * torch.pi * (phis.moveaxis(0, -1) @ alpha_cents[i]))
     
@@ -336,7 +336,7 @@ def alpha_segementation(phis: torch.Tensor,
         spatial_funcs = manual_spatial_funcs
 
     # Compute temporal basis functions
-    temporal_funcs = torch.zeros(L, *trj_size, device=torch_dev, dtype=complex_dtype)
+    temporal_funcs = torch.zeros(L, *trj_size, device=torch_dev, dtype=dtypes.complex_dtype)
     if 'zero' in interp_type:
         for i in range(L):
             temporal_funcs[i, ...] = ((inds == i) * 1.0)
@@ -351,13 +351,13 @@ def alpha_segementation(phis: torch.Tensor,
         
         # First compute AHA, which is all the pairwise 
         # dot products of the spatial features
-        AHA = torch.zeros((L, L), device=torch_dev, dtype=complex_dtype)
+        AHA = torch.zeros((L, L), device=torch_dev, dtype=dtypes.complex_dtype)
         for i in range(L):
             for j in range(L):
                 AHA[i, j] = (spatial_funcs[i].conj() * spatial_funcs[j]).mean()
                 
         # Next compute AHy, which is essentially int_r W(r, t) * b_l(r).conj() dr
-        AHy = torch.zeros((L, *trj_size), device=torch_dev, dtype=complex_dtype)
+        AHy = torch.zeros((L, *trj_size), device=torch_dev, dtype=dtypes.complex_dtype)
         for l1 in tqdm(range(0, L, L_batch_size), 'Least Squares Forward Pass', disable=not verbose):
             l2 = min(l1 + L_batch_size, L)
             AHy[l1:l2, ...] = t3n.forward(spatial_funcs[l1:l2].conj()) / np.prod(im_size)
@@ -426,7 +426,7 @@ def alpha_phi_svd(phis: torch.Tensor,
         
     # Default mask
     if mask is None:
-        mask = torch.ones(im_size, device=torch_dev, dtype=complex_dtype)
+        mask = torch.ones(im_size, device=torch_dev, dtype=dtypes.complex_dtype)
     
     # Batched implimentations of forward and normal operators
     def forward(x):
@@ -445,7 +445,7 @@ def alpha_phi_svd(phis: torch.Tensor,
         return torch.cat(ys, dim=0)
     
     # SVD 
-    inp_example = torch.randn(im_size, device=torch_dev, dtype=complex_dtype)
+    inp_example = torch.randn(im_size, device=torch_dev, dtype=dtypes.complex_dtype)
     U, S, Vh = svd_operator(forward, normal, inp_example, rank=L, num_iter=num_iter, lobpcg=True, verbose=verbose)
     
     # Reshape U and Vh to be spatial and temporal basis functions
@@ -541,7 +541,7 @@ def alpha_phi_svd_with_grappa(phis: torch.Tensor,
         return adjoint(forward(x))
     
     # SVD 
-    inp_example = torch.randn(im_size, device=torch_dev, dtype=complex_dtype)
+    inp_example = torch.randn(im_size, device=torch_dev, dtype=dtypes.complex_dtype)
     U, S, Vh = svd_operator(forward, normal, inp_example, rank=L, num_iter=num_iter, lobpcg=True)
     
     # Reshape U and Vh to be spatial and temporal basis functions

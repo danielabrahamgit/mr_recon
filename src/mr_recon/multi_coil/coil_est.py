@@ -5,7 +5,7 @@ import sigpy as sp
 from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
-from mr_recon.dtypes import complex_dtype
+from mr_recon import dtypes
 from mr_recon.algs import power_method_matrix, lobpcg_operator
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
@@ -18,6 +18,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
                      crp: Optional[float] = None,
                      sets_of_maps: Optional[int] = 1,
                      max_iter: Optional[int] = 100,
+                     coil_batch_size: Optional[int] = None,
                      lobpcg_iter: Optional[int] = None,
                      cpu_last_part: Optional[bool] = False,
                      verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -41,6 +42,8 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         number of sets of maps to compute
     max_iter : int
         number of iterations to run power method
+    coil_batch_size : int
+        Batches computation of covariance matrix over second coil dimension
     lobpcg_iter : int
         number of iterations to run lobpcg
         if given, uses lobpcg instead of svd for first part
@@ -59,6 +62,9 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     img_ndim = len(im_size)
     num_coils = ksp_cal.shape[0]
     device = ksp_cal.device
+
+    if coil_batch_size is None:
+        coil_batch_size = num_coils
 
     # TODO torch this part
     # Get calibration matrix.
@@ -104,16 +110,13 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     AHA = torch.zeros(im_size + (num_coils, num_coils), 
                         dtype=ksp_cal.dtype, device=device)
     kernels = kernels.to(device)
-    for kernel in tqdm(kernels, 'Computing covariance matrix', disable=not verbose):
+    for kernel in tqdm(kernels, 'Computing ESPIRIT covariance matrix', disable=not verbose, leave=False):
         aH = ifft(kernel, oshape=(num_coils, *im_size),
                                 dim=tuple(range(-img_ndim, 0)))
         aH = rearrange(aH, 'nc ... -> ... nc 1')
-        # a = aH.swapaxes(-1, -2).conj()
-        # AHA += aH @ a
-        bs = 2
-        for c1 in range(0, num_coils, bs):
-            c2 = min(num_coils, c1 + bs)
-            AHA[..., c1:c2, :] += aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj()
+        for ci in range(0, num_coils, coil_batch_size):
+            cf = min(num_coils, ci + coil_batch_size)
+            AHA[..., ci:cf, :] += aH[..., ci:cf, :] @ aH.swapaxes(-1, -2).conj()
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
     # Get eigenvalues and eigenvectors
@@ -219,7 +222,7 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
         kerns_batch = train_kernels(img_cal, src_vecs[n1:n2], 
                                     fast_method=False, 
                                     solver='solve',
-                                    lamda_tikonov=lamda_tikonov).type(complex_dtype)
+                                    lamda_tikonov=lamda_tikonov).type(dtypes.complex_dtype)
         if kerns is None:
             kerns = kerns_batch
         else:
