@@ -3,7 +3,7 @@ import sigpy as sp
 
 from mr_recon.fourier import fft, ifft, sigpy_nufft
 from mr_recon.algs import lin_solve
-from mr_recon.dtypes import real_dtype
+from mr_recon import dtypes
 from mr_recon.utils import gen_grd, np_to_torch, torch_to_np, rotation_matrix
 
 from typing import Optional, Tuple
@@ -36,7 +36,7 @@ def gen_source_vectors_rot_square(num_kerns: int,
     d = len(kern_size)
     if dks is None:
         dks = (1,) * d
-    src_vecs_base = gen_grd(kern_size, kern_size).type(real_dtype).reshape((-1, d))
+    src_vecs_base = gen_grd(kern_size, kern_size).type(dtypes.real_dtype).reshape((-1, d))
     for i in range(d):
         src_vecs_base[:, i] *= dks[i]
     src_vecs_base -= src_vecs_base.mean(dim=0)

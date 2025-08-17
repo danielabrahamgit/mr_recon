@@ -2,7 +2,7 @@ import torch
 import cupy as cp
 import numpy as np
 
-from mr_recon.dtypes import real_dtype
+from mr_recon import dtypes
 from typing import Optional
 from fast_pytorch_kmeans import KMeans
 from scipy.signal import get_window
@@ -67,7 +67,8 @@ def resize(input, oshape, ishift=None, oshift=None):
 
 def quantize_data(data: torch.Tensor,  
                   K: int,
-                  method: Optional['str'] = 'uniform') -> torch.Tensor:
+                  method: Optional['str'] = 'uniform',
+                  verbose: Optional[bool] = False) -> torch.Tensor:
     """
     Given data of shape (..., d), finds K 'clusters' with shape (K, d)
 
@@ -99,7 +100,6 @@ def quantize_data(data: torch.Tensor,
     if method == 'cluster':
         max_iter = 1000
         mode = 'euclidean'
-        verbose = 0
         # mode = 'cosine'
         if (torch_dev.index == -1) or (torch_dev.index is None):
             kmeans = KMeans(n_clusters=K,
@@ -179,7 +179,7 @@ def gen_grd(im_size: tuple,
     grd = torch.cat(
         [g[..., None] for g in grds], dim=-1)
         
-    return grd.type(real_dtype)
+    return grd.type(dtypes.real_dtype)
 
 def three_rotation_matrix(thetas: torch.Tensor) -> torch.Tensor:
     """
@@ -234,7 +234,7 @@ def rotation_matrix(axis: torch.Tensor,
     b = -axis[..., 0] * torch.sin(theta / 2.0)
     c = -axis[..., 1] * torch.sin(theta / 2.0)
     d = -axis[..., 2] * torch.sin(theta / 2.0)
-    R = torch.zeros((*theta.shape, 3, 3), device=dev, dtype=real_dtype)
+    R = torch.zeros((*theta.shape, 3, 3), device=dev, dtype=dtypes.real_dtype)
     R[..., 0, 0] = a * a + b * b - c * c - d * d
     R[..., 0, 1] = 2 * (b * c - a * d)
     R[..., 0, 2] = 2 * (b * d + a * c)
