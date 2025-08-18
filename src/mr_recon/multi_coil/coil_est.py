@@ -6,7 +6,7 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.dtypes import complex_dtype
-from mr_recon.algs import power_method_matrix, lobpcg_operator
+from mr_recon.algs import eigen_decomp_operator, power_method_matrix, lobpcg_operator
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
 from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
@@ -110,7 +110,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         aH = rearrange(aH, 'nc ... -> ... nc 1')
         # a = aH.swapaxes(-1, -2).conj()
         # AHA += aH @ a
-        bs = 2
+        bs = 1
         for c1 in range(0, num_coils, bs):
             c2 = min(num_coils, c1 + bs)
             AHA[..., c1:c2, :] += aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj()
@@ -122,12 +122,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     for i in range(sets_of_maps):
         
         # power iterations
-        mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter, verbose=verbose)
-        
-        # Phase relative to first map and crop
-        mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-12))
-        if crp:
-            mps *= eigen_vals > crp
+        mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter*3, verbose=verbose)
         
         # Update AHA
         if sets_of_maps > 1:
@@ -139,8 +134,13 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         mps = mps_all[0]
         eigen_vals = evals_all[0]
     else:
-        mps = torch.stack(mps_all, dim=0)
-        eigen_vals = torch.stack(evals_all, dim=0)
+        mps = torch.stack(mps_all, dim=1) # C S *im_size
+        eigen_vals = torch.stack(evals_all, dim=0) # S *im_size
+    
+    # Phase relative to first map and crop
+    mps *= torch.conj(mps[0] / (torch.abs(mps[0]) + 1e-12))
+    if crp:
+        mps *= eigen_vals > crp
 
     return mps, eigen_vals
 

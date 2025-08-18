@@ -7,6 +7,24 @@ from typing import Optional
 from fast_pytorch_kmeans import KMeans
 from scipy.signal import get_window
 
+def cvplot(*args, **kwargs):
+    from pyeyes import ComparativeViewer
+    for i, arg in enumerate(args):
+        kwargs['arg_' + str(i)] = arg
+
+    shp = kwargs[list(kwargs.keys())[0]].shape
+    for key in kwargs.keys():
+        value = kwargs[key]
+        assert value.shape == shp
+        kwargs[key] = value.nan_to_num()
+    
+    dims = [f'x{i}' for i in range(len(shp))]
+    last_2_dims = [dims[-2], dims[-1]]
+    cv = ComparativeViewer(kwargs,
+                           dims,
+                           last_2_dims)
+    cv.launch()
+
 def _expand_shapes(*shapes):
     """
     Given iterable of shapes, returns shapes with appropriate empty 

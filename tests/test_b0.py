@@ -1,13 +1,11 @@
-from einops import rearrange
 import torch
 import numpy as np
-import sigpy.plot as pl
 
 import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
-from mr_recon.imperfections.main_field import main_field_imperfection
+from mr_recon.imperfections.field import b0_to_phis_alphas, alpha_segementation
 from mr_recon.prox import L1Wav, LocallyLowRank, LLRHparams
 from mr_recon.algs import density_compensation
 from mr_recon.recons import CG_SENSE_recon, FISTA_recon
@@ -54,23 +52,17 @@ dcf = density_compensation(trj, im_size)
 print(f'Readout Time = {trj.shape[0]* dt * 1e3} ms')
 
 # B0 model
-imperf_model = main_field_imperfection(b0, trj.shape[:-1], 0, 2e-6,
-                                       L=100,
-                                       method='ts',
-                                       interp_type='lstsq',)
-A_sim = sense_linop(im_size, trj, mps, dcf, imperf_model=imperf_model)
+phis, alphas = b0_to_phis_alphas(b0, dcf.shape, 0, dt)
+b, h = alpha_segementation(phis, alphas, L=50, interp_type='lstsq', use_type3=False)
+A_sim = sense_linop(trj, mps, dcf, spatial_funcs=b, temporal_funcs=h)
 ksp = A_sim(img)
 
 # Linop
-imperf_model = main_field_imperfection(b0, trj.shape[:-1], 0, 2e-6,
-                                       L=20,
-                                       method='svd',
-                                       interp_type='zero',)
-# nufft = sigpy_nufft(im_size, width=4)
-nufft = svd_nufft(im_size)
+b, h = alpha_segementation(phis, alphas, L=20, interp_type='lstsq', use_type3=False)
+nufft = sigpy_nufft(im_size)
 bparams = batching_params(coil_batch_size=mps.shape[0])
-A = sense_linop(im_size, trj, mps, dcf, nufft, bparams=bparams, imperf_model=imperf_model)
-A_nufft = sense_linop(im_size, trj, mps, dcf, nufft, bparams=bparams)
+A = sense_linop(trj, mps, dcf, nufft, bparams=bparams, spatial_funcs=b, temporal_funcs=h, use_toeplitz=True)
+A_nufft = sense_linop(trj, mps, dcf, nufft, bparams=bparams)
 
 # Recons
 img_artifact = CG_SENSE_recon(A_nufft, ksp, max_iter=15,

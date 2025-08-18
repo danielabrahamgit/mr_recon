@@ -1,7 +1,7 @@
 import torch
 import sigpy as sp
 
-from mr_recon.fourier import fft, ifft, sigpy_nufft
+from mr_recon.fourier import fft, ifft, sigpy_nufft, NUFFT
 from mr_recon.algs import lin_solve
 from mr_recon.dtypes import real_dtype
 from mr_recon.utils import gen_grd, np_to_torch, torch_to_np, rotation_matrix
@@ -9,6 +9,7 @@ from mr_recon.utils import gen_grd, np_to_torch, torch_to_np, rotation_matrix
 from typing import Optional, Tuple
 from einops import rearrange, einsum
 from sigpy.fourier import _get_oversamp_shape, _apodize, _scale_coord
+from tqdm import tqdm
 
 def gen_source_vectors_rot_square(num_kerns: int,
                                   kern_size: tuple,
@@ -360,7 +361,6 @@ def grappa_src_trg(img_cal: torch.Tensor,
     
     return Asrc, Btrg
     
-
 def grappa_AHA_AHb(img_cal: torch.Tensor, 
                    source_vectors: torch.Tensor,
                    width: Optional[int] = 6,
@@ -529,6 +529,81 @@ def grappa_AHA_AHb_fast(img_cal: torch.Tensor,
                         'nco nci N ninpo ninpi -> N (nco ninpo) (nci ninpi)').conj()
 
         return AHA, AHb
+
+def train_derated(img_cal: torch.Tensor,
+                  src_vecs: torch.Tensor,
+                  src_nufft: sigpy_nufft,
+                  trg_nufft: sigpy_nufft,
+                  lamda_tikonov: Optional[float] = 1e-3,
+                  solver: Optional[str] = 'solve',
+                  batch_size: Optional[int] = 100) -> torch.Tensor:
+    """
+    Trains grappa kernels given calib image and source vectors
+
+    Parameters:
+    -----------
+    img_cal : torch.Tensor
+        calibration image with shape (C, *im_size)
+    src_vecs : torch.Tensor
+        vectors describing position of source relative to target with shape (N, S, d)
+    src_nufft : NUFFT
+        NUFFT object for source points
+    trg_nufft : NUFFT
+        NUFFT object for target points
+    lamda_tikonov : float
+        tikonov regularization parameter
+    solver : str
+        linear system solver from ['lstsq_torch', 'lstsq', 'pinv', 'inv']
+    
+    Returns:
+    --------
+    grappa_kernels : torch.Tensor
+        GRAPPA kernels with shape (N, C, C, S)
+        maps num_input source points with ncoil channels to ncoil output target points
+    """
+    # Consts
+    C = img_cal.shape[0]
+    im_size = img_cal.shape[1:]
+    d = len(im_size)
+    N = src_vecs.shape[0]
+    S = src_vecs.shape[1]
+    
+    # Placeholder for kernels
+    grappa_kernels = torch.zeros((N, C, C, S), dtype=torch.complex64, device=img_cal.device)
+    
+    # First part of NUFFT
+    ksp_os_src = src_nufft.forward_FT_only(img_cal[None])
+    ksp_os_trg = trg_nufft.forward_FT_only(img_cal[None])
+    
+    # Target points on grid
+    smax = src_vecs.abs().reshape((-1, d)).max(dim=0).values * 2
+    size_new = [2 * (round(im_size[i] - smax[i]) // 2) for i in range(d)]
+    trj_trg = gen_grd(size_new, size_new).to(img_cal.device)
+    trj_trg = trj_trg.reshape((-1, d))
+    
+    # Loop over source vectors
+    for n1 in tqdm(range(0, N, batch_size), 'Training GRAPPA Kernels'):
+        n2 = min(n1 + batch_size, N)
+        
+        # Batch of target samples
+        trj_trg_batch = trj_trg[:, None,] + src_vecs[None, n1:n2, S//2, :]
+        trg_batch = trg_nufft.forward_interp_only(ksp_os_trg, trj_trg_batch[None,])[0] # C T N
+        trg_batch = rearrange(trg_batch, 'C T N -> N T C')
+        
+        # Batch of source samples
+        src_vecs_batch = trj_trg[:, None, None] + src_vecs[None, n1:n2] 
+        src_batch = src_nufft.forward_interp_only(ksp_os_src, src_vecs_batch[None,])[0] # C T N S
+        src_batch = rearrange(src_batch, 'C T N S -> N T (S C)')
+        
+        # Perform GRAPPA solve
+        AHA = src_batch.mH @ src_batch # N SCo SCi
+        AHb = src_batch.mH @ trg_batch # N SCo C
+        G = lin_solve(AHA, AHb, lamda=lamda_tikonov, solver=solver) # N SCi C
+        grappa_kernels[n1:n2] = rearrange(G, 
+                                          'N (Si Ci) C -> N C Ci Si',
+                                          Si=S, Ci=C)
+    
+    return grappa_kernels
 
 def train_kernels(img_cal: torch.Tensor,
                   source_vectors: torch.Tensor,

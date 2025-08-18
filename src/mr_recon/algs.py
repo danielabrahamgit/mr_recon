@@ -658,6 +658,8 @@ def FISTA(AHA: nn.Module,
           num_iters: Optional[int] = 20,
           ptol_exit: Optional[float] = 0.5,
           return_ptols: Optional[bool] = False,
+          return_xs: Optional[bool] = False,
+          x0: Optional[torch.Tensor] = None,
           verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Solves ||Ax - b||_2^2 + lamda ||Gx||_1, where G is a linear function.
@@ -687,13 +689,18 @@ def FISTA(AHA: nn.Module,
     """
 
     # Start at AHb
-    x = AHb.clone()
+    if x0 is None:
+        x = AHb.clone()
+    else:
+        x = x0
     z = x.clone()
     
     if num_iters <= 0:
         return x
     
     ptols = []
+    if return_xs:
+        xs = []
     for k in tqdm(range(0, num_iters), 'FISTA Iterations', disable=not verbose):
 
         x_old = x.clone()
@@ -712,9 +719,13 @@ def FISTA(AHA: nn.Module,
             if verbose:
                 print(f'Tolerance reached after {k+1} iterations, exiting FISTA')
             break
+        if return_xs:
+            xs.append(x.clone())
     
     if return_ptols:
         return ptols, x
+    if return_xs:
+        return xs, x
     return x
 
 def gradient_descent(AHA: nn.Module,

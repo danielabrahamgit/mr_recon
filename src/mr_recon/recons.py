@@ -81,6 +81,7 @@ def CG_SENSE_recon(A: linop,
                    max_eigen: Optional[float] = None,
                    tolerance: Optional[float] = 1e-8,
                    weights: Optional[torch.Tensor] = None,
+                   ahb_init: Optional[torch.Tensor] = None,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run CG SENSE recon:
@@ -100,6 +101,8 @@ def CG_SENSE_recon(A: linop,
         maximum eigenvalue of AHA
     tolerance : float
         tolerance for CG algorithm
+    ahb_init : torch.Tensor
+        initial value for AHb, if None, it will be computed
     verbose : bool 
         Toggles print statements
 
@@ -119,17 +122,20 @@ def CG_SENSE_recon(A: linop,
         max_eigen *= 1.01
     
     # Starting with AHb
-    start = time.perf_counter()
-    y = ksp.type(complex_dtype)
-    AHb = A.adjoint(y) / (max_eigen ** 0.5)
-    end = time.perf_counter()
-    if verbose:
-        print(f'AHb took {end-start:.3f}(s)')
+    if ahb_init is None:
+        start = time.perf_counter()
+        y = ksp.type(complex_dtype)
+        AHb = A.adjoint(y) / (max_eigen ** 0.5)
+        end = time.perf_counter()
+        del y
+        if verbose:
+            print(f'AHb took {end-start:.3f}(s)')
+    else:
+        AHb = ahb_init.type(complex_dtype) / (max_eigen ** 0.5)
     if max_iter == 0:
         return AHb
 
-    # Clear data (we dont need it anymore)
-    del y
+    # Clear y-data (we dont need it anymore)
     gc.collect()
     with device:
         torch.cuda.empty_cache()

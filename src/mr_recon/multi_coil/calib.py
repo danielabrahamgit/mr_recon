@@ -30,6 +30,7 @@ def whiten_data(noise_mat: torch.Tensor,
     """
     C = noise_mat.shape[0]
     noise_mat = noise_mat.reshape((C, -1))
+    noise_mat -= noise_mat.mean(dim=-1, keepdim=True)
     cov_mat = (noise_mat @ noise_mat.H)
     cov_mat /= noise_mat.abs().max()
     vals, vecs = torch.linalg.eigh(cov_mat)
@@ -64,7 +65,7 @@ def calc_coil_subspace(ksp_mat: torch.Tensor,
         n_coil = torch.argwhere(cmsm > new_coil_size * cmsm[-1]).squeeze()[0]
     elif type(new_coil_size) is int:
         n_coil = new_coil_size
-    coil_subspace = u[:, :n_coil] #/ s[:n_coil]
+    coil_subspace = u[:, :n_coil]
     coil_subspace.imag *= -1 # conj without .conj() for weird numpy conversion reasons
 
     comps = []

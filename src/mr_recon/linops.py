@@ -1003,20 +1003,18 @@ class sense_linop(linop):
         
         # Compute toeplitz kernels
         if use_toeplitz:
+            if len(im_size) == 3:
+                print('3D Toeplitz will by default use an inner batch size of 1 to save memory.')
             if (spatial_funcs is None) or (temporal_funcs is None):
                 self.toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], dcf[None,])[0]
             else:
                 weights = einsum(temporal_funcs.conj(), temporal_funcs, 'L1 ... , L2 ... -> L1 L2 ...')
                 weights = rearrange(weights, 'n1 n2 ... -> (n1 n2) ... ') * dcf[None, ...]
-                self.toep_kerns = None
+                toep_kerns = []
                 for b1 in range(0, weights.shape[0], bparams.toeplitz_batch_size):
                     b2 = min(b1 + bparams.toeplitz_batch_size, weights.shape[0])
-                    toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], weights[b1:b2])
-                    if self.toep_kerns is None:
-                        self.toep_kerns = toep_kerns
-                    else:
-                        self.toep_kerns = torch.cat((self.toep_kerns, toep_kerns), dim=0)
-                self.toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], weights) 
+                    toep_kerns.append(nufft.calc_teoplitz_kernels(trj[None,], weights[b1:b2])[0])
+                self.toep_kerns = torch.stack(toep_kerns, dim=0)
                 L = temporal_funcs.shape[0]
                 self.toep_kerns = rearrange(self.toep_kerns, '(n1 n2) ... -> n1 n2 ...', n1=L, n2=L)
         else:
@@ -1158,6 +1156,12 @@ class sense_linop(linop):
             dim = len(self.im_size)
             coil_batch_size = self.bparams.coil_batch_size
             seg_batch_size = self.bparams.field_batch_size
+            
+            # Innter segment batching (smaller for 3D to save memory)
+            if dim == 3:
+                inner_seg_batch_size = 1
+            else:
+                inner_seg_batch_size = imperf_rank
 
             # Padding operator
             im_size_os = self.toep_kerns.shape[-dim:]
@@ -1177,28 +1181,31 @@ class sense_linop(linop):
                 for l1, l2 in batch_iterator(imperf_rank, seg_batch_size):
 
                     # Apply spatial funcs
-                    SBx = Sx[:, None, ...] * self.spatial_funcs[l1:l2]
+                    SBx = Sx[:, None, ...] * self.spatial_funcs[l1:l2] # C L *im_size
 
                     # Apply zero-padded FFT
-                    RSBx = padder.forward(SBx)
-                    FSBx = fft(RSBx, dim=tuple(range(-dim, 0))) # nc nseg *im_size_os
-
-                    # Apply Toeplitz kernels
-                    MFSBx = einsum(self.toep_kerns[:, l1:l2, ...],  FSBx,
-                                   'L L2 ..., C L2 ... -> C L ...')
+                    RSBx = padder.forward(SBx)  # C L *im_size_os
+                    FSBx = fft(RSBx, dim=tuple(range(-dim, 0))) # C L *im_size_os
                     
-                    # Apply iFFT and mask
-                    FMFBSx = ifft(MFSBx, dim=tuple(range(-dim, 0))) 
-                    FMFBSx = padder.adjoint(FMFBSx)
+                    # More batching for 3D case
+                    for m1, m2 in batch_iterator(imperf_rank, inner_seg_batch_size):
 
-                    # Adjoint spatial funcs
-                    BFMFBSx = (FMFBSx * self.spatial_funcs[l1:l2].conj()).sum(dim=-len(self.im_size)-1)
+                        # Apply Toeplitz kernels
+                        MFSBx = einsum(self.toep_kerns[m1:m2, l1:l2, ...],  FSBx,
+                                       'M L ..., C L ... -> C M ...')
+                        
+                        # Apply iFFT and mask
+                        FMFBSx = ifft(MFSBx, dim=tuple(range(-dim, 0))) 
+                        FMFBSx = padder.adjoint(FMFBSx)
 
-                    # Apply adjoint mps
-                    RFMFBSx = (BFMFBSx * mps.conj()).sum(dim=0)
-                    
-                    # Update output
-                    img_hat += RFMFBSx
+                        # Adjoint spatial funcs
+                        BFMFBSx = (FMFBSx * self.spatial_funcs[m1:m2].conj()).sum(dim=-len(self.im_size)-1)
+
+                        # Apply adjoint mps
+                        SFMFBSx = (BFMFBSx * mps.conj()).sum(dim=0)
+                        
+                        # Update output
+                        img_hat += SFMFBSx
         
         return img_hat
 
@@ -1388,7 +1395,6 @@ class subspace_linop_new(linop):
         """
         return self.adjoint(self.forward(img))
         
-
 class subspace_linop(linop):
     """
     Linop for subspace models

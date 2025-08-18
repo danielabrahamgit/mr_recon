@@ -7,14 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sigpy as sp
+import ptwt
 
 from mr_recon.block import Block
 from mr_recon.dtypes import complex_dtype, np_complex_dtype
-
-
-__all__ = [
-    'LLRHparams', 'LocallyLowRank',
-]
 
 """
 A proximal gradient is defined as 
@@ -50,6 +46,136 @@ def soft_thresh(x: torch.Tensor,
     return torch.exp(1j * torch.angle(x)) * torch.max(torch.abs(x) - rho, torch.zeros(x.shape, device=x.device))
 
 class L1Wav(nn.Module):
+    """Wavelet proximal operator"""
+
+    def __init__(self, 
+                 im_size: tuple, 
+                 lamda: float, 
+                 axes: Optional[tuple] = None,
+                 rnd_shift: Optional[int] = 3,
+                 level: Optional[int] = None,
+                 rnd_phase: Optional[bool] = True,
+                 wave_name: Optional[str] = 'db4'):
+        """
+        Parameters:
+        -----------
+        shape - tuple
+            the image/volume dimensions
+        lamda - float
+            Regularization strength
+        level - int
+            the level of wavelet decomposition
+        axes - tuple
+            axes to compute wavelet transform over
+        rnd_shift - int
+            randomly shifts image by rnd_shift in each dim before applying prox
+        wave_name - str
+            the type of wavelet to use from:
+            ['haar', 'db', 'sym', 'coif', 'bior', 'rbio', 'dmey', 'gaus',
+            'mexh', 'morl', 'cgau', 'shan', 'fbsp', 'cmor', ...]
+            see https://pywavelets.readthedocs.io/en/latest/ref/wavelets.html#wavelet-families
+        """
+        super().__init__()
+
+        # Default over last len(im_size) axes
+        if axes is None:
+            axes = tuple([d for d in range(-len(im_size), 0)])
+        self.im_size = im_size
+        self.lamda = lamda
+        self.axes = axes
+        self.rnd_shift = rnd_shift
+        self.rnd_phase = rnd_phase
+        w = ptwt.fswavedec2 if len(im_size) == 2 else ptwt.wavedec3
+        wh = ptwt.fswaverec2 if len(im_size) == 2 else ptwt.waverec3
+        def dec(x):
+            # Stack real and imaginary parts
+            x_stack = torch.cat((x.real, x.imag), dim=0)
+            return w(x_stack, wave_name, axes=axes, level=level)
+        def rec(x):
+            # Inverse stack real and imaginary parts
+            stacked = wh(x, wave_name, axes=axes)
+            re_im = stacked[:len(stacked)//2] + 1j * stacked[len(stacked)//2:]
+            return re_im.type(complex_dtype)
+        self.dec = dec
+        self.rec = rec
+        
+    @staticmethod
+    def soft_threshold_coeffs_re_im(coeffs, tau):
+        # Real is fist half, imaginary is second half
+        # helper for a single tensor
+        def _soft_(x):
+            # sign(x) * max(|x| - tau, 0)
+            # we do it in‐place on x
+            x_real = x[:len(x)//2]
+            x_imag = x[len(x)//2:]
+            mag = torch.sqrt(x_real**2 + x_imag**2)
+            phz = torch.atan2(x_imag, x_real)
+            mag = torch.max(mag - tau, torch.zeros_like(mag))
+            x[:len(x)//2] = mag * torch.cos(phz)
+            x[len(x)//2:] = mag * torch.sin(phz)
+            return x
+        
+        # Apply soft thresholding to each level
+        _soft_(coeffs[0])
+        for level_dict in coeffs[1:]:
+            for key, arr in level_dict.items():
+                _soft_(arr)
+        return coeffs
+
+
+    def forward(self, 
+                input: torch.tensor,
+                alpha: Optional[float] = 1.0):
+        """
+        Proximal operator for l1 wavelet
+
+        Parameters
+        ----------
+        input - torch.tensor
+            image/volume input with shape (N, *im_size)
+        alpha - float
+            proximal 'alpha' term
+        """
+        
+        if input.dim() == len(self.im_size):
+            # Add batch dim
+            input = input[None, ...]
+            batch = False
+        elif input.dim() != len(self.im_size) + 1:
+            raise ValueError(f'Input must have {len(self.im_size) + 1} dimensions, got {input.dim()}')
+        else:
+            batch = False
+        assert input.shape[-len(self.im_size):] == self.im_size, \
+            f'Input shape {input.shape} does not match im_size {self.im_size}'
+        
+        # Random stuff
+        shifts = torch.randint(-self.rnd_shift,
+                               self.rnd_shift + 1, 
+                               (len(self.im_size),)).tolist()
+        shifts_neg = [-s for s in shifts]
+        if self.rnd_phase:
+            phz = torch.rand((1,), device=input.device) * 2 * np.pi 
+            phase = torch.exp(1j * phz).type(complex_dtype)
+        else:
+            phase = torch.tensor([1.0], dtype=complex_dtype, device=input.device)
+
+        # Apply Randomness
+        nd = len(self.axes)
+        input_shift = input.roll(shifts, dims=self.axes) * phase
+
+        # Apply prox
+        coeffs = self.dec(input_shift)
+        coeffs_st = self.soft_threshold_coeffs_re_im(coeffs, alpha * self.lamda)
+        input_st = self.rec(coeffs_st)
+        
+        # Undo random stuff ...
+        output = (input_st * phase.conj()).roll(shifts_neg, dims=self.axes)
+        
+        if batch:
+            return output
+        return output[0, ...]
+
+class L1Wav_cpu(nn.Module):
     """Wavelet proximal operator mimicking Sid's implimentation"""
 
     def __init__(self, 
@@ -57,6 +183,7 @@ class L1Wav(nn.Module):
                  lamda: float, 
                  axes: Optional[tuple] = None,
                  rnd_shift: Optional[int] = 3,
+                 rnd_phase: Optional[bool] = True,
                  wave_name: Optional[str] = 'db4'):
         """
         Parameters:
@@ -69,6 +196,8 @@ class L1Wav(nn.Module):
             axes to compute wavelet transform over
         rnd_shift - int
             randomly shifts image by rnd_shift in each dim before applying prox
+        rnd_phase - bool
+            whether to apply a random phase to the image before applying prox
         wave_name - str
             the type of wavelet to use from:
             ['haar', 'db', 'sym', 'coif', 'bior', 'rbio', 'dmey', 'gaus',
@@ -85,6 +214,7 @@ class L1Wav(nn.Module):
         if axes is None:
             axes = tuple([i for i in range(len(shape))])
         self.lamda = lamda
+        self.rnd_phase = rnd_phase
         self.axes = axes
         self.W = sp.linop.Wavelet(shape, axes=axes, wave_name=wave_name)
 
@@ -104,7 +234,10 @@ class L1Wav(nn.Module):
         
         # Random stuff
         shift = round(self.rng.uniform(-self.rnd_shift, self.rnd_shift))
-        phase = np.exp(1j * self.rng.uniform(-np.pi, np.pi)).astype(np_complex_dtype)
+        if self.rnd_phase:
+            phase = np.exp(1j * self.rng.uniform(-np.pi, np.pi)).astype(np_complex_dtype)
+        else:
+            phase = 1.0
 
         # Roll each axis
         nd = len(self.axes)
@@ -234,6 +367,7 @@ class LocallyLowRank(nn.Module):
 
         # Take SVD
         U, S, Vh = torch.linalg.svd(x, full_matrices=False, driver='gesvda')
+        Vh.nan_to_num_(0.0)
 
         # Threshold
         S = S - self.hparams.threshold

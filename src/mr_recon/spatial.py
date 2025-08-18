@@ -156,18 +156,21 @@ def laplacian(u: torch.Tensor,
     # Restore batch dim
     return lap.reshape(u.shape)
 
-def fourier_resize(x, new_shape, window='boxcar'):
+def fourier_resize(x, new_shape, window='boxcar', window_after_crop=True):
 
     # FFT
     ndim = len(new_shape)
     X = fft(x, dim=tuple(range(-ndim, 0)))
+    if not window_after_crop:
+        X = apply_window(X, ndim, window)
 
     # Zero pad/chop
     oshape = X.shape[:-ndim] + new_shape
     X_rs = resize(X, oshape)
 
     # Windowing
-    X_rs = apply_window(X_rs, ndim, window)
+    if window_after_crop:
+        X_rs = apply_window(X_rs, ndim, window)
 
     # IFFT
     x_rs = ifft(X_rs, dim=tuple(range(-ndim, 0)))

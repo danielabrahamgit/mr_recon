@@ -1,48 +1,54 @@
+import torch
+import numpy as np
+
 import matplotlib
 matplotlib.use('webagg')
 import matplotlib.pyplot as plt
 
-import torch
-import numpy as np
-import sigpy as sp
-from mr_recon.fourier import chebyshev_nufft, cufi_nufft, matrix_nufft, sigpy_nufft, svd_nufft, torchkb_nufft, gridded_nufft, triton_nufft
 from mr_recon.utils import np_to_torch, torch_to_np, gen_grd
 from einops import rearrange, einsum
+from mr_recon.fourier import (
+    chebyshev_nufft, 
+    cufi_nufft, 
+    matrix_nufft, 
+    sigpy_nufft, 
+    svd_nufft, 
+    torchkb_nufft, 
+    gridded_nufft, 
+    triton_nufft
+)
 
 # # Random seeds
 # np.random.seed(0)
 # torch.manual_seed(0)
 
 # Params
-device_idx = 4
-grd_os = 1.5
+device_idx = 0
+grd_os = round(1.333 * 294) / 294
 try:
     torch_dev = torch.device(device_idx)
 except:
     torch_dev = torch.device('cpu')
-d = 2
-im_size = (64,)*d
+d = 3
+im_size = (12, 294, 150)
 rtol = 5e-2 
-eps = 1e-2
+eps = 1e-6
 
 # Make grid and k-space coordinates
 grd = gen_grd(im_size).to(torch_dev)
 crds = (torch.rand((1000, d), dtype=torch.float32, device=torch_dev) - 0.5)
 for i in range(d):
-    crds[..., i] *= im_size[i] #* .9
-# crds = torch.round(crds * grd_os) / grd_os
-img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
-img = torch.randn_like(img)
+    crds[..., i] *= im_size[i]
+crds = torch.round(crds * grd_os) / grd_os
+# img = np_to_torch(sp.shepp_logan(im_size)).to(torch_dev).type(torch.complex64)
+img = torch.randn(im_size, dtype=torch.complex64, device=torch_dev)
 
 # Create nuffts
-grd_nufft = gridded_nufft(im_size, grd_os)
-sp_nufft = sigpy_nufft(im_size)
-tr_nufft = triton_nufft(im_size)
-mx_nufft = matrix_nufft(im_size)
-cf_nufft = cufi_nufft(im_size, 1e-6)
-# sv_nufft = svd_nufft(im_size, n_svd=16, svd_mx_size=(35,)*d)
-nuffts = [cf_nufft, sp_nufft,]
-names = ['cufi_nufft', 'sigpy_nufft']
+nuffts = [
+    gridded_nufft(im_size, grd_os), 
+    sigpy_nufft(im_size, oversamp=2.0),
+]
+names = [str(nufft) for nufft in nuffts]
 def plot_err_ksp(err):
     plt.plot(err.cpu())
     plt.ylim(-.2, 1.2)
