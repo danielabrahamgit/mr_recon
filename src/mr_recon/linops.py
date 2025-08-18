@@ -1008,15 +1008,12 @@ class sense_linop(linop):
             else:
                 weights = einsum(temporal_funcs.conj(), temporal_funcs, 'L1 ... , L2 ... -> L1 L2 ...')
                 weights = rearrange(weights, 'n1 n2 ... -> (n1 n2) ... ') * dcf[None, ...]
-                self.toep_kerns = None
+                self.toep_kerns = []
                 for b1 in range(0, weights.shape[0], bparams.toeplitz_batch_size):
                     b2 = min(b1 + bparams.toeplitz_batch_size, weights.shape[0])
                     toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], weights[b1:b2])
-                    if self.toep_kerns is None:
-                        self.toep_kerns = toep_kerns
-                    else:
-                        self.toep_kerns = torch.cat((self.toep_kerns, toep_kerns), dim=0)
-                self.toep_kerns = nufft.calc_teoplitz_kernels(trj[None,], weights) 
+                    self.toep_kerns.append(toep_kerns)
+                self.toep_kerns = torch.cat(self.toep_kerns, dim=0)
                 L = temporal_funcs.shape[0]
                 self.toep_kerns = rearrange(self.toep_kerns, '(n1 n2) ... -> n1 n2 ...', n1=L, n2=L)
         else:
@@ -1192,7 +1189,7 @@ class sense_linop(linop):
                     FMFBSx = padder.adjoint(FMFBSx)
 
                     # Adjoint spatial funcs
-                    BFMFBSx = (FMFBSx * self.spatial_funcs[l1:l2].conj()).sum(dim=-len(self.im_size)-1)
+                    BFMFBSx = (FMFBSx * self.spatial_funcs.conj()).sum(dim=-len(self.im_size)-1)
 
                     # Apply adjoint mps
                     RFMFBSx = (BFMFBSx * mps.conj()).sum(dim=0)
