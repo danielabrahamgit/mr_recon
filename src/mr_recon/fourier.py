@@ -411,7 +411,7 @@ class triton_nufft(NUFFT):
         """
         ndim = len(self.im_size)
         for i in range(-ndim, 0):
-            crds = torch.arange(-(img.shape[i] // 2), img.shape[i] // 2, device=img.device)
+            crds = torch.arange(img.shape[i], device=img.device) - img.shape[i] // 2
             tup = (slice(None),) + (None,) * (-i-1)
             img *= self._apodization_func(crds / ceil(self.oversamp * img.shape[i]))[tup]
         return img
@@ -738,15 +738,79 @@ class sigpy_nufft(NUFFT):
         self.apodize = apodize
         if beta is None:
             if (((width / oversamp) * (oversamp - 0.5))**2 - 0.8) < 0:
-                print('WARNING: beta is set to 1.0')
-                self.beta = 1
+                if width != 1:
+                    print('WARNING: beta is set to 1.0')
+                self.beta = 1  
             else:
                 self.beta = np.pi * (((width / oversamp) * (oversamp - 0.5))**2 - 0.8)**0.5
         else:
             self.beta = beta
     
-    def _apodization_func(self, 
-                          x: torch.Tensor) -> torch.Tensor:
+    def optimal_beta(self,
+                     nbetas: Optional[int] = 100,
+                     num_sigs: Optional[int] = 1000,
+                     torch_dev: Optional[torch.device] = torch.device('cpu')) -> float:
+        """
+        Returns the optimal beta for this NUFFT with 
+        
+        Returns:
+        --------
+        beta : float
+            optimal beta for the NUFFT
+        """
+        # Discretize over kdevs, rs
+        N = max(self.im_size)
+        kdevs = torch.linspace(-0.5, 0.5, N, device=torch_dev) / self.oversamp
+        betas = torch.linspace(0.5, 20, nbetas, device=torch_dev)
+        
+        # Make a few random 1d signals
+        rnd_sigs = torch.randn((num_sigs, N), dtype=dtypes.complex_dtype, device=torch_dev)
+        
+        # Ground truth values
+        rs = gen_grd((N,)).to(torch_dev)[:, 0]
+        gt = torch.exp(-2j * np.pi * (kdevs[:, None] @ rs[None, :]))
+        vals_gt = torch.zeros((num_sigs, N), dtype=dtypes.complex_dtype, device=torch_dev)
+        for i in range(num_sigs):
+            vals_gt[i] = gt @ rnd_sigs[i]
+        
+        # See which beta is closest to the ground truth
+        errs = []
+        for beta in betas:
+            
+            # Compare beta-nufft to ground truth
+            nft = sigpy_nufft((self.im_size[0],), self.oversamp, self.width, beta=beta)
+            vals = nft.forward(rnd_sigs[None,], kdevs[None, :, None])[0]
+            scale = (vals.conj() * vals_gt).sum() / (vals.conj() * vals).sum()
+            vals = vals * scale
+            err = (vals - vals_gt).norm()
+            errs.append(err)
+        
+        # Return best Beta
+        errs = torch.stack(errs, dim=0)
+        imin = errs.argmin(dim=0)
+        return betas[imin].item()
+    
+    def _apodization_func_rect(self,
+                                 x: torch.Tensor):
+        """
+        1D apodization for the NUFFT with rectangular kernel function
+
+        Args:
+        -----
+        x : torch.Tensor <float>
+            Arb shape signal between [-1/2, 1/2]
+            
+        Returns:
+        --------
+        apod : torch.Tensor <float>
+            apodization evaluated at input x
+        """
+        return 1/torch.sinc(self.width * x / self.oversamp)
+    
+    def _apodization_func_kb(self, 
+                             x: torch.Tensor,
+                             beta: float,
+                             width: float) -> torch.Tensor:
         """
         1D apodization for the NUFFT
         
@@ -760,12 +824,13 @@ class sigpy_nufft(NUFFT):
         apod : torch.Tensor <float>
             apodization evaluated at input x
         """
-
-        apod = (
-            self.beta**2 - (np.pi * self.width * x) ** 2
-        ) ** 0.5
-        apod /= torch.sinh(apod)
-        return apod
+        eps = 1e-12
+        arg = (beta**2 - (np.pi * width * x) ** 2)
+        apod_pos = arg.clamp(min=0).sqrt()
+        apod_pos /= torch.sinh(apod_pos) + eps
+        apod_neg = (-arg.clamp(max=0)).sqrt()
+        apod_neg /= torch.sin(apod_neg) + eps
+        return apod_pos + apod_neg
     
     def _scale_trj(self, trj, shape):
         ndim = trj.shape[-1]
@@ -798,7 +863,9 @@ class sigpy_nufft(NUFFT):
         for i in range(-ndim, 0):
             crds = torch.arange(img.shape[i], device=img.device) - img.shape[i] // 2
             tup = (slice(None),) + (None,) * (-i-1)
-            img *= self._apodization_func(crds / ceil(self.oversamp * img.shape[i]))[tup]
+            img *= self._apodization_func_kb(crds / ceil(self.oversamp * img.shape[i]),
+                                             beta=self.beta,
+                                             width=self.width)[tup]
         return img
     
     def forward_FT_only(self, 
@@ -981,7 +1048,7 @@ class torchkb_nufft(NUFFT):
         tup = (None,) * (trj.ndim - 1) + (slice(None),)
         trj_rs = torch.pi * trj / (im_size_arr[tup] / 2)
 
-        return trj_rs
+        return trj_rs.type(torch.float32)
 
     def forward(self, 
                 img: torch.Tensor, 
@@ -1066,129 +1133,65 @@ class cufi_nufft(NUFFT):
         """
         super().__init__(im_size)
         self.eps = eps
+        
+        if len(im_size) == 1:
+            self.frw = cufinufft.nufft1d2
+            self.adj = cufinufft.nufft1d1
+        elif len(im_size) == 2:
+            self.frw = cufinufft.nufft2d2
+            self.adj = cufinufft.nufft2d1
+        elif len(im_size) == 3:
+            self.frw = cufinufft.nufft3d2
+            self.adj = cufinufft.nufft3d1
 
     def forward(self,
                 img: torch.Tensor, 
                 trj: torch.Tensor) -> torch.Tensor:
         N = trj.shape[0]
         d = trj.shape[-1]
+        img_batch_size = img.shape[1:-len(self.im_size)]
+        im_size = self.im_size
+        trj_size = trj.shape[:-1]
+        trj_flt = trj.reshape((N, -1, d))
+        img_flt = img.reshape((N, -1, *im_size))
         
-        ksp = torch.zeros((N, *img.shape[1:-len(trj.shape[1:-1])], *trj.shape[1:-1]), 
+        ksp = torch.zeros((N, *img_batch_size, *trj.shape[1:-1]), 
                           dtype=dtypes.complex_dtype, device=img.device)
         
         for n in range(N):
-            if d == 1:
-                ksp[n] = self.frw_1d(img[n], trj[n], self.eps, self.im_size) 
-            elif d == 2:
-                ksp[n] = self.frw_2d(img[n], trj[n], self.eps, self.im_size)
-            elif d == 3:
-                ksp[n] = self.frw_3d(img[n], trj[n], self.eps, self.im_size)
-            else:
-                raise ValueError(f"Unsupported trajectory dimension: {d}. Only 1D, 2D, and 3D are supported.")
-        
-        return ksp
+            trj_cp = torch_to_np(trj_flt[n])
+            img_cp = torch_to_np(img_flt[n])
+            ksp_n = np_to_torch(self.frw(*trj_cp.T, 
+                                         img_cp, 
+                                         eps=self.eps,
+                                         isign=-1))
+            ksp[n] = ksp_n.reshape((*img.shape[:-d], *trj_size))
+        return ksp / np.prod(im_size) ** 0.5
     
     def adjoint(self,
                 ksp: torch.Tensor,
                 trj: torch.Tensor) -> torch.Tensor:
         N = trj.shape[0]
         d = trj.shape[-1]
+        im_size = self.im_size
+        trj_size = trj.shape[:-1]
+        ksp_size = ksp.shape[:-len(trj_size)]
+        trj_flt = trj.reshape((N, -1, d))
+        ksp_flt = ksp.reshape((N, -1, trj_flt.shape[1]))
         
         img = torch.zeros((N, *ksp.shape[1:-len(trj.shape[1:-1])], *self.im_size), 
                           dtype=dtypes.complex_dtype, device=ksp.device) 
         for n in range(N):
-            if d == 1:
-                img[n] = self.adj_1d(ksp[n], trj[n], self.eps, self.im_size)
-            elif d == 2:
-                img[n] = self.adj_2d(ksp[n], trj[n], self.eps, self.im_size)
-            elif d == 3:
-                img[n] = self.adj_3d(ksp[n], trj[n], self.eps, self.im_size)
-            else:
-                raise ValueError(f"Unsupported trajectory dimension: {d}. Only 1D, 2D, and 3D are supported.")
+            trj_cp = torch_to_np(trj_flt[n])
+            ksp_cp = torch_to_np(ksp_flt[n])
+            img_n = np_to_torch(self.adj(*trj_cp.T,
+                                         ksp_cp, 
+                                         eps=self.eps,
+                                         isign=1,
+                                         n_modes=im_size))
+            img[n] = img_n.reshape((*ksp_size, *im_size))
         
-        return img
-
-    @staticmethod
-    def frw_1d(img: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
-        trj_size = trj.shape[:-1]
-        trj_flt = trj.reshape((trj.shape[0], 1))
-        img_flt = img.reshape((-1, *im_size))
-        trj_cp = torch_to_np(trj_flt)
-        img_cp = torch_to_np(img_flt)
-        ksp = np_to_torch(cufinufft.nufft1d2(trj_cp[:, 0], img_cp, 
-                                                eps=eps,
-                                                isign=-1))
-        return ksp.reshape((*img.shape[:-1], *trj_size))
-    
-    @staticmethod
-    def adj_1d(ksp: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
-        trj_size = trj.shape[:-1]
-        ksp_size = ksp.shape[:-len(trj_size)]
-        trj_flt = trj.reshape((trj.shape[0], 1))
-        ksp_flt = ksp.reshape((-1, trj_flt.shape[0]))
-        trj_cp = torch_to_np(trj_flt)
-        ksp_cp = torch_to_np(ksp_flt)
-        img = np_to_torch(cufinufft.nufft1d1(trj_cp[:, 0], ksp_cp, 
-                                                eps=eps,
-                                                isign=1,
-                                                n_modes=im_size[0]))
-        return img.reshape((*ksp_size, *im_size))
-    
-    @staticmethod
-    def frw_2d(img: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
-        trj_size = trj.shape[:-1]
-        trj_flt = trj.reshape((trj.shape[0], 2))
-        img_flt = img.reshape((-1, *im_size))
-        trj_cp = torch_to_np(trj_flt)
-        img_cp = torch_to_np(img_flt)
-        ksp = np_to_torch(cufinufft.nufft2d2(trj_cp[:, 0], trj_cp[:, 1], 
-                                             img_cp, 
-                                             eps=eps,
-                                             isign=-1))
-        return ksp.reshape((*img.shape[:-1], *trj_size))    
-    
-    @staticmethod
-    def adj_2d(ksp: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
-        trj_size = trj.shape[:-1]
-        ksp_size = ksp.shape[:-len(trj_size)]
-        trj_flt = trj.reshape((trj.shape[0], 2))
-        ksp_flt = ksp.reshape((-1, trj_flt.shape[0]))
-        trj_cp = torch_to_np(trj_flt)
-        ksp_cp = torch_to_np(ksp_flt)
-        img = np_to_torch(cufinufft.nufft2d1(trj_cp[:, 0], trj_cp[:, 1],
-                                             ksp_cp, 
-                                             eps=eps,
-                                             isign=1,
-                                             n_modes=im_size))
-        return img.reshape((*ksp_size, *im_size))
-    
-    @staticmethod
-    def frw_3d(img: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
-        trj_size = trj.shape[:-1]
-        trj_flt = trj.reshape((trj.shape[0], 3))
-        img_flt = img.reshape((-1, *im_size))
-        trj_cp = torch_to_np(trj_flt)
-        img_cp = torch_to_np(img_flt)
-        ksp = np_to_torch(cufinufft.nufft3d2(trj_cp[:, 0], trj_cp[:, 1], trj_cp[:, 2],
-                                             img_cp, 
-                                             eps=eps,
-                                             isign=-1))
-        return ksp.reshape((*img.shape[:-1], *trj_size))    
-    
-    @staticmethod
-    def adj_3d(ksp: torch.Tensor, trj: torch.Tensor, eps: float, im_size: tuple) -> torch.Tensor:
-        trj_size = trj.shape[:-1]
-        ksp_size = ksp.shape[:-len(trj_size)]
-        trj_flt = trj.reshape((trj.shape[0], 3))
-        ksp_flt = ksp.reshape((-1, trj_flt.shape[0]))
-        trj_cp = torch_to_np(trj_flt)
-        ksp_cp = torch_to_np(ksp_flt)
-        img = np_to_torch(cufinufft.nufft3d1(trj_cp[:, 0], trj_cp[:, 1], trj_cp[:, 2],
-                                             ksp_cp, 
-                                             eps=eps,
-                                             isign=1,
-                                             n_modes=im_size))
-        return img.reshape((*ksp_size, *im_size))
+        return img / np.prod(im_size) ** 0.5
 
     def rescale_trajectory(self,
                            trj: torch.Tensor) -> torch.Tensor:
@@ -1198,22 +1201,22 @@ class cufi_nufft(NUFFT):
         tup = (None,) * (trj.ndim - 1) + (slice(None),)
         trj_rs = torch.pi * trj / (im_size_arr[tup] / 2)
 
-        return trj_rs 
-
+        return trj_rs.contiguous()
+    
 class gridded_nufft(NUFFT):
 
     def __init__(self,
                  im_size: tuple,
-                 grid_oversamp: Optional[float] = 1.0):
+                 oversamp: Optional[float] = 1.0,):
         super().__init__(im_size)
-        self.im_size_os = tuple([round(i * grid_oversamp) for i in self.im_size])
-        self.grid_oversamp = grid_oversamp
+        self.im_size_os = tuple([round(i * oversamp) for i in self.im_size])
+        self.oversamp = oversamp
     
     def rescale_trajectory(self,
                            trj: torch.Tensor) -> torch.Tensor:
         
         # Clamp each dimension
-        trj_rs = trj * self.grid_oversamp
+        trj_rs = trj * self.oversamp
         for i in range(trj_rs.shape[-1]):
             n_over_2 = self.im_size_os[i]/2
             trj_rs[..., i] = (trj_rs[..., i] + n_over_2).round() % self.im_size_os[i] # $25 to Yonatan
@@ -1252,7 +1255,7 @@ class gridded_nufft(NUFFT):
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
         
-        return ksp * (self.grid_oversamp ** (d/2))
+        return ksp * (self.oversamp ** (d/2))
 
     def adjoint_iFT_only(self, 
                          ksp_os: torch.Tensor) -> torch.Tensor:
@@ -1281,7 +1284,7 @@ class gridded_nufft(NUFFT):
         for i in range(N):
             ksp_os[i] = multi_grid(ksp_torch[i], trj_torch[i].type(torch.int32), self.im_size_os)
             
-        return ksp_os * (self.grid_oversamp ** (d/2))
+        return ksp_os * (self.oversamp ** (d/2))
     
     def calc_teoplitz_kernels(self,
                               trj: torch.Tensor,
@@ -1307,11 +1310,11 @@ class gridded_nufft(NUFFT):
         """
 
         # Consts
-        os_factor = self.grid_oversamp
+        os_factor = self.oversamp
         im_size_os = tuple([round(i * os_factor) for i in self.im_size])
 
         # Make new instance of NUFFT with oversampled image size
-        nufft_os = gridded_nufft(im_size_os, grid_oversamp=1.0)
+        nufft_os = gridded_nufft(im_size_os, oversamp=1.0)
 
         return calc_toep_kernel_helper(nufft_os.adjoint, (trj).type(torch.int32), weights) * (os_factor ** len(self.im_size))
 
@@ -1470,7 +1473,8 @@ class svd_nufft(NUFFT):
         grid_os_size = self.padder.pad_im_size
         for i in range(trj_rs.shape[-1]):
             n_over_2 = grid_os_size[i]/2
-            trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, grid_os_size[i]-1)
+            trj_rs[..., i] = (trj_rs[..., i] + n_over_2).round() % grid_os_size[i] # $25 to Yonatan
+            # trj_rs[..., i] = torch.clamp(trj_rs[..., i] + n_over_2, 0, grid_os_size[i]-1)
         trj_rs = torch.round(trj_rs).type(torch.int32)
 
         return trj_rs
@@ -1502,6 +1506,7 @@ class svd_nufft(NUFFT):
         for i in range(N):
             ksp[i] = multi_index(ksp_os[i], d, trj_torch[i].type(torch.int32))
 
+        # Multiply by temporal functions
         empty_dims = ksp.ndim - self.temporal_funcs.ndim - 1
         tup = (None, slice(0, n_svd)) + (None,) * empty_dims + (slice(None),) * (self.temporal_funcs.ndim - 1)
         ksp = (ksp * self.temporal_funcs[tup]).sum(1)
