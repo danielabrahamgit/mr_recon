@@ -1,6 +1,7 @@
-site_name: YourPackage
-repo_url: https://github.com/your-org/your-package
-repo_name: your-org/your-package
+site_name: MRI Reconstruction with PyTorch
+repo_url: https://github.com/danielabrahamgit/mr_recon
+repo_name: danielabrahamgit/mr_recon
+
 theme:
   name: material
   features:
@@ -12,39 +13,53 @@ theme:
     - search.highlight
     - content.code.copy
     - content.action.edit
+
 markdown_extensions:
   - admonition
-  - codehilite
-  - deflist
+  - def_list
   - footnotes
   - meta
   - toc:
       permalink: true
   - pymdownx.arithmatex:
       generic: true
-
-  - pymdownx.betterem
   - pymdownx.details
   - pymdownx.highlight
   - pymdownx.inlinehilite
   - pymdownx.superfences
-  - toc:
-      permalink: true
   - pymdownx.tabbed:
       alternate_style: true
+
 plugins:
   - search
   - mkdocstrings:
       handlers:
         python:
+          paths: ["src"]         # <- src/ layout
           options:
-            show_source: true
             docstring_style: google
+            show_source: true
+            separate_signature: true
+            show_signature_annotations: true
+            heading_level: 2
+            members_order: source
+            filters: ["!^_"]
+            merge_init_into_class: true
   - mkdocs-jupyter
+
 nav:
   - Home: index.md
-  - Getting Started: getting-started.md
-  - API Reference: reference.md
+  - API Reference:
+      - Overview: reference.md
+      # Manually list API pages (examples below)
+      # - mr_recon: api/mr_recon.md
+  - Demos:
+      - GRAPPA Reconstruction: examples/grappa.ipynb
+      - Sense Reconstruction: examples/sense.ipynb
+      - Compressed Sensing: examples/cs.ipynb
+      - NUFFT Comparisons: examples/nufft.ipynb
+      - Field Correction: examples/field.ipynb
+
 extra_javascript:
   - https://polyfill.io/v3/polyfill.min.js?features=es6
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
