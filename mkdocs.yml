@@ -1,0 +1,50 @@
+site_name: YourPackage
+repo_url: https://github.com/your-org/your-package
+repo_name: your-org/your-package
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+markdown_extensions:
+  - admonition
+  - codehilite
+  - deflist
+  - footnotes
+  - meta
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+
+  - pymdownx.betterem
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+  - pymdownx.tabbed:
+      alternate_style: true
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            docstring_style: google
+  - mkdocs-jupyter
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - API Reference: reference.md
+extra_javascript:
+  - https://polyfill.io/v3/polyfill.min.js?features=es6
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
