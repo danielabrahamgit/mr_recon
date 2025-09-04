@@ -424,6 +424,104 @@ class type3_nufft(linop):
             # ----------------- Step 5: Reshape and pray -----------------
             return x.reshape((N, *self.ishape))
 
+class encoding_matrix(linop):
+    """
+    Linop for naive encoding matrix construction.
+    """
+
+    def __init__(self, 
+                 mps: torch.Tensor,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 temporal_batch_size: Optional[int] = None,
+                 bparams: Optional[batching_params] = batching_params(),
+                 verbose: Optional[bool] = False):
+        im_size = mps.shape[1:]
+        trj_size = alphas.shape[1:]
+        B = phis.shape[0]
+        C = mps.shape[0]
+        d = len(im_size)
+        super().__init__(im_size, (C, *trj_size))
+
+        # Consts
+        torch_dev = alphas.device
+        assert mps.device == torch_dev
+
+        # Default params
+        if dcf is None:
+            dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+
+        self.bparams = bparams
+        self.alphas_flt = alphas.reshape((B, -1))
+        self.phis_flt = phis.reshape((B, -1))
+        self.dcf_flt = dcf.flatten()
+        self.mps_flt = mps.reshape((C, -1))
+        self.tbs = temporal_batch_size
+        self.verbose = verbose
+    
+    def forward(self,
+                img: torch.Tensor) -> torch.Tensor:
+        # Consts
+        R = self.phis_flt.shape[1]
+        T = self.alphas_flt.shape[1]
+        C = self.mps_flt.shape[0]
+        cbs = self.bparams.coil_batch_size
+        tbs = self.tbs
+
+        ksp = torch.zeros((C, T), dtype=complex_dtype, device=img.device)
+        img_flt = img.flatten()
+        for c1, c2 in batch_iterator(C, cbs):
+            
+            # Apply coil maps
+            Sx = (self.mps_flt[c1:c2] * img_flt) # cbs R
+            
+            for t1, t2 in batch_iterator(T, tbs):
+                
+                # Grab a temporal batch
+                alphas_batch = self.alphas_flt[:, t1:t2] # B tbs
+                phis_batch = self.phis_flt # B R
+
+                # Apply encoding matrix
+                enc_mx = torch.exp(-2j * torch.pi * (phis_batch.T @ alphas_batch)) # R tbs
+                ksp[c1:c2, t1:t2] += (Sx @ enc_mx)
+                
+        return ksp.reshape(self.oshape) / (R ** 0.5) # mimick orthogonal FFT
+    
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
+        # Consts
+        R = self.phis_flt.shape[1]
+        T = self.alphas_flt.shape[1]
+        C = self.mps_flt.shape[0]
+        cbs = self.bparams.coil_batch_size
+        tbs = self.tbs
+
+        img = torch.zeros(R, dtype=complex_dtype, device=ksp.device)
+        ksp_flt = ksp.reshape((C, T))
+        for c1, c2 in batch_iterator(C, cbs):
+
+            # for t1, t2 in batch_iterator(T, tbs):
+            for t1 in tqdm(range(0, T, tbs), disable=not self.verbose):
+                t2 = min(t1 + tbs, T)
+                
+                # Grab a temporal batch
+                alphas_batch = self.alphas_flt[:, t1:t2] # B tbs
+                phis_batch = self.phis_flt # B R
+
+                # Apply adjoint encoding matrix
+                enc_mx = torch.exp(2j * torch.pi * (alphas_batch.T @ phis_batch)) # tbs R
+                coil_imgs = (ksp_flt[c1:c2, t1:t2] * self.dcf_flt[t1:t2]) @ enc_mx # cbs R
+                
+                # Apply adjoint coils
+                img += (self.mps_flt[c1:c2].conj() * coil_imgs).sum(dim=0)
+                
+        return img.reshape(self.ishape) / (R ** 0.5) # mimick orthogonal FFT
+    
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+        return self.adjoint(self.forward(img))
+
 class imperf_coil_lowrank(linop):
     """
     Linop for combining imperfections and coils into
