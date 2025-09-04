@@ -1,24 +1,24 @@
 import torch
 import cupy as cp
 import numpy as np
-
+    
 from mr_recon.dtypes import real_dtype
 from typing import Optional
 from fast_pytorch_kmeans import KMeans
 from scipy.signal import get_window
+from pyeyes import ComparativeViewer
 
 def cvplot(*args, **kwargs):
-    from pyeyes import ComparativeViewer
     for i, arg in enumerate(args):
         kwargs['arg_' + str(i)] = arg
 
     shp = kwargs[list(kwargs.keys())[0]].shape
     for key in kwargs.keys():
-        value = kwargs[key]
+        value = kwargs[key].cpu()
         assert value.shape == shp
         kwargs[key] = value.nan_to_num()
     
-    dims = [f'x{i}' for i in range(len(shp))]
+    dims = [f'{i}' for i in range(len(shp))]
     last_2_dims = [dims[-2], dims[-1]]
     cv = ComparativeViewer(kwargs,
                            dims,
