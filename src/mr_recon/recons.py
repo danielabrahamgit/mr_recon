@@ -82,6 +82,7 @@ def CG_SENSE_recon(A: linop,
                    tolerance: Optional[float] = 1e-8,
                    weights: Optional[torch.Tensor] = None,
                    ahb_init: Optional[torch.Tensor] = None,
+                   clear_gpu_mem: Optional[bool] = True,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run CG SENSE recon:
@@ -135,10 +136,10 @@ def CG_SENSE_recon(A: linop,
     if max_iter == 0:
         return AHb
 
-    # Clear y-data (we dont need it anymore)
-    gc.collect()
-    with device:
-        torch.cuda.empty_cache()
+    if clear_gpu_mem:
+        gc.collect()
+        with device:
+            torch.cuda.empty_cache()
 
     # Wrap normal with max eigen
     AHA = lambda x : A.normal(x) / max_eigen
