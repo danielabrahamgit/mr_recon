@@ -396,7 +396,7 @@ def power_method_operator(A: callable,
     if verbose:
         print(f'Max Eigenvalue = {ll}')
     
-    return x0, ll.item()
+    return x0, ll
 
 def eigen_decomp_operator(A: callable,
                           x0: torch.Tensor,

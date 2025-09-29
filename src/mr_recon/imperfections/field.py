@@ -269,6 +269,47 @@ def isotropic_cluster_alphas(alphas: torch.Tensor,
     
     return alpha_cents, inds
 
+def extract_dc_phis_alphas(phis: torch.Tensor,
+                           alphas: torch.Tensor,
+                           dc_tol=1e-10) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Extract any phis/alphas which are not spatially varying and remove them.
+
+    Parameters:
+    -----------
+    phis : torch.Tensor
+        Phase basis with shape (B, *im_size)
+    alphas : torch.Tensor
+        Phase coefficients with shape (B, *trj_size)
+
+    Returns
+    --------
+    dc_phi : torch.Tensor
+        DC phase applied to ksp of shape (*trj_size)
+    phis : torch.Tensor
+        Phase basis with shape (Bl, *im_size)
+    alphas : torch.Tensor
+        Phase coefficients with shape (Bl, *trj_size)
+    Returns DC phase of shape (*trj_size), as well as Bl < B bases
+    """
+    B = phis.shape[0]
+    phis_flt = phis.reshape((B, -1))
+    # inds where phis are constant
+    DC_inds = torch.where(phis_flt.max(dim=1).values - phis_flt.min(dim=1).values < dc_tol)[0]
+    if len(DC_inds) == 0:
+        return torch.ones(alphas.shape[1:], device=alphas.device, dtype=complex_dtype), phis, alphas
+
+    dc_phis = phis_flt[DC_inds, 0]
+    dc_alphas = alphas[DC_inds]
+    dc_phase = torch.exp(2j * torch.pi * einsum(dc_phis, dc_alphas, 'L, L ... -> ...'))
+
+    keep_inds = torch.tensor([i for i in range(B) if i not in DC_inds], device=phis.device)
+    phis = phis[keep_inds]
+    alphas = alphas[keep_inds]
+
+    return dc_phase, phis, alphas
+
+
 def alpha_segementation(phis: torch.Tensor,
                         alphas: torch.Tensor,
                         L: int,

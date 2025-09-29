@@ -3,7 +3,7 @@ import torch
 import time
 
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, Union
 from mr_recon.dtypes import complex_dtype
 from mr_recon.linops import linop
 from mr_recon.utils import np_to_torch, torch_to_np
@@ -15,11 +15,32 @@ from mr_recon.algs import (
     FISTA
 )
 
+def _max_eigen_calc(A: linop,
+                    device: torch.device,
+                    verbose: Optional[bool] = True,
+                    max_eigen: Optional[Union[float, str]] = 'rough') -> float:
+    """
+    Estimate largest eigenvalue so that lambda max of AHA is 1
+    """
+    if max_eigen is None or max_eigen == 'rough':
+        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
+        if max_eigen == 'rough':
+            # faster max eigenvalue that is less accurate but good enough
+            _, max_eigen = power_method_operator(A.normal, x0, num_iter=6, verbose=verbose)
+            max_eigen *= 1.3
+        else:
+            _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
+            max_eigen *= 1.01
+    else:
+        assert isinstance(max_eigen, (float, int)), "max_eigen must be a float, 'rough', or None"
+    
+    return max_eigen
+
 def min_norm_recon(A: linop,
                    ksp: torch.Tensor,
                    max_iter: int = 15,
                    lamda_l2: Optional[float] = 0.0,
-                   max_eigen: Optional[float] = None,
+                   max_eigen: Optional[Union[float, str]] = 'rough',
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run min norm recon:
@@ -50,10 +71,7 @@ def min_norm_recon(A: linop,
     device = ksp.device
 
     # Estimate largest eigenvalue so that lambda max of AHA is 1
-    if max_eigen is None:
-        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
-        _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
-        max_eigen *= 1.01
+    max_eigen = _max_eigen_calc(A, device, verbose, max_eigen)
 
     # Wrap normal with max eigen
     AAH = lambda x : A.forward(A.adjoint(x)) / max_eigen
@@ -78,7 +96,7 @@ def CG_SENSE_recon(A: linop,
                    ksp: torch.Tensor,
                    max_iter: Optional[int] = 15,
                    lamda_l2: Optional[float] = 0.0,
-                   max_eigen: Optional[float] = None,
+                   max_eigen: Optional[Union[float, str]] = 'rough',
                    tolerance: Optional[float] = 1e-8,
                    weights: Optional[torch.Tensor] = None,
                    ahb_init: Optional[torch.Tensor] = None,
@@ -117,10 +135,7 @@ def CG_SENSE_recon(A: linop,
     device = ksp.device
 
     # Estimate largest eigenvalue so that lambda max of AHA is 1
-    if max_eigen is None:
-        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
-        _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
-        max_eigen *= 1.01
+    max_eigen = _max_eigen_calc(A, device, verbose, max_eigen)
     
     # Starting with AHb
     if ahb_init is None:
@@ -190,7 +205,7 @@ def FISTA_recon(A: linop,
                 ksp: torch.Tensor,
                 proxg: callable,
                 max_iter: int = 40,
-                max_eigen: Optional[float] = None,
+                max_eigen: Optional[Union[float, str]] = 'rough',
                 verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run FISTA recon
@@ -221,10 +236,7 @@ def FISTA_recon(A: linop,
     device = ksp.device
 
     # Estimate largest eigenvalue so that lambda max of AHA is 1
-    if max_eigen is None:
-        x0 = torch.randn(A.ishape, dtype=complex_dtype, device=device)
-        _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
-        max_eigen *= 1.01
+    max_eigen = _max_eigen_calc(A, device, verbose, max_eigen)
     
     # Starting with AHb
     start = time.perf_counter()
