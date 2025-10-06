@@ -291,32 +291,43 @@ def svd_matrix_method_tall(A: torch.Tensor,
     Vh : torch.Tensor
         right singular vectors with shape (rank, M)
     """
-    # HACK -- torch lobpcg doesn't support complex numbers
     AHA = A.H @ A
-    Ar_top = torch.cat([AHA.real, -AHA.imag], dim=1)
-    Ar_bot = torch.cat([AHA.imag, AHA.real], dim=1)
-    Ar = torch.cat([Ar_top, Ar_bot], dim=0)
+
+    if torch.is_complex(A):
+        # HACK -- torch lobpcg doesn't support complex numbers
+        Ar_top = torch.cat([AHA.real, -AHA.imag], dim=1)
+        Ar_bot = torch.cat([AHA.imag, AHA.real], dim=1)
+        Ar = torch.cat([Ar_top, Ar_bot], dim=0)
+        
+        # Compute real eigen decomposition
+        M = AHA.shape[-1]
+        sig_squaredr, Vhr = torch.lobpcg(Ar, k=2*rank, niter=niter)
+
+         # Sort by singular values and threshold
+        idx = torch.argsort(sig_squaredr, descending=True)
+        sig_squaredr = sig_squaredr[idx]
+        Vhr = Vhr[..., idx]
+
+        # Convert to complex
+        Vh1 =       Vhr[..., :M, ::2] + 1j * Vhr[..., M:, ::2]
+        Vh2 = -1j * Vhr[..., :M, 1::2] +     Vhr[..., M:, 1::2]
+        sgns = torch.logical_and((Vh1.real * Vh2.real).mean(dim=-2) > 0, (Vh1.imag * Vh2.imag).mean(dim=-2) > 0)
+        sgns = sgns.float() * 2 - 1
+        Vh = (Vh1 + Vh2 * sgns)/2
+        sig_squared = sig_squaredr[..., ::2]
+
+    else:
+        sig_squared, Vh = torch.lobpcg(AHA, k=rank, niter=niter)
     
-    # Compute real eigen decomposition
-    M = AHA.shape[-1]
-    sig_squaredr, Vhr = torch.lobpcg(Ar, k=2*rank, niter=niter)
-    
-    # Sort by singular values
-    idx = torch.argsort(sig_squaredr, descending=True)
-    sig_squaredr = sig_squaredr[idx]
-    Vhr = Vhr[..., idx]
-    
-    # Convert to complex
-    Vh1 =       Vhr[..., :M, ::2] + 1j * Vhr[..., M:, ::2]
-    Vh2 = -1j * Vhr[..., :M, 1::2] +     Vhr[..., M:, 1::2]
-    sgns = torch.logical_and((Vh1.real * Vh2.real).mean(dim=-2) > 0, (Vh1.imag * Vh2.imag).mean(dim=-2) > 0)
-    sgns = sgns.float() * 2 - 1
-    Vh = (Vh1 + Vh2 * sgns)/2
-    sig_squared = sig_squaredr[..., ::2]
+        # Sort by singular values and threshold
+        idx = torch.argsort(sig_squared, descending=True)
+        sig_squared = sig_squared[idx]
+        Vh = Vh[..., idx]
     
     # Compute U
     Vh = Vh.H
     U = (A @ Vh.H / sig_squared ** 0.5)
+    
     return U, sig_squared ** 0.5, Vh
 
 def power_method_matrix(M: torch.Tensor,
