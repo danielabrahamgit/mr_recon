@@ -68,6 +68,10 @@ class type3_nufft_naive(linop):
         assert phis.shape[0] == alphas.shape[0], "phis and alphas must have same number of bases (B)"
         self.phis = phis.reshape((B, -1))
         self.alphas = alphas.reshape((B, -1))
+        self.Ntemp = self.alphas.shape[1]
+        self.Nspac = self.phis.shape[1]
+        self.B = B
+        self.device = phis.device
         
     def forward(self, 
                 x: torch.Tensor) -> torch.Tensor:
@@ -83,9 +87,17 @@ class type3_nufft_naive(linop):
             The output with shape (N, *trj_size)
         """
         N = x.shape[0]
-        enc_mat = torch.exp(-2j * torch.pi * (self.phis.T @ self.alphas))
         x_flt = x.reshape((N, -1))
-        return (x_flt @ enc_mat).reshape((N, *self.oshape))
+        bs = self._compute_batch_size(x.shape[0], op='forward')
+        if bs is None:
+            enc_mat = torch.exp(-2j * torch.pi * (self.phis.T @ self.alphas))
+            return (x_flt @ enc_mat).reshape((N, *self.oshape))
+        else:
+            out = torch.zeros((N, self.Ntemp), dtype=x.dtype, device=x.device)
+            for b1, b2 in batch_iterator(self.Nspac, bs):
+                enc_mat = torch.exp(-2j * torch.pi * (self.phis[:, b1:b2].T @ self.alphas))
+                out += x_flt[:, b1:b2] @ enc_mat
+            return out.reshape((N, *self.oshape))
         
     def adjoint(self, 
                 y: torch.Tensor) -> torch.Tensor:
@@ -101,9 +113,17 @@ class type3_nufft_naive(linop):
             The image with shape (N, *im_size)
         """
         N = y.shape[0]
-        enc_mat = torch.exp(2j * torch.pi * (self.alphas.T @ self.phis))
         y_flt = y.reshape((N, -1))
-        return (y_flt @ enc_mat).reshape((N, *self.ishape))
+        bs = self._compute_batch_size(y.shape[0], op='adjoint')
+        if bs is None:
+            enc_mat = torch.exp(2j * torch.pi * (self.alphas.T @ self.phis))
+            return (y_flt @ enc_mat).reshape((N, *self.ishape))
+        else:
+            out = torch.zeros((N, self.Nspac), dtype=y.dtype, device=y.device)
+            for b1, b2 in batch_iterator(self.Ntemp, bs):
+                enc_mat = torch.exp(2j * torch.pi * (self.alphas[:, b1:b2].T @ self.phis))
+                out += y_flt[:, b1:b2] @ enc_mat
+            return out.reshape((N, *self.ishape))
     
     def normal(self, 
                 x: torch.Tensor) -> torch.Tensor:
@@ -119,6 +139,49 @@ class type3_nufft_naive(linop):
             The output with shape (N, *trj_size)
         """
         return self.adjoint(self.forward(x))
+
+    def _compute_batch_size(self, B: int, op: str = 'forward'):
+        # determine batching scheme based on memory constraints
+        if self.device.type != 'cuda':
+            return None
+        
+        N = self.Nspac
+        T = self.Ntemp
+        K = self.B
+        bytes_per_real = self.phis.element_size()
+        bytes_per_cplx = bytes_per_real * 2
+
+        # Total memory usage
+        def get_total_bytes(N=N, T=T, ff=1.5):
+            bytes_phi   = K * N * bytes_per_real
+            bytes_alpha = K * T * bytes_per_real
+            bytes_x     = B * N * bytes_per_cplx
+            bytes_tmp   = N * T * bytes_per_real
+            bytes_E     = N * T * bytes_per_cplx
+            bytes_y     = B * T * bytes_per_cplx
+            total_bytes = bytes_phi + bytes_alpha + bytes_x + bytes_tmp + bytes_E + bytes_y
+            total_bytes *= ff # fudge factor
+            return int(total_bytes)
+
+        # memory available
+        size_computation = get_total_bytes()
+        size_avail = torch.cuda.mem_get_info(self.device)[0]
+
+        if size_computation <= size_avail:
+            return None # fits in memory
+        else:
+            if op == 'forward':
+                # batch over spatial dim
+                bytes_per_batch = get_total_bytes(N=1, T=T, ff=3)
+                overhead = get_total_bytes(N=0, T=T, ff=3)
+                bs = int((size_avail - overhead) // (bytes_per_batch - overhead))
+                return max(bs, 1)
+            else:
+                # batch over temporal dim
+                bytes_per_batch = get_total_bytes(N=N, T=1, ff=3)
+                overhead = get_total_bytes(N=N, T=0, ff=3)
+                bs = int((size_avail - overhead) // (bytes_per_batch - overhead))
+                return max(bs, 1)
 
 class type3_nufft(linop):
     
