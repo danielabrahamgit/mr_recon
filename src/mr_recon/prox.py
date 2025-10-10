@@ -334,7 +334,7 @@ class LocallyLowRank(nn.Module):
         self.rnd_shift = hparams.rnd_shift
 
         # Derived
-        self.block = Block(self.hparams.block_size, self.hparams.block_stride)
+        self.block = Block(self.hparams.block_size, self.hparams.block_stride, input_type=input_type)
         self.block_weights = nn.Parameter(
             self.block.precompute_normalization(input_size).type(self.input_type),
             requires_grad=False,

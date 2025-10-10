@@ -206,6 +206,7 @@ def FISTA_recon(A: linop,
                 proxg: callable,
                 max_iter: int = 40,
                 max_eigen: Optional[Union[float, str]] = 'rough',
+                clear_gpu_mem: Optional[bool] = True,
                 verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run FISTA recon
@@ -248,14 +249,15 @@ def FISTA_recon(A: linop,
 
     # Clear data (we dont need it anymore)
     del y
-    gc.collect()
-    with device:
-        torch.cuda.empty_cache()
+    if clear_gpu_mem:
+        gc.collect()
+        with device:
+            torch.cuda.empty_cache()
 
     # Wrap normal with max eigen
     AHA = lambda x : A.normal(x) / max_eigen
 
     # Run FISTA
-    recon = FISTA(AHA, AHb, proxg, max_iter)
+    recon = FISTA(AHA, AHb, proxg, max_iter, verbose=verbose)
 
     return recon
