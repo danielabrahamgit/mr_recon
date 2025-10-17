@@ -36,6 +36,51 @@ def _max_eigen_calc(A: linop,
     
     return max_eigen
 
+def prep_AHA_AHb(A: linop,
+                 ksp: torch.Tensor,
+                 max_eigen: Optional[Union[float, str]] = 'rough',
+                 ahb_init: Optional[torch.Tensor] = None,
+                 verbose: bool = True,
+                 alpha_scale: bool = True,
+                 ) -> tuple[callable, torch.Tensor]:
+
+    # Consts
+    device = ksp.device
+
+    # Estimate largest eigenvalue so that lambda max of AHA is 1
+    max_eigen = _max_eigen_calc(A, device, verbose, max_eigen)
+    
+    # Starting with AHb
+    if ahb_init is None:
+        start = time.perf_counter()
+        y = ksp.type(complex_dtype) / (max_eigen ** 0.5)
+
+        if alpha_scale:
+            ynorm = y.abs().square().sum()
+
+        AHb = A.adjoint(y) / (max_eigen ** 0.5)
+        end = time.perf_counter()
+        del y
+        if verbose:
+            print(f'AHb took {end-start:.3f}(s)')
+    else:
+        alpha_scale = False
+        AHb = ahb_init.type(complex_dtype) / (max_eigen)
+    
+    # Wrap normal with max eigen
+    AHA = lambda x : A.normal(x) / max_eigen
+
+    if alpha_scale:
+        # NOTE: try Adding scaling to improve conditioning
+        scale = ynorm / ((A(AHb) / (max_eigen ** 0.5)).abs().square().sum())
+        AHb = AHb * scale
+        if verbose:
+            print(f"\tAlpha Scale = {scale:.4f}")
+    else:
+        scale = 1.0
+
+    return AHA, AHb, scale
+
 def min_norm_recon(A: linop,
                    ksp: torch.Tensor,
                    max_iter: int = 15,
@@ -85,7 +130,7 @@ def min_norm_recon(A: linop,
     
     # Apply adjoint 
     start = time.perf_counter()
-    recon = A.adjoint(y) / (max_eigen ** 0.5)
+    recon = A.adjoint(y) / (max_eigen)
     end = time.perf_counter()
     if verbose:
         print(f'AHy took {end-start:.3f}(s)')
@@ -130,34 +175,16 @@ def CG_SENSE_recon(A: linop,
     recon : torch.Tensor
         the reconstructed image/volume
     """
-
-    # Consts
-    device = ksp.device
-
-    # Estimate largest eigenvalue so that lambda max of AHA is 1
-    max_eigen = _max_eigen_calc(A, device, verbose, max_eigen)
     
-    # Starting with AHb
-    if ahb_init is None:
-        start = time.perf_counter()
-        y = ksp.type(complex_dtype)
-        AHb = A.adjoint(y) / (max_eigen ** 0.5)
-        end = time.perf_counter()
-        del y
-        if verbose:
-            print(f'AHb took {end-start:.3f}(s)')
-    else:
-        AHb = ahb_init.type(complex_dtype) / (max_eigen ** 0.5)
+    AHA, AHb, scale = prep_AHA_AHb(A, ksp, max_eigen, ahb_init, verbose)
+    
     if max_iter == 0:
         return AHb
 
     if clear_gpu_mem:
         gc.collect()
-        with device:
+        with ksp.device:
             torch.cuda.empty_cache()
-
-    # Wrap normal with max eigen
-    AHA = lambda x : A.normal(x) / max_eigen
 
     # Run CG
     recon = conjugate_gradient(AHA=AHA, 
@@ -168,7 +195,7 @@ def CG_SENSE_recon(A: linop,
                                weights=weights,
                                verbose=verbose)
     
-    return recon
+    return recon / scale
 
 def coil_combine(multi_chan_img: torch.Tensor,
                  mps: Optional[torch.Tensor] = None,
@@ -206,13 +233,14 @@ def FISTA_recon(A: linop,
                 proxg: callable,
                 max_iter: int = 40,
                 max_eigen: Optional[Union[float, str]] = 'rough',
+                ahb_init: Optional[torch.Tensor] = None,
                 clear_gpu_mem: Optional[bool] = True,
                 verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run FISTA recon
     recon = min_x ||Ax - b||_2^2 + g(x)
     
-    Parameters:
+    Parameters
     -----------
     A : linop
         The linear operator (see linop)
@@ -227,37 +255,23 @@ def FISTA_recon(A: linop,
     verbose : bool 
         Toggles print statements
 
-    Returns:
+    Returns
     --------
     recon : torch.Tensor
         the reconstructed image/volume
     """
 
-    # Consts
-    device = ksp.device
-
-    # Estimate largest eigenvalue so that lambda max of AHA is 1
-    max_eigen = _max_eigen_calc(A, device, verbose, max_eigen)
+    AHA, AHb, scale = prep_AHA_AHb(A, ksp, max_eigen, ahb_init, verbose)
     
-    # Starting with AHb
-    start = time.perf_counter()
-    y = ksp.type(complex_dtype)
-    AHb = A.adjoint(y) / (max_eigen ** 0.5)
-    end = time.perf_counter()
-    if verbose:
-        print(f'AHb took {end-start:.3f}(s)')
+    if max_iter == 0:
+        return AHb
 
-    # Clear data (we dont need it anymore)
-    del y
     if clear_gpu_mem:
         gc.collect()
-        with device:
+        with ksp.device:
             torch.cuda.empty_cache()
-
-    # Wrap normal with max eigen
-    AHA = lambda x : A.normal(x) / max_eigen
 
     # Run FISTA
     recon = FISTA(AHA, AHb, proxg, max_iter, verbose=verbose)
 
-    return recon
+    return recon / scale
