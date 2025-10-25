@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple, Optional, Callable, Union
+from typing import Tuple, Optional, Callable, Union, Literal
 
 from einops import rearrange
 import numpy as np
@@ -25,6 +25,7 @@ class LLRHparams:
                         Tuple[int, int, int]]
     threshold: float
     rnd_shift: int = 3
+    thresh_mode: Literal['abs', 'rel'] = 'rel'
 
 def soft_thresh(x: torch.Tensor,
                 rho: float) -> torch.Tensor:
@@ -124,7 +125,7 @@ class L1Wav(nn.Module):
 
 
     def forward(self, 
-                input: torch.tensor,
+                input: torch.Tensor,
                 alpha: Optional[float] = 1.0):
         """
         Proximal operator for l1 wavelet
@@ -136,7 +137,6 @@ class L1Wav(nn.Module):
         alpha - float
             proximal 'alpha' term
         """
-        
         if input.dim() == len(self.im_size):
             # Add batch dim
             input = input[None, ...]
@@ -144,7 +144,7 @@ class L1Wav(nn.Module):
         elif input.dim() != len(self.im_size) + 1:
             raise ValueError(f'Input must have {len(self.im_size) + 1} dimensions, got {input.dim()}')
         else:
-            batch = False
+            batch = True
         assert input.shape[-len(self.im_size):] == self.im_size, \
             f'Input shape {input.shape} does not match im_size {self.im_size}'
         
@@ -314,6 +314,7 @@ class TV(nn.Module):
 
         return input # TODO
 
+
 class LocallyLowRank(nn.Module):
     """Version of LLR mimicking Sid's version in Sigpy
 
@@ -323,11 +324,15 @@ class LocallyLowRank(nn.Module):
             self,
             input_size: Tuple,
             hparams: LLRHparams,
+            mask: Optional[torch.Tensor] = None,
             input_type: Optional[Callable]= None,
     ):
         super().__init__()
         self.input_type = input_type if input_type is not None else complex_dtype
         self.hparams = hparams
+        self.mask = mask
+        if self.mask is not None:
+            self.mask = self.mask.type(self.input_type)
 
         # Using a fixed random number generator so that recons are consistent
         self.rng = np.random.default_rng(1000)
@@ -360,22 +365,37 @@ class LocallyLowRank(nn.Module):
         # Extract Blocks
         x, nblocks = self.block(x)
 
+        # block mask
+        if self.mask is not None:
+            m = torch.roll(self.mask, (shift,)*block_dim, dims=tuple(range(-block_dim, 0)))
+            m, nm = self.block(m[None, None,])
+            binds = m[0,0].reshape(m.shape[2], -1).abs().sum(dim=-1) > 0
+        else:
+            binds = slice(None,)
+
         # Combine within-block dimensions
         # Move temporal dimension to be second-to-last
         unblocked_shape = x.shape # Save block shape for later
         x = rearrange(x, 'n a b ... -> n b a (...)')
 
         # Take SVD
-        U, S, Vh = torch.linalg.svd(x, full_matrices=False, driver='gesvda')
+        U, S, Vh = torch.linalg.svd(x[:, binds], full_matrices=False, driver='gesvda')
         Vh.nan_to_num_(0.0)
 
+        if self.hparams.thresh_mode == 'rel':
+            # Relative thresholding
+            thresh = self.hparams.threshold * S.max(dim=-1, keepdim=True).values
+        else:
+            # Absolute thresholding
+            thresh = self.hparams.threshold
+        
         # Threshold
-        S = S - self.hparams.threshold
+        S = S - thresh
         S[S < 0] = 0.
         S = S.type(U.dtype)
 
         # Recompose blocks
-        x = U @ (S[..., None] * Vh)
+        x[:, binds] = U @ (S[..., None] * Vh)
 
         # Unblock and normalize
         x = rearrange(x, 'n b a x -> n a b x')

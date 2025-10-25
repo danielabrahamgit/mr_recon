@@ -3,7 +3,7 @@ import sigpy as sp
 import torch.nn as nn
 
 from tqdm import tqdm
-from typing import Optional, Tuple
+from typing import Optional, Callable, Tuple, Union
 from einops import rearrange, einsum
 from mr_recon.utils import torch_to_np, np_to_torch
 from mr_recon.dtypes import complex_dtype
@@ -738,6 +738,85 @@ def FISTA(AHA: nn.Module,
     if return_xs:
         return xs, x
     return x
+
+
+def TOS(
+    AHA: nn.Module,
+    AHb: torch.Tensor,
+    proxg1: Callable[[torch.Tensor], torch.Tensor],
+    proxg2: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    gamma: float = 1.0,          # step size ~ 1/L, with L = ||A||^2
+    num_iters: int = 100,
+    ptol_exit: float = 0.5,
+    return_ptols: bool = False,
+    return_xs: bool = False,
+    x0: Optional[torch.Tensor] = None,
+    verbose: bool = True,
+) -> Union[torch.Tensor, Tuple]:
+    """
+    Solve:  min_x  f(x) + g1(x) + g2(x)
+    with f(x) = 0.5||Ax - b||^2  (grad f = A^H A x - A^H b),
+    using Davis–Yin three-operator splitting.
+
+    Args
+    ----
+    AHA: module implementing x -> A^H A x   (batched ok)
+    AHb: tensor of A^H b
+    proxg1, proxg2: callables for prox of g1 and g2 at step 'gamma'
+        (typical pattern: make closures that already include λ*gamma)
+    gamma: stepsize in (0, 2/L); pick ~ 0.99 / L
+    """
+    # init
+    z = AHb.clone() if x0 is None else x0.clone()
+    ptols = []
+    xs = [] if return_xs else None
+
+    if num_iters <= 0:
+        return z
+
+    pbar = range(num_iters)
+    if verbose:
+        pbar = tqdm(pbar, desc="TOS Iterations")
+
+    for k in pbar:
+        # x^{k+1} = prox_{γ g1}(z^k)
+        x = proxg1(z)
+
+        # y^{k+1} = prox_{γ g2}( 2x - z - γ ∇f(x) )
+        gr = AHA(x) - AHb
+        y = proxg2(2 * x - z - gamma * gr)
+
+        # z^{k+1} = z^k + y^{k+1} - x^{k+1}
+        z_new = z + y - x
+
+        # ptol on the main iterate (you can also use ||z_{k+1}-z_k||)
+        ptol = 100 * torch.linalg.norm(z_new - z) / (torch.linalg.norm(z_new) + 1e-12)
+        if return_ptols:
+            ptols.append(ptol.item())
+
+        if verbose:
+            pass  # tqdm bar already shows progress
+
+        if ptol < ptol_exit:
+            if verbose:
+                print(f"Tolerance reached after {k+1} iterations, exiting TOS")
+            z = z_new
+            break
+
+        z = z_new
+        if return_xs:
+            xs.append(x.detach().clone())
+
+    # return policy
+    if return_ptols and return_xs:
+        return ptols, xs, x
+    if return_ptols:
+        return ptols, x
+    if return_xs:
+        return xs, x
+    return x
+
 
 def gradient_descent(AHA: nn.Module,
                      AHb: torch.Tensor,

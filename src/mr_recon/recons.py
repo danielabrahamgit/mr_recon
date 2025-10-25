@@ -12,7 +12,8 @@ from mr_recon.algs import (
     conjugate_gradient, 
     power_method_operator, 
     gradient_descent,
-    FISTA
+    FISTA,
+    TOS,
 )
 
 def _max_eigen_calc(A: linop,
@@ -29,10 +30,10 @@ def _max_eigen_calc(A: linop,
             _, max_eigen = power_method_operator(A.normal, x0, num_iter=6, verbose=verbose)
             max_eigen *= 1.3
         else:
-            _, max_eigen = power_method_operator(A.normal, x0, verbose=verbose)
-            max_eigen *= 1.01
+            _, max_eigen = power_method_operator(A.normal, x0, num_iter=12, verbose=verbose)
+            max_eigen *= 1.1
     else:
-        assert isinstance(max_eigen, (float, int)), "max_eigen must be a float, 'rough', or None"
+        assert isinstance(max_eigen, (float, int, torch.Tensor)), "max_eigen must be a tensor, float, 'rough', or None"
     
     return max_eigen
 
@@ -273,5 +274,54 @@ def FISTA_recon(A: linop,
 
     # Run FISTA
     recon = FISTA(AHA, AHb, proxg, max_iter, verbose=verbose)
+
+    return recon / scale
+
+def TOS_recon(A: linop,
+              ksp: torch.Tensor,
+              prox1: callable,
+              prox2: callable,
+              max_iter: int = 50,
+              max_eigen: Optional[Union[float, str]] = 'rough',
+              ahb_init: Optional[torch.Tensor] = None,
+              clear_gpu_mem: Optional[bool] = True,
+              verbose: Optional[bool] = True) -> torch.Tensor:
+    """
+    Run TOS recon
+    recon = min_x ||Ax - b||_2^2 + g1(x) + g2(x)
+    
+    Parameters
+    -----------
+    A : linop
+        The linear operator (see linop)
+    ksp : torch.Tensor
+        k-space data with shape (nc, nro, npe, ntr)
+    proxg : callable
+        proximal operator for g(x)
+    max_iter : int
+        max number of iterations for recon algorithm
+    max_eigen : float
+        maximum eigenvalue of AHA
+    verbose : bool 
+        Toggles print statements
+
+    Returns
+    --------
+    recon : torch.Tensor
+        the reconstructed image/volume
+    """
+
+    AHA, AHb, scale = prep_AHA_AHb(A, ksp, max_eigen, ahb_init, verbose)
+    
+    if max_iter == 0:
+        return AHb
+
+    if clear_gpu_mem:
+        gc.collect()
+        with ksp.device:
+            torch.cuda.empty_cache()
+
+    # Run FISTA
+    recon = TOS(AHA, AHb, prox1, prox2, num_iters=max_iter, verbose=verbose)
 
     return recon / scale
