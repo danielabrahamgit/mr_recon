@@ -932,7 +932,8 @@ def conjugate_gradient(AHA: nn.Module,
         
         # Apply model
         Ap = AHA_wrapper(p)
-        pAp = torch.real(torch.sum(p.conj() * Ap)).item()
+
+        pAp = torch.real(torch.sum(p.conj() * Ap))
 
         # Update x
         # assert pAp > 0, 'A is not Semi-Definite'

@@ -54,7 +54,8 @@ class type3_nufft_naive(linop):
     
     def __init__(self,
                  phis: torch.Tensor,
-                 alphas: torch.Tensor):
+                 alphas: torch.Tensor,
+                 mask: Optional[torch.Tensor] = None):
         """
         Args:
         -----
@@ -70,7 +71,14 @@ class type3_nufft_naive(linop):
         self.alphas = alphas.reshape((B, -1))
         self.Ntemp = self.alphas.shape[1]
         self.Nspac = self.phis.shape[1]
+        self.Nspac_full = self.phis.shape[1]
         self.B = B
+        self.mask = None
+        if mask is not None:
+            assert mask.shape == self.ishape, "support_mask must have same shape as spatial dimensions of phis"
+            self.mask = mask.reshape(-1).bool() # valid voxels
+            self.phis = self.phis[:, self.mask]
+            self.Nspac = self.mask.sum().item()
         self.device = phis.device
         
     def forward(self, 
@@ -88,7 +96,10 @@ class type3_nufft_naive(linop):
         """
         N = x.shape[0]
         x_flt = x.reshape((N, -1))
+        if self.mask is not None:
+            x_flt = x_flt[:, self.mask]
         bs = self._compute_batch_size(x.shape[0], op='forward')
+
         if bs is None:
             enc_mat = torch.exp(-2j * torch.pi * (self.phis.T @ self.alphas))
             return (x_flt @ enc_mat).reshape((N, *self.oshape))
@@ -117,12 +128,20 @@ class type3_nufft_naive(linop):
         bs = self._compute_batch_size(y.shape[0], op='adjoint')
         if bs is None:
             enc_mat = torch.exp(2j * torch.pi * (self.alphas.T @ self.phis))
-            return (y_flt @ enc_mat).reshape((N, *self.ishape))
+            if self.mask is not None:
+                 out = torch.zeros((N, self.Nspac_full), dtype=y.dtype, device=y.device)
+                 out[:, self.mask] = (y_flt @ enc_mat) # (N, Nspac)
+                 return out.reshape((N, *self.ishape))
+            else:
+                return (y_flt @ enc_mat).reshape((N, *self.ishape))
         else:
-            out = torch.zeros((N, self.Nspac), dtype=y.dtype, device=y.device)
+            out = torch.zeros((N, self.Nspac_full), dtype=y.dtype, device=y.device)
             for b1, b2 in batch_iterator(self.Ntemp, bs):
                 enc_mat = torch.exp(2j * torch.pi * (self.alphas[:, b1:b2].T @ self.phis))
-                out += y_flt[:, b1:b2] @ enc_mat
+                if self.mask is not None:
+                    out[:, self.mask] += y_flt[:, b1:b2] @ enc_mat
+                else:
+                    out += y_flt[:, b1:b2] @ enc_mat
             return out.reshape((N, *self.ishape))
     
     def normal(self, 
