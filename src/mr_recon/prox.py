@@ -381,6 +381,7 @@ class LocallyLowRank(nn.Module):
         # Take SVD
         U, S, Vh = torch.linalg.svd(x[:, binds], full_matrices=False, driver='gesvda')
         Vh.nan_to_num_(0.0)
+        U.nan_to_num_(0.0)
 
         if self.hparams.thresh_mode == 'rel':
             # Relative thresholding
