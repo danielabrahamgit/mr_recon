@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.dtypes import complex_dtype
 from mr_recon.algs import eigen_decomp_operator, power_method_matrix, lobpcg_operator
-from mr_recon.utils import torch_to_np, np_to_torch
+from mr_recon.utils import torch_to_np, np_to_torch, batch_iterator
 from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
 from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
 
@@ -100,20 +100,31 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
 
     # Get covariance matrix in image domain
     if cpu_last_part:
+        old_dev = device
         device = torch.device('cpu')
+        bs_AHA = 16
+    else:
+        old_dev = device
+        bs_AHA = 1
+    
     AHA = torch.zeros(im_size + (num_coils, num_coils), 
                         dtype=ksp_cal.dtype, device=device)
     kernels = kernels.to(device)
+
     for kernel in tqdm(kernels, 'Computing covariance matrix', disable=not verbose):
-        aH = ifft(kernel, oshape=(num_coils, *im_size),
-                                dim=tuple(range(-img_ndim, 0)))
-        aH = rearrange(aH, 'nc ... -> ... nc 1')
+        aH = torch.zeros(im_size + (num_coils, 1), dtype=kernel.dtype, device=old_dev)
+        fft_coil_bs = 10
+        for ci, cl in batch_iterator(num_coils, fft_coil_bs):
+            ah_ = ifft(kernel[ci:cl].to(old_dev), oshape=(cl-ci, *im_size), dim=tuple(range(-img_ndim, 0)))
+            aH[..., ci:cl, :] = rearrange(ah_, 'nc ... -> ... nc 1')
+        aH = aH.to(device)
+
         # a = aH.swapaxes(-1, -2).conj()
         # AHA += aH @ a
-        bs = 1
-        for c1 in range(0, num_coils, bs):
-            c2 = min(num_coils, c1 + bs)
-            AHA[..., c1:c2, :] += aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj()
+        for c1 in tqdm(range(0, num_coils, bs_AHA), 'Matmul batches', leave=False):
+            c2 = min(num_coils, c1 + bs_AHA)
+            AHA[..., c1:c2, :] += (aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj())
+
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
     # Get eigenvalues and eigenvectors
