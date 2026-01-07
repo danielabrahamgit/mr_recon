@@ -409,6 +409,54 @@ class LocallyLowRank(nn.Module):
         # Return the thresholded input
         return x
 
+    def forward_batch_noshift(self, x: torch.Tensor, m: Optional[torch.Tensor] = None):
+        """
+        Inner call for batch processing without random shifts
+        For large 3D problems that need to be done memory efficiently in Z
+        """
+
+        # Extract Blocks
+        x, nblocks = self.block(x)
+
+        # block mask
+        if m is not None:
+            m, nm = self.block(m[None, None,])
+            binds = m[0,0].reshape(m.shape[2], -1).abs().sum(dim=-1) > 0
+        else:
+            binds = slice(None,)
+
+        # Combine within-block dimensions
+        # Move temporal dimension to be second-to-last
+        unblocked_shape = x.shape # Save block shape for later
+        x = rearrange(x, 'n a b ... -> n b a (...)')
+
+        # Take SVD
+        U, S, Vh = torch.linalg.svd(x[:, binds], full_matrices=False, driver='gesvda')
+        Vh.nan_to_num_(0.0)
+        U.nan_to_num_(0.0)
+
+        if self.hparams.thresh_mode == 'rel':
+            # Relative thresholding
+            thresh = self.hparams.threshold * S.max(dim=-1, keepdim=True).values
+        else:
+            # Absolute thresholding
+            thresh = self.hparams.threshold
+        
+        # Threshold
+        S = S - thresh
+        S[S < 0] = 0.
+        S = S.type(U.dtype)
+
+        # Recompose blocks
+        x[:, binds] = U @ (S[..., None] * Vh)
+
+        # Unblock and normalize
+        x = rearrange(x, 'n b a x -> n a b x')
+        x = x.reshape(*unblocked_shape)
+        x = self.block.adjoint(x, nblocks, norm_weights=self.block_weights)
+
+        return x
+
     def forward_mrf(self, x: torch.Tensor):
         """Simple wrapper that fixes dimensions
         x: [A H W [D]]
