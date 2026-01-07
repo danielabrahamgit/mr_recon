@@ -17,6 +17,7 @@ def apply_rovir(img_cal: torch.Tensor,
                 mask_interf: torch.Tensor,
                 signal_cutoff: Optional[Union[float, int]] = 0.95,
                 B_eps: Optional[float] = 1e-6,
+                plot: Optional[bool] = True,
                 *channel_data) -> torch.Tensor:
     """
     Apply the ROvir algorithm to the input image.
@@ -80,16 +81,17 @@ def apply_rovir(img_cal: torch.Tensor,
     weights = evecs[:, :signal_cutoff] # C n
     weights = torch.linalg.qr(weights, mode='reduced')[0]
     
-    import matplotlib.pyplot as plt
-    plt.plot(pcnt_signal.cpu().numpy(), label='Signal')
-    plt.plot(pcnt_interf.cpu().numpy(), label='Interference')
-    plt.axvline(signal_cutoff, color='r', linestyle='--')
-    plt.ylim(-.05, 1.05)
-    plt.legend()
+    if plot:
+        import matplotlib.pyplot as plt
+        plt.plot(pcnt_signal.cpu().numpy(), label='Signal')
+        plt.plot(pcnt_interf.cpu().numpy(), label='Interference')
+        plt.axvline(signal_cutoff, color='r', linestyle='--')
+        plt.ylim(-.05, 1.05)
+        # plt.legend()
     
-    # Show the percent of signal and interference energy
-    print(f'Signal pcnt = {100*pcnt_signal[signal_cutoff-1].item():.2f}%')
-    print(f'Interf pcnt = {100*pcnt_interf[signal_cutoff-1].item():.2f}%')
+        # Show the percent of signal and interference energy
+        C = weights.shape[1]
+        print(f'Signal: {100*pcnt_signal[signal_cutoff-1].item():.2f}%\t Interf: {100*pcnt_interf[signal_cutoff-1].item():.2f}%\t Coils={C}')
     
     # Apply weights to channel data
     ch_data = []
