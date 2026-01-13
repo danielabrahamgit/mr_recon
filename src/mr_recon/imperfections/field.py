@@ -313,6 +313,7 @@ def extract_dc_phis_alphas(phis: torch.Tensor,
 def alpha_segementation(phis: torch.Tensor,
                         alphas: torch.Tensor,
                         L: int,
+                        mask: Optional[torch.Tensor] = None,
                         L_batch_size: Optional[int] = 1,
                         interp_type: Optional[str] = 'zero',
                         use_type3: Optional[bool] = True,
@@ -388,8 +389,8 @@ def alpha_segementation(phis: torch.Tensor,
         if use_type3:
             t3n = type3_nufft(phis, alphas)
         else:
-            t3n = type3_nufft_naive(phis, alphas)
-        
+            t3n = type3_nufft_naive(phis, alphas, mask=mask)
+
         # First compute AHA, which is all the pairwise 
         # dot products of the spatial features
         AHA = torch.zeros((L, L), device=torch_dev, dtype=complex_dtype)
