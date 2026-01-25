@@ -13,3 +13,7 @@ authors = [
 ]
 description = "A package for efficient MRI reconstruction in Pytorch"
 readme = "README.md"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["mr_recon"]

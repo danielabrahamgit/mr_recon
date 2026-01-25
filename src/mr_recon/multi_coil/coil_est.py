@@ -110,10 +110,10 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         aH = rearrange(aH, 'nc ... -> ... nc 1')
         # a = aH.swapaxes(-1, -2).conj()
         # AHA += aH @ a
-        bs = 1
+        bs = 4
         for c1 in range(0, num_coils, bs):
             c2 = min(num_coils, c1 + bs)
-            AHA[..., c1:c2, :] += aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj()
+            AHA[..., c1:c2, :] += (aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj())
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
     
     # Get eigenvalues and eigenvectors
@@ -158,8 +158,8 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
     """
     Trains grappa kernels and then calls csm_from_kernels.
 
-    Parameters:
-    -----------
+    Args
+    ----
     ksp_cal : torch.Tensor
         Calibration k-space data with shape (ncoil, *cal_size)
     im_size : tuple
@@ -179,8 +179,8 @@ def csm_from_grappa(ksp_cal: torch.Tensor,
     verbose : bool
         toggles progress bar
 
-    Returns:
-    --------
+    Returns
+    -------
     mps : torch.Tensor
         coil sensitivity maps with shape (ncoil, *im_size)
     eigen_vals : torch.Tensor

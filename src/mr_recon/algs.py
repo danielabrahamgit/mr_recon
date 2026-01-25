@@ -18,18 +18,16 @@ def soft_thresh(x: torch.Tensor,
     return x
 
 def density_compensation(trj: torch.Tensor,
-                         im_size: tuple,
-                         num_iters: Optional[int] = 30,
-                         method='sigpy'):
+                         im_size: Tuple,
+                         num_iters: int = 30,
+                         method: str = 'sigpy') -> torch.Tensor:
     """
-    Computes density compensation factor using Pipe Menon method.
-    Copied from sigpy.
+    Computes density compensation factor using Pipe Menon method. Copied from sigpy.
 
-    Parameters:
-    -----------
+    Args
+    ----
     trj : torch.Tensor
-        k-space trajectory with shape (..., d), scaled from -Ni/2 to Ni/2
-        where Ni = im_size[i]
+        k-space trajectory with shape (..., d), scaled from -Ni/2 to Ni/2 where Ni = im_size[i]
     im_size : tuple
         image size 
     num_iters : int
@@ -39,8 +37,8 @@ def density_compensation(trj: torch.Tensor,
         'CG_ksp' - Congugate gradient in k-space
         'CG_img' - Congugate gradient in image-space
     
-    Returns:
-    --------
+    Returns
+    -------
     dcf : torch.Tensor
         density compensation factor with shape (...)
     """
@@ -61,46 +59,6 @@ def density_compensation(trj: torch.Tensor,
                             device=sp.Device(idx), 
                             max_iter=num_iters)    
         dcf = np_to_torch(dcf)
-    
-    # # CG in k-space
-    # elif method == 'cg_ksp':
-    #     nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=1.0, width=4, beta=8, apodize=False)
-    #     def GHG(x):
-    #         adj = nft.adjoint(x[None,], trj[None,])
-    #         fwd = nft.forward(adj, trj[None,])[0].real
-    #         return fwd
-        
-    #     # Fix scaling factor and run CG
-    #     ones = torch.ones(trj.shape[:-1], device=torch_dev, dtype=torch.float32)
-    #     delta = ones.flatten() * 0
-    #     delta[0] = 1
-    #     scale = GHG(delta.reshape(ones.shape)).abs().max()
-    #     AHA = lambda x : GHG(x) / scale
-    #     dcf = conjugate_gradient(AHA, ones, num_iters=num_iters, lamda_l2=1e0 * 0, verbose=True).abs()
-
-    # elif method == 'cg_img':
-    #     delta = torch.zeros(im_size_os, device=torch_dev, dtype=torch.complex64)
-    #     slc = tuple([im_size_os[i] // 2 for i in range(len(im_size_os))])
-    #     delta[slc] = 1
-
-    #     nft = sigpy_nufft(im_size_os, trj.device.index, oversamp=os, width=4, beta=8, apodize=False)
-    #     kerns = nft.calc_teoplitz_kernels(trj[None,], os_factor=2.0)
-    #     # def FHF(x):
-    #     #     fwd = nft.forward(x[None,], trj[None,])
-    #     #     adj = nft.adjoint(fwd, trj[None,])[0]
-    #     #     return adj
-    #     def FHF(x):
-    #         adj = nft.normal_toeplitz(x[None,None], kerns)[0,0]
-    #         return adj
-    #     def FHF_inv(x):
-    #         adj = nft.normal_toeplitz(x[None,None], 1 / (kerns + 1e1))[0,0]
-    #         return adj
-    #     scale = FHF(delta).abs().max()
-    #     AHA = lambda x : FHF(x) / scale
-    #     print(scale)
-    #     # dcf_img = conjugate_gradient(AHA, delta, num_iters=num_iters*0 + 20, lamda_l2=1e1, verbose=True)
-    #     dcf_img = FHF_inv(delta)
-    #     dcf = nft.forward(dcf_img[None,], trj[None,])[0].abs()
         
     dcf /= dcf.max()
     return dcf
@@ -116,8 +74,8 @@ def svd_operator(A: callable,
     """
     Uses power method or lobpcg to to eigen-step in SVD on a matrix operator.
 
-    Parameters:
-    -----------
+    Args
+    ----
     A : callable
         linear operator mapping from (N, *inp_shape) to (N, *out_shape)
         where N is a batch dimension
@@ -138,8 +96,8 @@ def svd_operator(A: callable,
     verbose : bool
         toggles progress bar
     
-    Returns:
-    --------
+    Returns
+    -------
     U : torch.Tensor
         left vectors with shape (*out_shape, rank)
     S : torch.Tensor
@@ -152,7 +110,7 @@ def svd_operator(A: callable,
     V, S = eigen_decomp_operator(AHA, inp_example, num_eigen=rank, num_iter=num_iter, tol=tol, lobpcg=lobpcg, verbose=verbose)
     
     # Sort by singular values
-    idx = torch.argsort(S, descending=True)
+    idx = torch.argsort(S.abs(), descending=True)
     V = V[idx]
     S = S[idx] ** 0.5
     U = None
@@ -409,8 +367,8 @@ def eigen_decomp_operator(A: callable,
     """
     Uses power method to find largest num_eigen eigenvalues and corresponding eigenvectors
 
-    Parameters:
-    -----------
+    Args
+    ----
     A : callable
         linear operator mapping from (N, *vec_shape) to (N, *vec_shape)
         where N is a batch dimension
@@ -431,8 +389,8 @@ def eigen_decomp_operator(A: callable,
     verbose : bool
         toggles progress bar
     
-    Returns:
-    --------
+    Returns
+    -------
     eigen_vecs : torch.Tensor
         eigenvectors with shape (num_eigen, *vec_shape)
     eigen_vals : torch.Tensor
@@ -600,8 +558,8 @@ def lin_solve(AHA: torch.Tensor,
     """
     Solves (AHA + lamda I) @ x = AHb for x
 
-    Parameters:
-    -----------
+    Args
+    ----
     AHA : torch.Tensor
         square matrix with shape (..., n, n)
     AHb : torch.Tensor
@@ -616,8 +574,8 @@ def lin_solve(AHA: torch.Tensor,
         'cg' - conjugate gradient
         'gd' - gradient descent
     
-    Returns:
-    --------
+    Returns
+    -------
     x : torch.Tensor
         solution with shape (..., n, m)
     """
@@ -645,7 +603,7 @@ def lin_solve(AHA: torch.Tensor,
     elif solver == 'inv':
         x = torch.linalg.inv(AHA) @ AHb
     elif solver == 'cg':
-        x = conjugate_gradient(lambda x : AHA @ x, AHb, num_iters=100, lamda_l2=lamda)
+        x = conjugate_gradient(lambda x : AHA @ x, AHb, num_iters=1, lamda_l2=lamda, verbose=False)
     elif solver == 'gd':
         x = gradient_descent(lambda x : AHA @ x, AHb, lr=1e-4*2, num_iters=10000, lamda_l2=lamda)
     else:
@@ -665,8 +623,8 @@ def FISTA(AHA: nn.Module,
     Solves ||Ax - b||_2^2 + lamda ||Gx||_1, where G is a linear function.
     The proximal operator of Gx if given by 'proxg'
 
-    Parameters
-    ----------
+    Args
+    ----
     AHA : nn.Module
         The gram or normal operator of A
     AHb : torch.tensor
@@ -785,11 +743,12 @@ def conjugate_gradient(AHA: nn.Module,
                        return_resids: Optional[bool] = False,
                        weights: Optional[torch.Tensor] = None,
                        verbose=True) -> torch.Tensor:
-    """Conjugate gradient for complex numbers. The output is also complex.
-    Solve for argmin ||Ax - b||^2. Inspired by sigpy!
+    """
+    Conjugate gradient for complex numbers. The output is also complex. 
+    Solve for argmin ||Ax - b||^2
     
-    Parameters:
-    -----------
+    Args
+    ----
     AHA : nn.Module 
         Linear operator representing the gram/normal operator of A
     AHb : torch.tensor
@@ -807,8 +766,8 @@ def conjugate_gradient(AHA: nn.Module,
     verbose : bool
         toggles print statements
     
-    Returns:
-    ---------
+    Returns
+    -------
     x : torch.tensor <complex>
         least squares estimate of x, same shape as x0 if provided    
     """

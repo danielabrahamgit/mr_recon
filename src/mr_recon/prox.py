@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import sigpy as sp
 import ptwt
 
-from mr_recon.block import Block
+from mr_recon._func.block import Block
 from mr_recon.dtypes import complex_dtype, np_complex_dtype
 
 """
@@ -398,4 +398,15 @@ class LocallyLowRank(nn.Module):
         x = x[None, ...]
         x = self(x)
         x = x[0, ...]
+        return x
+    
+    def forward_t3n(self, x: torch.Tensor):
+        """Simple wrapper that fixes dimensions
+        x: [N T H W [D]]
+
+        Adds batch dim
+        """
+        x = x.moveaxis(-1, 0)[None,]
+        x = self(x)
+        x = x[0, ...].moveaxis(0, -1)
         return x

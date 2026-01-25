@@ -103,8 +103,8 @@ def coco_to_phis_alphas(trj: torch.Tensor,
     """
     Convert trajectory to concomitant fields phi and alpha notation
 
-    Args:
-    -----
+    Args
+    ----
     trj : torch.Tensor
         K-space trajectory with shape (*trj_size, 3) in units of 1/meters
     spatial_crds : torch.Tensor
@@ -116,8 +116,8 @@ def coco_to_phis_alphas(trj: torch.Tensor,
     dt : float
         Sampling time along readout in units of seconds
 
-    Returns:
-    --------
+    Returns
+    -------
     phis : torch.Tensor
         Phase basis in radians with shape (4, *im_size)
     alphas : torch.Tensor
@@ -165,14 +165,14 @@ def rescale_phis_alphas(phis: torch.Tensor,
     where phi_nrm are normalized to be between [-1/2, 1/2], meaning that alpha_nrm 
     tel you how many phase wraps accumulate
     
-    Args:
+    Args
     -----
     phis : torch.Tensor
         Phase basis with shape (B, *im_size)
     alphas : torch.Tensor
         Phase coefficients with shape (B, *trj_size)
         
-    Returns:
+    Returns
     --------
     phis_nrm : torch.Tensor
         Normalized phase basis with shape (B, *im_size)
@@ -196,13 +196,16 @@ def rescale_phis_alphas(phis: torch.Tensor,
     alphas_flt = alphas.reshape((B, T))
     
     # Center alphas and phis
+    idx_flat = torch.argwhere(phis_flt.std(dim=1) < 1e-6)[:, 0]
     phis_mp = (phis_flt.min(dim=1).values + phis_flt.max(dim=1).values)/2
+    phis_mp[idx_flat] = 0.0
     alphas_mp = (alphas_flt.min(dim=1).values + alphas_flt.max(dim=1).values)/2
     phis_flt_cent = phis_flt - phis_mp[:, None]
     alphas_flt_cent = alphas_flt - alphas_mp[:, None]
     
-    # Rescale phis to be between [-1/2, 1/2]
+    # Rescale phis to be between [-1/2, 1/2]    
     scales = phis_flt_cent.abs().max(dim=1).values * 2
+    scales[idx_flat] = phis_flt_cent[idx_flat].abs().max(dim=1).values
     phis_flt_cent /= scales[:, None]
     phis_mp /= scales
     alphas_flt_cent *= scales[:, None]
@@ -244,13 +247,16 @@ def isotropic_cluster_alphas(alphas: torch.Tensor,
     alphas_flt = alphas.reshape((B, -1))
     
     # Center alphas and phis
+    idx_flat = torch.argwhere(phis_flt.std(dim=1) < 1e-6)[:, 0]
     phis_mp = (phis_flt.min(dim=1).values + phis_flt.max(dim=1).values)/2
+    phis_mp[idx_flat] = 0.0
     alphas_mp = (alphas_flt.min(dim=1).values + alphas_flt.max(dim=1).values)/2
     phis_flt_cent = phis_flt - phis_mp[:, None]
     alphas_flt_cent = alphas_flt - alphas_mp[:, None]
     
     # Rescale phis to be between [-1/2, 1/2]
     scales = phis_flt_cent.abs().max(dim=1).values * 2
+    scales[idx_flat] = phis_flt_cent[idx_flat].abs().max(dim=1).values
     phis_flt_cent /= scales[:, None]
     phis_mp /= scales
     alphas_flt_cent *= scales[:, None]
@@ -288,8 +294,8 @@ def alpha_segementation(phis: torch.Tensor,
     
     alphas_l are chosen according to k-means clustering 
 
-    Parameters:
-    -----------
+    Args
+    ----
     phis : torch.Tensor
         Phase basis with shape (B, *im_size)
     alphas : torch.Tensor
@@ -305,8 +311,8 @@ def alpha_segementation(phis: torch.Tensor,
     use_type3 : bool
         If True, use type3 nufft for forward pass
 
-    Returns:
-    --------
+    Returns
+    -------
     spatial_funcs : torch.Tensor
         Spatial basis functions with shape (L, *im_size)
     temporal_funcs : torch.Tensor
@@ -368,7 +374,7 @@ def alpha_segementation(phis: torch.Tensor,
 
     return spatial_funcs, temporal_funcs
 
-def alpha_phi_svd(phis: torch.Tensor,
+def phi_alpha_svd(phis: torch.Tensor,
                   alphas: torch.Tensor,
                   L: int,
                   mask: Optional[torch.Tensor] = None,

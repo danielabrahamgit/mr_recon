@@ -284,8 +284,8 @@ def spatial_interp(spatial_input: torch.Tensor,
     Perform polynomial interpolation on the spatial dimensions of a tensor
     at specified coordinates.
     
-    Parameters:
-    -----------
+    Args
+    ----
     spatial_input : torch.Tensor
         Input tensor of shape (N, d0, d1, ..., d_{K-1}).
     coords : torch.Tensor
@@ -295,8 +295,8 @@ def spatial_interp(spatial_input: torch.Tensor,
     mode : str, optional
         How to handle points outside the boundaries (default 'nearest').
     
-    Returns:
-    --------
+    Returns
+    -------
     out : torch.Tensor
         An array of interpolated values with shape (N, M). That is, for each
         batch element, the tensor is evaluated at the provided coordinates.

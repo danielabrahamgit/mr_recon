@@ -89,8 +89,8 @@ def quantize_data(data: torch.Tensor,
     """
     Given data of shape (..., d), finds K 'clusters' with shape (K, d)
 
-    Args:
-    -----
+    Args
+    ----
     data : torch.Tensor
         data to quantize with shape (..., d)
     K : int
@@ -100,8 +100,8 @@ def quantize_data(data: torch.Tensor,
         'uniform' - uniformly spaced bins
         'unique' - just takes unique values
     
-    Returns:
-    --------
+    Returns
+    -------
     centers : torch.Tensor
         cluster/quantization centers with shape (K, d)
     idxs : torch.Tensor <int>
@@ -162,6 +162,61 @@ def quantize_data(data: torch.Tensor,
     idxs = idxs.reshape(data.shape[:-1])
 
     return centers, idxs
+
+def pick_K_vectors(vectors: torch.Tensor,
+                   K: int,
+                   sigma: Optional[float] = 0.0,
+                   method: Optional[str] = 'minmax') -> torch.Tensor:
+    """
+    Given N vectors, pick K represenative vectors that are far apart from each other.
+    
+    Args
+    ----
+    vectors : torch.Tensor
+        Vectors to pick from with shape (N, d) 
+    K : int
+        Number of vectors to pick
+    sigma : float
+        Adds noise to N vectors to 'blur out' the distribution
+    method : str
+        'kmeans' will use k-means clustering to pick the vectors.
+        'random' will pick K random vectors from the input.
+        'minmax' will pick K vectors that are farthest apart from each other.
+        'convhull' TODO need to implement this.
+        
+    Returns
+    -------
+    kvectors : torch.Tensor
+        K vectors with shape (K, d)
+    idxs : torch.Tensor
+        Indices of the picked vectors in the original input with shape (K,) in [0, N)
+    """
+    # Consts
+    N, d = vectors.shape
+    assert N > K, f'N={N} is not greater than K={K}.'
+    
+    # Add noise
+    vectors_noisy = vectors + torch.randn_like(vectors) * sigma
+    
+    # Kmeans clustering
+    if method == 'kmeans':
+        kvectors, idxs = quantize_data(data=vectors_noisy, K=K, method='cluster')
+    elif method == 'random':
+        idxs = torch.randperm(N)[:K]
+        kvectors = vectors_noisy[idsx]
+    elif method == 'minmax':
+        picked = [torch.randint(0, N, (1,))]
+        dist = torch.linalg.norm(vectors_noisy - vectors_noisy[picked], dim=-1)
+        for _ in range(1, K):
+            nxt = torch.argmax(dist)
+            picked.append(nxt)
+            dist = torch.minimum(dist, torch.linalg.norm(vectors_noisy - vectors_noisy[nxt], dim=-1))
+        idxs = torch.tensor(picked, dtype=torch.long, device=vectors_noisy.device)
+        kvectors = vectors_noisy[idxs]
+    else:
+        raise ValueError(f'Unknown method {method}.')
+        
+    return kvectors, idxs
 
 def gen_grd(im_size: tuple, 
             fovs: Optional[tuple] = None,
@@ -233,15 +288,15 @@ def rotation_matrix(axis: torch.Tensor,
     """
     Computes rotation matrices for a given axis and angle
 
-    Parameters:
-    -----------
+    Args
+    ----
     axis : torch.Tensor
         axis of rotation with shape (..., 3)
     theta : torch.Tensor
         angle of rotation in radians with shape (...)
     
-    Returns:
-    --------
+    Returns
+    -------
     R : torch.Tensor
         rotation matrix with shape (..., 3, 3)
     """

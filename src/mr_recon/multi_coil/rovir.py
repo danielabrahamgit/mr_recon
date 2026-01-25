@@ -58,7 +58,7 @@ def apply_rovir(img_cal: torch.Tensor,
         B_psd = B.clone()
     B_psd += B_eps * torch.eye(C, device=B.device, dtype=B.dtype) * eig_b.max()
     
-    # # Compute generalized eigenvalue decomposition
+    # Compute generalized eigenvalue decomposition
     evals, evecs = generalized_eigenvalue_decomposition(A, B_psd)
     
     # Determine cutoff number of channels
@@ -80,12 +80,12 @@ def apply_rovir(img_cal: torch.Tensor,
     weights = evecs[:, :signal_cutoff] # C n
     weights = torch.linalg.qr(weights, mode='reduced')[0]
     
-    import matplotlib.pyplot as plt
-    plt.plot(pcnt_signal.cpu().numpy(), label='Signal')
-    plt.plot(pcnt_interf.cpu().numpy(), label='Interference')
-    plt.axvline(signal_cutoff, color='r', linestyle='--')
-    plt.ylim(-.05, 1.05)
-    plt.legend()
+    # import matplotlib.pyplot as plt
+    # plt.plot(pcnt_signal.cpu().numpy(), label='Signal')
+    # plt.plot(pcnt_interf.cpu().numpy(), label='Interference')
+    # plt.axvline(signal_cutoff-1, color='r', linestyle='--')
+    # plt.ylim(-.05, 1.05)
+    # plt.legend()
     
     # Show the percent of signal and interference energy
     print(f'Signal pcnt = {100*pcnt_signal[signal_cutoff-1].item():.2f}%')

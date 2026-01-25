@@ -9,24 +9,61 @@ from mr_recon.recons import CG_SENSE_recon
 from einops import rearrange, einsum
 from typing import Optional, Union
 
+def remove_bad_coils(ksp_sig: torch.Tensor,
+                     ksp_noise: torch.Tensor,
+                     snr_pcntile: float = 0.7):
+    """
+    Remove bad coils based on SNR percentile
+    
+    Args
+    ----
+    ksp_sig : torch.Tensor
+        k-space signal data (ideally center of k-space) with shape (C, *sig_size)
+    ksp_noise : torch.Tensor
+        k-space noise data (ideally edges of k-space) with shape (C, *noise_size)
+    snr_pcntile : float
+        percentile threshold for SNR, between 0 and 1   
+    
+    Returns
+    -------
+    good_coils_inds : torch.Tensor
+        boolean mask of good coils, shape (C,)
+    """
+    # Reshape to (C, N)
+    C = ksp_noise.shape[0]
+    assert ksp_sig.shape[0] == C, "Signal and noise must have same number of coils"
+    ksp_sig_flt = ksp_sig.reshape((C, -1))
+    ksp_noise_flt = ksp_noise.reshape((C, -1))
+    
+    # Compute SNR
+    sig_power = (ksp_sig_flt.abs()**2).mean(dim=-1)
+    noise_power = (ksp_noise_flt.abs()**2).mean(dim=-1)
+    snr = sig_power / noise_power
+    
+    # Threshold based on percentile
+    thresh = torch.quantile(snr, snr_pcntile)
+    good_coils_inds = snr >= thresh
+
+    return good_coils_inds
+
 def whiten_data(noise_mat: torch.Tensor,
                 *args):
     """
     Whiten data using calibration noisy data
 
-    Args:
-    -----
+    Args
+    ----
     noise_mat : torch.Tensor
         matrix with just noise, shape (C, ...)
     *args : list[torch.Tensor]
         additional tensors to whiten, shape (C, ...)
 
-    Returns:
-    --------
+    Returns
+    -------
     psi_half_inv : torch.Tensor
-        whitening matrix, shape (C, C)
+        whitening matrix, shape (Cout, Cin)
     args : list[torch.Tensor]
-        whitened tensors, shape (C, ...)
+        whitened tensors, shape (Cout, ...)
     """
     C = noise_mat.shape[0]
     noise_mat = noise_mat.reshape((C, -1))

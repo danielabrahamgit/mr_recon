@@ -68,6 +68,7 @@ class type3_nufft_naive(linop):
         assert phis.shape[0] == alphas.shape[0], "phis and alphas must have same number of bases (B)"
         self.phis = phis.reshape((B, -1))
         self.alphas = alphas.reshape((B, -1))
+        # print(f'Matrix Size = {self.phis.shape[1]} x {self.alphas.shape[1]} = {self.phis.shape[1] * self.alphas.shape[1] * 4 / (2 ** 30)} GB')
         
     def forward(self, 
                 x: torch.Tensor) -> torch.Tensor:
@@ -120,12 +121,10 @@ class type3_nufft_naive(linop):
         """
         return self.adjoint(self.forward(x))
 
-class type3_nufft(linop):
-    
+class type3_ish(linop):
     def __init__(self,
-                 phis: torch.Tensor,
                  alphas: torch.Tensor,
-                 oversamp: float = 2.0,
+                 oversamp: float = 1.25,
                  width: float = 4.0,
                  use_toep: Optional[bool] = False):
         """
@@ -137,12 +136,161 @@ class type3_nufft(linop):
         type3 nuffts look like:
             y_k = sum_n x_n e^{-j 2\pi phi_n * alpha_k}
             
-        TODO list: 
+        TODO list
         ----------
-        1. Fix KB beta calculation -- beatty is not good for large oversamp factors
-        2. Update gridding/interp functions to be n-dimensional (currently up to 5d)
+        1. Update gridding/interp functions to be n-dimensional (currently up to 5d)
 
+        Args
+        -----
+        alphas : torch.Tensor
+            The temporal phase coefficients, shape (B, *trj_size)
+        oversamp : float
+            The oversampling factor for spatial gridding
+        width : float
+            The width of the gridding kernel
+        use_toep : bool
+            toggles Topelitz for gram/normal/AHA operator
+        """    
+        # Consts
+        B, *trj_size = alphas.shape
+        T = np.prod(trj_size)
+        torch_dev = alphas.device
+        
+        # Store
+        self.alphas = alphas.reshape((B, T))
+        self.torch_dev = torch_dev
+        self.B = B
+        self.trj_size = trj_size
+        
+        # Consts for gridding
+        self.grd_S = self.alphas.abs().max(dim=1).values
+        self.grd_W = width
+        self.grd_N_os = torch.ceil(2 * self.grd_S * oversamp + self.grd_W).long()
+        self.grd_os = self.grd_N_os / (self.grd_N_os / oversamp).round() # FIXME?
+        self.grd_N = self.grd_N_os / self.grd_os
+        self.grd_gamma = self.grd_N_os / (2 * self.grd_os * self.grd_S)
+        self.grd_beta = np.pi * (((self.grd_W / self.grd_os) * (self.grd_os - 0.5))**2 - 0.8)**0.5
+        self.grd_N_os = tuple((self.grd_N * self.grd_os).ceil().long().tolist())
+        super().__init__(tuple(self.grd_N_os), tuple(trj_size))
+        self.nft = sigpy_nufft(self.grd_N_os)
+        print(f'Actual oversamplings = {self.grd_os}')
+        print(f'Oversampling Grids = {self.grd_N_os}')
+        
+        # Optimize beta
+        self.nft.beta = self.nft.optimal_beta(torch_dev=torch_dev) # Better beta calculation
+        # for i in range(len(self.grd_beta)):
+        #     nft_dummy = sigpy_nufft(im_size=(self.grd_N[i].round().long().item(),), 
+        #                             oversamp=self.grd_os[i].item(), 
+        #                             width=self.grd_W)
+        #     self.grd_beta[i] = nft_dummy.optimal_beta(torch_dev=torch_dev)
+    
+    @staticmethod
+    def apod(x, beta, width):
+        eps = 1e-12
+        arg = (beta**2 - (np.pi * width * x) ** 2)
+        apod_pos = arg.clamp(min=0).sqrt()
+        apod_pos /= torch.sinh(apod_pos) + eps
+        apod_neg = (-arg.clamp(max=0)).sqrt()
+        apod_neg /= torch.sin(apod_neg) + eps
+        return apod_pos + apod_neg
+       
+    def forward(self,
+                x_grid: torch.Tensor,) -> torch.Tensor:
+        """
+        Applies post gridding steps of type 3 nufft.
+        
+        Args
+        ----
+        x_grid : torch.Tensor
+            The gridded image data to be transformed, shape (N, *grd_N_os)
+        
+        Returns
+        -------
+        y : torch.Tensor
+            The output with shape (N, *trj_size)
+        """
+        # Consts
+        N = x_grid.shape[0]
+            
+        # ----------------- Call NUFFT on gridded data -----------------
+        alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
+        y_pre_apod = self.nft.forward(x_grid, alphas_rep * self.grd_gamma) # N T
+        y_pre_apod *= np.prod(self.grd_N_os) ** 0.5
+        
+        # ----------------- Apodize -----------------
+        y = y_pre_apod * self.apod(alphas_rep * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+        
+        # ----------------- Reshape and Pray -----------------
+        return y.reshape((N, *self.oshape))
+    
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint operator
+        
         Args:
+        -----
+        y : torch.Tensor
+            The k-space data to be transformed, shape (N, *trj_size)
+        
+        Returns:
+        --------
+        x_grid : torch.Tensor
+            The output gridded image data with shape (N, *grd_N_os)
+        """
+        # Consts
+        N = y.shape[0]
+        
+        # ----------------- Apodize -----------------
+        alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
+        y_flt = y.reshape((N, -1))
+        y_apod = y_flt * self.apod(alphas_rep * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+        
+        # ----------------- Call Adjoint NUFFT -----------------
+        x_grid = self.nft.adjoint(y_apod, alphas_rep * self.grd_gamma) # N *self.grd_N_os
+        x_grid *= np.prod(self.grd_N_os) ** 0.5
+        
+        return x_grid.reshape((N, *self.ishape))
+    
+    def normal(self,
+               x_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Applies normal operator
+        
+        Args:
+        -----
+        x_grid : torch.Tensor
+            The gridded image data to be transformed, shape (N, *grd_N_os)
+            
+        Returns:
+        --------
+        torch.Tensor
+            The output with shape (N, *grd_N_os)
+        """
+        return self.adjoint(self.forward(x_grid))
+    
+class type3_nufft(linop):
+    
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 oversamp: float = 1.25,
+                 width: float = 4.0,
+                 use_toep: Optional[bool] = False):
+        """
+        KB implimentation of the type-3 nufft as described in:
+        "A PARALLEL NONUNIFORM FAST FOURIER TRANSFORM LIBRARY 
+        BASED ON AN ``EXPONENTIAL OF SEMICIRCLE" KERNEL - Barnett et. al.
+        "https://epubs.siam.org/doi/pdf/10.1137/18M120885X
+        
+        type3 nuffts look like:
+            y_k = sum_n x_n e^{-j 2\pi phi_n * alpha_k}
+            
+        TODO list
+        ----------
+        1. Update gridding/interp functions to be n-dimensional (currently up to 5d)
+
+        Args
         -----
         phis : torch.Tensor
             The spatial phase maps, shape (B, *im_size)
@@ -163,8 +311,9 @@ class type3_nufft(linop):
         torch_dev = phis.device
         assert B == B_, "phis and alphas must have same number of bases (B)"
         assert phis.device == alphas.device, "phis and alphas must be on same device"
+        assert phis.dtype == alphas.dtype, "phis and alphas must have same dtype"
         super().__init__(tuple(im_size), tuple(trj_size))
-        
+     
         # Flatten everything
         phis_flt = phis.reshape((B, R))
         alphas_flt = alphas.reshape((B, T))
@@ -203,6 +352,14 @@ class type3_nufft(linop):
         # print(f'Actual oversamplings = {self.grd_os}')
         # print(f'Oversampling Grids = {self.grd_N_os}')
         
+        # Optimize beta
+        self.nft.beta = self.nft.optimal_beta(torch_dev=torch_dev) # Better beta calculation
+        # for i in range(len(self.grd_beta)):
+        #     nft_dummy = sigpy_nufft(im_size=(self.grd_N[i].round().long().item(),), 
+        #                             oversamp=self.grd_os[i].item(), 
+        #                             width=self.grd_W)
+        #     self.grd_beta[i] = nft_dummy.optimal_beta(torch_dev=torch_dev)
+        
         if use_toep:
             # print('Computing toeplitz Kernels ... ', end='')
             apod_weights = self.apod(self.alphas.T * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
@@ -212,9 +369,14 @@ class type3_nufft(linop):
             self.kerns = None
         
     @staticmethod
-    def apod(x, beta, W):
-        a = (beta**2 - (np.pi * W * x) ** 2) ** 0.5
-        return a / torch.sinh(a)
+    def apod(x, beta, width):
+        eps = 1e-12
+        arg = (beta**2 - (np.pi * width * x) ** 2)
+        apod_pos = arg.clamp(min=0).sqrt()
+        apod_pos /= torch.sinh(apod_pos) + eps
+        apod_neg = (-arg.clamp(max=0)).sqrt()
+        apod_neg /= torch.sin(apod_neg) + eps
+        return apod_pos + apod_neg
         
     def forward(self,
                 x: torch.Tensor,) -> torch.Tensor:
@@ -501,9 +663,7 @@ class encoding_matrix(linop):
         ksp_flt = ksp.reshape((C, T))
         for c1, c2 in batch_iterator(C, cbs):
 
-            # for t1, t2 in batch_iterator(T, tbs):
-            for t1 in tqdm(range(0, T, tbs), disable=not self.verbose):
-                t2 = min(t1 + tbs, T)
+            for t1, t2 in batch_iterator(T, tbs):
                 
                 # Grab a temporal batch
                 alphas_batch = self.alphas_flt[:, t1:t2] # B tbs
@@ -1051,6 +1211,7 @@ class sense_linop(linop):
                  use_toeplitz: Optional[bool] = False,
                  spatial_funcs: Optional[torch.Tensor] = None,
                  temporal_funcs: Optional[torch.Tensor] = None,
+                 adc_filter: Optional[torch.Tensor] = None,
                  bparams: Optional[batching_params] = batching_params()):
         """
         Parameters
@@ -1072,6 +1233,8 @@ class sense_linop(linop):
             the spatial functions for imperfection models with shape (L, *im_size)
         temporal_funcs : torch.tensor <complex> | GPU
             the temporal functions for imperfection models with shape (L, *trj_size)
+        adc_filter : torch.tensor <float>
+            the adc filter to apply in the frequence domain, assumed to be applied ot the first dim of trj
         """
         im_size = mps.shape[1:]
         trj_size = trj.shape[:-1]
@@ -1119,6 +1282,7 @@ class sense_linop(linop):
             self.toep_kerns = None
 
         # Save
+        self.adc_filter = adc_filter
         self.im_size = im_size
         self.trj_size = trj_size
         self.use_toeplitz = use_toeplitz
@@ -1174,6 +1338,13 @@ class sense_linop(linop):
                 
                 # Append to k-space
                 ksp[c:d, ...] += HFSBx
+                
+        
+        # Apply adc filter if provided
+        if self.adc_filter is not None:
+            kf = fft(ksp, dim=1)
+            kf = kf * self.adc_filter
+            ksp = ifft(kf, dim=1)
 
         return ksp
     
@@ -1201,6 +1372,12 @@ class sense_linop(linop):
 
         # Result image
         img = torch.zeros(self.im_size, dtype=complex_dtype, device=self.torch_dev)
+        
+        # Apply adc filter if provided
+        if self.adc_filter is not None:
+            kf = fft(ksp, dim=1)
+            kf = kf * self.adc_filter
+            ksp = ifft(kf, dim=1)
             
         # Batch over coils
         for c, d in batch_iterator(nc, coil_batch_size):

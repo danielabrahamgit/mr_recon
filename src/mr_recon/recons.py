@@ -88,8 +88,8 @@ def CG_SENSE_recon(A: linop,
     Run CG SENSE recon:
     recon = (AHA + lamda_l2I)^-1 AHb
     
-    Parameters:
-    -----------
+    Args
+    ----
     A : linop
         The linear operator (see linop)
     ksp : torch.Tensor
@@ -107,8 +107,8 @@ def CG_SENSE_recon(A: linop,
     verbose : bool 
         Toggles print statements
 
-    Returns:
-    --------
+    Returns
+    -------
     recon : torch.Tensor
         the reconstructed image/volume
     """
