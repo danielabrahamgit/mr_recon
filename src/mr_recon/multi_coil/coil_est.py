@@ -1,15 +1,15 @@
 import time
 import torch
-import sigpy as sp
 
 from tqdm import tqdm
 from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.dtypes import complex_dtype
-from mr_recon.algs import eigen_decomp_operator, power_method_matrix, lobpcg_operator
-from mr_recon.utils import torch_to_np, np_to_torch, batch_iterator
-from mr_recon.fourier import ifft, NUFFT, torchkb_nufft, sigpy_nufft
-from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, gen_source_vectors_min_dist, gen_source_vectors_rot, gen_source_vectors_circ, train_kernels, gen_source_vectors_rot_square
+from mr_recon.algs import power_method_matrix, lobpcg_operator
+from mr_recon.utils import batch_iterator
+from mr_recon.fourier import ifft, NUFFT, sigpy_nufft
+from mr_recon.block import array_to_blocks
+from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, train_kernels, gen_source_vectors_rot_square
 
 def csm_from_espirit(ksp_cal: torch.Tensor,
                      im_size: tuple,
@@ -60,18 +60,12 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     num_coils = ksp_cal.shape[0]
     device = ksp_cal.device
 
-    # TODO torch this part
     # Get calibration matrix.
     # Shape [num_coils] + num_blks + [kernel_width] * img_ndim
-    ksp_cal_sp = torch_to_np(ksp_cal)
-    dev = sp.get_device(ksp_cal_sp)
-    with dev:
-        mat = sp.array_to_blocks(
-            ksp_cal_sp, [kernel_width] * img_ndim, [1] * img_ndim)
-        mat = mat.reshape([num_coils, -1, kernel_width**img_ndim])
-        mat = mat.transpose([1, 0, 2])
-        mat = mat.reshape([-1, num_coils * kernel_width**img_ndim])
-    mat = np_to_torch(mat)
+    mat = array_to_blocks(
+        ksp_cal, [kernel_width] * img_ndim, [1] * img_ndim
+    ).reshape(num_coils, -1, kernel_width**img_ndim)
+    mat = mat.permute(1, 0, 2).reshape(-1, num_coils * kernel_width**img_ndim)
 
     # Perform SVD on calibration matrix
     if verbose:
@@ -434,19 +428,14 @@ def calc_espirit_kernels(ksp_cal: torch.Tensor,
     img_ndim = len(im_size)
     num_coils = ksp_cal.shape[0]
 
-    # TODO torch this part
     # Get calibration matrix.
     # Shape [num_coils] + num_blks + [kernel_width] * img_ndim
-    ksp_cal_sp = torch_to_np(ksp_cal)
-    dev = sp.get_device(ksp_cal_sp)
-    with dev:
-        mat = sp.array_to_blocks(
-            ksp_cal_sp, [kernel_width] * img_ndim, [1] * img_ndim)
-        calib_mat = mat.reshape((num_coils, -1, *((kernel_width,)*img_ndim))) # For debug
-        mat = mat.reshape([num_coils, -1, kernel_width**img_ndim])
-        mat = mat.transpose([1, 0, 2])
-        mat = mat.reshape([-1, num_coils * kernel_width**img_ndim])
-    mat = np_to_torch(mat)
+    mat = array_to_blocks(
+        ksp_cal, [kernel_width] * img_ndim, [1] * img_ndim
+    )
+    calib_mat = mat.reshape((num_coils, -1, *((kernel_width,)*img_ndim))) # For debug
+    mat = mat.reshape(num_coils, -1, kernel_width**img_ndim)
+    mat = mat.permute(1, 0, 2).reshape(-1, num_coils * kernel_width**img_ndim)
 
     # Perform SVD on calibration matrix
     if verbose:
@@ -463,4 +452,4 @@ def calc_espirit_kernels(ksp_cal: torch.Tensor,
     kernels = VH.reshape(
         [num_kernels, num_coils] + [kernel_width] * img_ndim)
     
-    return kernels, np_to_torch(rearrange(calib_mat, 'C N ... -> N C ...'))
+    return kernels, rearrange(calib_mat, 'C N ... -> N C ...')

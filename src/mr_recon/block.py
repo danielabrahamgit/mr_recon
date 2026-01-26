@@ -7,6 +7,31 @@ from mr_recon.dtypes import complex_dtype
 from einops import rearrange
 from typing import Tuple, Optional
 
+def array_to_blocks(x: torch.Tensor, blk_shape: tuple, blk_strides: tuple) -> torch.Tensor:
+    """Extract blocks from an array in a sliding window manner.
+
+    Args:
+        input (torch.Tensor): input array of shape [..., N_1, ..., N_ndim]
+        blk_shape (tuple): block shape of length ndim, with ndim={1, 2, 3}.
+        blk_strides (tuple): block strides of length ndim.
+
+    Returns:
+        torch.Tensor: tensor of shape [...] + num_blks + blk_shape, where
+            num_blks = (N - blk_shape + blk_strides) // blk_strides.
+
+    """
+    if len(blk_shape) != len(blk_strides):
+        raise ValueError("blk_shape must have the same length as blk_strides.")
+
+    ndim = len(blk_shape)
+    nbdim = x.ndim - ndim
+
+    for d in range(ndim):
+        x = x.unfold(dimension = nbdim + d, size = blk_shape[d], step = blk_strides[d])
+
+    return x.contiguous()
+
+
 class Block(nn.Module):
     """Inspired by torchgeometry's extract_patches
     https://kornia.readthedocs.io/en/v0.1.2/_modules/torchgeometry/contrib/extract_patches.html
