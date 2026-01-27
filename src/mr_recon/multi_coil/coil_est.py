@@ -6,10 +6,43 @@ from typing import Optional, Tuple
 from einops import rearrange, einsum
 from mr_recon.dtypes import complex_dtype
 from mr_recon.algs import power_method_matrix, lobpcg_operator
-from mr_recon.utils import batch_iterator
+from mr_recon.utils import batch_iterator, tqdm_batch_iterator
 from mr_recon.fourier import ifft, NUFFT, sigpy_nufft
 from mr_recon.block import array_to_blocks
 from mr_recon.multi_coil.grappa_utils import gen_source_vectors_rand, train_kernels, gen_source_vectors_rot_square
+
+def _espirit_batch_sizes(
+    kernel_batch_size: Optional[int],
+    ndim: int,
+    cpu_last_part: bool,
+    Nc: int,
+):
+    """
+    Heuristic batch sizes for ESPRIT when using in 2D or 3D
+    """
+    bs_kern = 1
+    bs_aha = 1
+    bs_fft = 1
+    
+    if ndim == 2:
+        if kernel_batch_size is not None:
+            bs_kern = kernel_batch_size
+        # don't batch AHA and FFT, should fit on 1 GPU
+        bs_aha = Nc
+        bs_fft = Nc
+    elif ndim == 3:
+        bs_kern = 1
+        if cpu_last_part:
+            bs_aha = 16
+            bs_fft = 10
+        else:
+            bs_aha = 1
+            bs_fft = 5
+    
+    batch_aha = (bs_aha < Nc)
+    batch_fft = (bs_fft < Nc)
+
+    return bs_kern, bs_aha, bs_fft, batch_aha, batch_fft
 
 def csm_from_espirit(ksp_cal: torch.Tensor,
                      im_size: tuple,
@@ -17,9 +50,10 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
                      kernel_width: Optional[int] = 6,
                      crp: Optional[float] = None,
                      sets_of_maps: Optional[int] = 1,
-                     max_iter: Optional[int] = 100,
+                     max_iter: Optional[int] = 300,
                      lobpcg_iter: Optional[int] = None,
                      cpu_last_part: Optional[bool] = False,
+                     kernel_batch_size: Optional[int] = None,
                      verbose: Optional[bool] = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Copy of sigpy implementation of ESPIRiT calibration, but in torch:
@@ -28,7 +62,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     Parameters:
     -----------
     ksp_cal : torch.Tensor
-        Calibration k-space data with shape (ncoil, *cal_size)
+        Calibration k-space data with shape (Nc, *cal_size)
     im_size : tuple
         output image size
     thresh : float
@@ -44,34 +78,42 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     lobpcg_iter : int
         number of iterations to run lobpcg
         if given, uses lobpcg instead of svd for first part
+    cpu_last_part : bool
+        if True, moves AHA and after computations to CPU (for 3D problems)
+    kernel_batch_size : int
+        batch size for computing AHA over ESPIRIT kernels (can be >1 if 2D problems)
     verbose : bool
         toggles progress bar
 
     Returns:
     --------
     mps : torch.Tensor
-        coil sensitivity maps with shape (ncoil, *im_size)
+        coil sensitivity maps with shape (Nc, *im_size)
     eigen_vals : torch.Tensor
         eigenvalues with shape (*im_size)
     """
 
     # Consts
     img_ndim = len(im_size)
-    num_coils = ksp_cal.shape[0]
+    Nc = ksp_cal.shape[0]
     device = ksp_cal.device
 
-    # Get calibration matrix.
-    # Shape [num_coils] + num_blks + [kernel_width] * img_ndim
+    # batching things
+    bs_kern, bs_aha, bs_fft, batch_aha, batch_fft = _espirit_batch_sizes(
+        kernel_batch_size, img_ndim, cpu_last_part, Nc
+    )
+
+    # Get calibration matrix.: [Nc] + num_blks + [kernel_width] * img_ndim
     mat = array_to_blocks(
         ksp_cal, [kernel_width] * img_ndim, [1] * img_ndim
-    ).reshape(num_coils, -1, kernel_width**img_ndim)
-    mat = mat.permute(1, 0, 2).reshape(-1, num_coils * kernel_width**img_ndim)
+    ).reshape(Nc, -1, kernel_width**img_ndim)
+    mat = mat.permute(1, 0, 2).reshape(-1, Nc * kernel_width**img_ndim)
 
     # Perform SVD on calibration matrix
     if verbose:
-        print('Computing SVD on calibration matrix: ', end='')
+        print('[ESIRIT]: Computing SVD on calibration matrix: ', end='')
         start = time.perf_counter()
-    
+
     if lobpcg_iter is not None:
         AHA = mat.H @ mat
         A_op = lambda x : AHA @ x
@@ -83,51 +125,54 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     else:
         _, S, VH = torch.linalg.svd(mat, full_matrices=False)
     VH = VH[S > thresh * S.max(), :]
+
     if verbose:
         end = time.perf_counter()
         print(f'{end - start:.3f}s')
 
-    # Get kernels
-    num_kernels = len(VH)
-    kernels = VH.reshape(
-        [num_kernels, num_coils] + [kernel_width] * img_ndim)
-
-    # Get covariance matrix in image domain
+    # Move to CPU if last part is on CPU, for large 3D problems
     if cpu_last_part:
         old_dev = device
         device = torch.device('cpu')
-        bs_AHA = 16
     else:
         old_dev = device
-        bs_AHA = 1
     
-    AHA = torch.zeros(im_size + (num_coils, num_coils), 
-                        dtype=ksp_cal.dtype, device=device)
+    # ------- Compute covariance matrix -------   
+    num_kernels = len(VH)
+    kernels = VH.reshape([num_kernels, Nc] + [kernel_width] * img_ndim)
+    AHA = torch.zeros(im_size + (Nc, Nc), dtype=ksp_cal.dtype, device=device)
     kernels = kernels.to(device)
 
-    for kernel in tqdm(kernels, 'Computing covariance matrix', disable=not verbose):
-        aH = torch.zeros(im_size + (num_coils, 1), dtype=kernel.dtype, device=old_dev)
-        fft_coil_bs = 10
-        for ci, cl in batch_iterator(num_coils, fft_coil_bs):
-            ah_ = ifft(kernel[ci:cl].to(old_dev), oshape=(cl-ci, *im_size), dim=tuple(range(-img_ndim, 0)))
-            aH[..., ci:cl, :] = rearrange(ah_, 'nc ... -> ... nc 1')
-        aH = aH.to(device)
+    tqdm_k_kwargs = {"desc": "[ESPIRIT]: covariance matrix", "disable": not verbose}
+    tqdm_aha_kwargs = {"desc": "[ESPIRIT AHA]: Matmul batches", "disable": not verbose, "leave": False}
+    for ki, ke in tqdm_batch_iterator(num_kernels, batch_size=bs_kern, **tqdm_k_kwargs):
+        kb = ke - ki
+        # iFFT kernel
+        if batch_fft:
+            aH = torch.zeros((kb, *im_size, Nc, 1), dtype=kernels.dtype, device=old_dev)
+            for ci, cl in batch_iterator(Nc, bs_fft):
+                ah_ = ifft(kernels[ki:ke, ci:cl].to(old_dev), oshape=(kb, cl-ci, *im_size), dim=tuple(range(-img_ndim, 0)))
+                aH[..., ci:cl, :] = rearrange(ah_, 'nk nc ... -> nk ... nc 1')
+            aH = aH.to(device)
+        else:
+            aH = ifft(kernels[ki:ke], oshape=(kb, Nc, *im_size), dim=tuple(range(-img_ndim, 0))).moveaxis(1, -1)[..., None]
 
-        # a = aH.swapaxes(-1, -2).conj()
-        # AHA += aH @ a
-        for c1 in tqdm(range(0, num_coils, bs_AHA), 'Matmul batches', leave=False):
-            c2 = min(num_coils, c1 + bs_AHA)
-            AHA[..., c1:c2, :] += (aH[..., c1:c2, :] @ aH.swapaxes(-1, -2).conj())
+        # Add to AHA
+        if batch_aha:
+            for c1, c2 in tqdm_batch_iterator(Nc, batch_size=bs_aha, **tqdm_aha_kwargs):
+                AHA[..., c1:c2, :] += ((aH[..., c1:c2, :] @ aH.mH)).sum(dim=0)
+        else:
+            AHA += ((aH @ aH.mH)).sum(dim=0)
 
     AHA *= (torch.prod(torch.tensor(im_size)).item() / kernel_width**img_ndim)
-    
+
     # Get eigenvalues and eigenvectors
     mps_all = []
     evals_all = []
     for i in range(sets_of_maps):
         
         # power iterations
-        mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter*3, verbose=verbose)
+        mps, eigen_vals = power_method_matrix(AHA, num_iter=max_iter, verbose=verbose)
         
         # Update AHA
         if sets_of_maps > 1:
@@ -148,6 +193,7 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
         mps *= eigen_vals > crp
 
     return mps, eigen_vals
+
 
 def csm_from_grappa(ksp_cal: torch.Tensor,
                     im_size: tuple,

@@ -1,7 +1,8 @@
 import torch
 import cupy as cp
 import numpy as np
-    
+from tqdm import tqdm
+
 from mr_recon.dtypes import real_dtype
 from typing import Optional
 from fast_pytorch_kmeans import KMeans
@@ -380,6 +381,18 @@ def batch_iterator(total, batch_size):
     assert total > 0, f'batch_iterator called with {total} elements'
     delim = list(range(0, total, batch_size)) + [total]
     return zip(delim[:-1], delim[1:])
+
+def tqdm_batch_iterator(total: int, batch_size: Optional[int] = None, **tqdm_kwargs):
+    """Convenience function for wrapping batch_iterator with a progress bar"""
+    if batch_size is None:
+        tqdm_total = 1
+    else:
+        tqdm_total = -(-total // batch_size)
+    return tqdm(
+        batch_iterator(total, batch_size),
+        total=tqdm_total,
+        **tqdm_kwargs,
+    )
 
 def normalize(shifted, target, ofs=True, mag=False):
     """
