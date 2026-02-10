@@ -1391,9 +1391,7 @@ class sense_linop(linop):
 
 class sense_linop_noise_cov(linop):
     
-    def __init__(self,
-                 noise_cov,
-                 **sense_args):
+    def __init__(self, A: linop, noise_cov: Optional[torch.Tensor]):
         """
         Args:
         -----
@@ -1402,13 +1400,10 @@ class sense_linop_noise_cov(linop):
         **sense_args : dict
             the arguments for the sense_linop constructor
         """
-        im_size = sense_args['mps'].shape[1:]
-        trj_size = sense_args['trj'].shape[:-1]
-        C = sense_args['mps'].shape[0]
-        super().__init__(im_size, (C, *trj_size))
+        super().__init__(A.ishape, A.oshape)
         
         self.set_noise_cov(noise_cov)
-        self.A = sense_linop(**sense_args)
+        self.A = A
     
     def apply_kspace_coil_mat(self,
                               ksp: torch.Tensor,
