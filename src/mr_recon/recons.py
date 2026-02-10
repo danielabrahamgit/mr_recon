@@ -10,6 +10,7 @@ from mr_recon.utils import np_to_torch, torch_to_np
 from mr_recon.algs import (
     density_compensation, 
     conjugate_gradient, 
+    conjugate_gradient_fixed_iter,
     power_method_operator, 
     gradient_descent,
     FISTA,
@@ -147,6 +148,7 @@ def CG_SENSE_recon(A: linop,
                    weights: Optional[torch.Tensor] = None,
                    ahb_init: Optional[torch.Tensor] = None,
                    clear_gpu_mem: Optional[bool] = True,
+                   fixed_iter: Optional[bool] = True,
                    verbose: Optional[bool] = True) -> torch.Tensor:
     """
     Run CG SENSE recon:
@@ -188,13 +190,25 @@ def CG_SENSE_recon(A: linop,
             torch.cuda.empty_cache()
 
     # Run CG
-    recon = conjugate_gradient(AHA=AHA, 
-                               AHb=AHb,
-                               num_iters=max_iter,
-                               lamda_l2=lamda_l2,
-                               tolerance=tolerance,
-                               weights=weights,
-                               verbose=verbose)
+    if fixed_iter:
+        cg_func = conjugate_gradient_fixed_iter
+        kwargs = dict(
+            num_iters=max_iter,
+            lamda_l2=lamda_l2,
+            weights=weights,
+            verbose=verbose,
+        )
+    else:
+        cg_func = conjugate_gradient
+        kwargs = dict(
+            num_iters=max_iter,
+            lamda_l2=lamda_l2,
+            tolerance=tolerance,
+            weights=weights,
+            verbose=verbose,
+        )
+
+    recon = cg_func(AHA=AHA, AHb=AHb, **kwargs)
     
     return recon / scale
 

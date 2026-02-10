@@ -915,7 +915,7 @@ def conjugate_gradient(AHA: nn.Module,
         P = lambda x : x
     
     # Tikonov regularization
-    if weights:
+    if weights is not None:
         AHA_wrapper = lambda x : AHA(x) + lamda_l2 * weights * x
     else:
         AHA_wrapper = lambda x : AHA(x) + lamda_l2 * x
@@ -950,6 +950,7 @@ def conjugate_gradient(AHA: nn.Module,
 
         # Update r
         r = r - alpha * Ap
+
         rnrm = torch.norm(r)
         if return_resids:
             resids.append(rnrm.item())
@@ -968,3 +969,83 @@ def conjugate_gradient(AHA: nn.Module,
         return resids, xs
     else:
         return x0
+
+def conjugate_gradient_fixed_iter(AHA: nn.Module, 
+                                  AHb: torch.Tensor, 
+                                  P: Optional[nn.Module] = None,
+                                  num_iters: Optional[int] = 10, 
+                                  lamda_l2: Optional[float] = 0.0,
+                                  weights: Optional[torch.Tensor] = None,
+                                  verbose=True) -> torch.Tensor:
+    """Conjugate gradient for complex numbers. The output is also complex.
+    Solve for argmin ||Ax - b||^2.
+
+    Faster on GPU than conjugate_gradient because it doesn't have to check for tolerance.
+    This can be up to 2x faster due to removal of a cuda sync point.
+    
+    Parameters:
+    -----------
+    AHA : nn.Module 
+        Linear operator representing the gram/normal operator of A
+    AHb : torch.tensor
+        The A hermitian transpose times b
+    P : nn.Module
+        Preconditioner 
+    num_iters : int 
+        Max number of iterations.
+    lamda_l2 : float
+        Replaces AHA with AHA + lamda_l2 * I
+    verbose : bool
+        toggles print statements
+    
+    Returns:
+    ---------
+    x : torch.tensor <complex>
+        least squares estimate of x, same shape as x0 if provided    
+    """
+
+    # Default preconditioner is identity matrix
+    if P is None:
+        P = lambda x : x
+    
+    # Tikonov regularization
+    if weights is not None:
+        AHA_wrapper = lambda x : AHA(x) + lamda_l2 * weights * x
+    else:
+        AHA_wrapper = lambda x : AHA(x) + lamda_l2 * x
+
+    # Start at AHb
+    x0 = AHb.clone()
+    if num_iters == 0:
+        return x0
+
+    # Define iterative vars
+    r = AHb - AHA_wrapper(x0)
+    z = P(r)
+    p = z.clone()
+
+    # Main loop
+    for i in tqdm(range(num_iters), 'CG Iterations', disable=not verbose):
+        
+        # Apply model
+        Ap = AHA_wrapper(p)
+
+        pAp = torch.real(torch.sum(p.conj() * Ap))
+
+        # Update x
+        # assert pAp > 0, 'A is not Semi-Definite'
+        rz = torch.real(torch.sum(r.conj() * z))
+        alpha = rz / pAp
+        x0 = x0 + alpha * p
+
+        # Update r
+        r = r - alpha * Ap
+
+        # Update z
+        z = P(r)
+
+        # Update p
+        beta = torch.real(torch.sum(r.conj() * z)) / rz
+        p = z + beta * p
+    
+    return x0
