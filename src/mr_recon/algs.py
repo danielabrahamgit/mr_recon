@@ -607,6 +607,7 @@ def lobpcg_operator(A: callable,
 def lin_solve(AHA: torch.Tensor, 
               AHb: torch.Tensor, 
               lamda: Optional[float] = 0.0, 
+              verbose: Optional[bool] = False,
               solver: Optional[int] = 'solve') -> torch.Tensor:
     """
     Solves (AHA + lamda I) @ x = AHb for x
@@ -626,6 +627,7 @@ def lin_solve(AHA: torch.Tensor,
         'inv' - regular inverse
         'cg' - conjugate gradient
         'gd' - gradient descent
+        'chol' - cholesky decomp into L and then solve with torch.linalg.solve_triangular
     
     Returns:
     --------
@@ -651,12 +653,17 @@ def lin_solve(AHA: torch.Tensor,
             for i in range(AHA_cp.shape[0]):
                 x[i] = dev.xp.linalg.lstsq(AHA_cp[i], AHb_cp[i], rcond=None)[0]
         x = np_to_torch(x).reshape(AHb.shape)
+    elif solver == 'chol':
+        L, info = torch.linalg.cholesky_ex(AHA)
+        if info.sum() > 0:
+            raise ValueError(f"Cholesky decomposition failed with info {info}")
+        x = torch.linalg.solve_triangular(L.mH, torch.linalg.solve_triangular(L, AHb, upper=False), upper=True)
     elif solver == 'pinv':
         x = torch.linalg.pinv(AHA, hermitian=True) @ AHb
     elif solver == 'inv':
         x = torch.linalg.inv(AHA) @ AHb
     elif solver == 'cg':
-        x = conjugate_gradient(lambda x : AHA @ x, AHb, num_iters=100, lamda_l2=lamda)
+        x = conjugate_gradient(lambda x : AHA @ x, AHb, num_iters=100, lamda_l2=lamda, verbose=verbose)
     elif solver == 'gd':
         x = gradient_descent(lambda x : AHA @ x, AHb, lr=1e-4*2, num_iters=10000, lamda_l2=lamda)
     else:
