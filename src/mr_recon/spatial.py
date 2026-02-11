@@ -45,7 +45,7 @@ def derivative(u: torch.Tensor,
             app = u[tuple([slice(None) if i != (dim % u.ndim) else slice(-1, None) for i in range(u.ndim)])]
             dff = torch.diff(u, dim=dim, append=app)
     elif method == 'conv':
-        kern = torch.tensor([1, -8, 0, 8, -1]).to(u.device).type(u.dtype) / 12
+        kern = torch.tensor([1, -8, 0, 8, -1], device=u.device).type(u.dtype) / 12
         u_rs = u.moveaxis(dim, -1)
         og_shape = u_rs.shape
         u_rs = u_rs.reshape((-1, u_rs.shape[-1]))
@@ -54,9 +54,9 @@ def derivative(u: torch.Tensor,
         dff = dff.moveaxis(-1, dim).reshape(u.shape)
     elif method == 'fourier_conv':
         if pre:
-            kern = torch.tensor([0,-1,1]).to(u.device).type(u.dtype)
+            kern = torch.tensor([0,-1,1], device=u.device).type(u.dtype)
         else:
-            kern = torch.tensor([-1,1,0]).to(u.device).type(u.dtype)
+            kern = torch.tensor([-1,1,0], device=u.device).type(u.dtype)
         kern = torch_to_np(kern)
         with sp.get_device(kern):
             kern_rs = np_to_torch(sp.resize(kern, (u.shape[dim],)))
@@ -130,7 +130,7 @@ def laplacian(u: torch.Tensor,
     lap = u_flt * 0
     if method == 'fourier':
         # Apply laplacian operator in freq domain
-        k = gen_grd(im_size).to(u.device) * 2 * torch.pi
+        k = gen_grd(im_size, device=u.device) * 2 * torch.pi
         u_f = fft(u_flt, dim=tuple(range(-len(im_size), 0)))
         lap_f = -(torch.linalg.norm(k, dim=-1) ** 2) * u_f
         lap = ifft(lap_f, dim=tuple(range(-len(im_size), 0))).real
@@ -139,11 +139,11 @@ def laplacian(u: torch.Tensor,
         if method == 'conv':
             method += '_h2'
         if 'h2' in method:
-            kern = torch.tensor([1, -2, 1]).to(u_flt.device).type(u_flt.dtype)
+            kern = torch.tensor([1, -2, 1], device=u_flt.device).type(u_flt.dtype)
         elif 'h4' in method:
-            kern = torch.tensor([1, 16, -30, 16, -1]).to(u_flt.device).type(u_flt.dtype) / 12
+            kern = torch.tensor([1, 16, -30, 16, -1], device=u_flt.device).type(u_flt.dtype) / 12
         elif 'h6' in method:
-            kern = torch.tensor([2, -27, 270, -490, 270, -27, 2]).to(u_flt.device).type(u_flt.dtype) / 180
+            kern = torch.tensor([2, -27, 270, -490, 270, -27, 2], device=u_flt.device).type(u_flt.dtype) / 180
         for i in range(-len(im_size), 0):
             lap += apply_kern_1d(u_flt, kern, dim=i)
     elif method == 'der':
@@ -213,7 +213,7 @@ def spatial_resize(x: torch.Tensor,
     if method == 'fourier':
         x_rs_flt = fourier_resize(x_flt, im_size, window=window)
     else:
-        grd = 2 * gen_grd(im_size).to(x.device)
+        grd = 2 * gen_grd(im_size, device=x.device)
         grd -= grd.min()
         grd *= 2 / grd.max()
         grd -= 1
@@ -266,8 +266,8 @@ def spatial_resize_poly(x: torch.Tensor,
     # Call spatial interpolation
     inp_size = x.shape[-len(im_size):]
     kwargs = {'order': order, 'mode': mode}
-    inp_size_tensor = torch.tensor(inp_size).to(x.device)
-    spatial_crds = (gen_grd(im_size, balanced=True).to(x.device) + 0.5) * (inp_size_tensor - 1)
+    inp_size_tensor = torch.tensor(inp_size, device=x.device)
+    spatial_crds = (gen_grd(im_size, balanced=True, device=x.device) + 0.5) * (inp_size_tensor - 1)
     x_rs = spatial_interp(x, spatial_crds, **kwargs).reshape(oshape)
     
     # Reshape to original batch dims

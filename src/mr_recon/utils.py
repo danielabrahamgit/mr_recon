@@ -166,7 +166,8 @@ def quantize_data(data: torch.Tensor,
 
 def gen_grd(im_size: tuple, 
             fovs: Optional[tuple] = None,
-            balanced: Optional[bool] = False) -> torch.Tensor:
+            balanced: Optional[bool] = False,
+            device: Optional[torch.device] = None) -> torch.Tensor:
     """
     Generates a grid of points given image size and FOVs
 
@@ -182,16 +183,20 @@ def gen_grd(im_size: tuple,
     grd : torch.Tensor
         grid of points with shape (*im_size, len(im_size))
     """
+    kwargs = {}
+    if device is not None:
+        kwargs['device'] = device
+
     if fovs is None:
         fovs = (1,) * len(im_size)
     if balanced:
         lins = [
-            fovs[i] * torch.linspace(-1/2, 1/2, im_size[i]) 
+            fovs[i] * torch.linspace(-1/2, 1/2, im_size[i], **kwargs) 
             for i in range(len(im_size))
             ]
     else:
         lins = [
-            fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2 + (im_size[i] % 2)) / (im_size[i]) 
+            fovs[i] * torch.arange(-(im_size[i]//2), im_size[i]//2 + (im_size[i] % 2), **kwargs) / (im_size[i]) 
             for i in range(len(im_size))
             ]
     grds = torch.meshgrid(*lins, indexing='ij')
