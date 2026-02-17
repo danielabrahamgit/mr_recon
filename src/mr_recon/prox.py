@@ -266,13 +266,15 @@ class L1Wav_cpu(nn.Module):
         
         return output_torch
 
-# FIXME TODO
+
 class TV(nn.Module):
     
     def __init__(self,
                  im_size: tuple,
                  lamda: float,
-                 norm: Optional[str] = 'l1'):
+                 axes: Optional[tuple] = None,
+                 norm: Optional[str] = 'l1',
+                 n_iter: int = 50):
         """
         TV operator is defined as
 
@@ -287,14 +289,24 @@ class TV(nn.Module):
         norm : str
             the type of norm to use from:
             ['l1', 'l2']
+        axes : tuple
+            axes to compute TV over
+        n_iter : int
+            number of Chambolle iterations for the prox
         """
         super().__init__()
-        assert len(im_size) == 2 or len(im_size) == 3, 'Only 2D and 3D images are supported'
+        if axes is None:
+            axes = tuple([d for d in range(-len(im_size), 0)])
+        if norm not in ('l1', 'l2'):
+            raise ValueError(f"norm must be one of ['l1','l2'], got {norm}")
         self.im_size = im_size
         self.lamda = lamda
+        self.axes = axes
+        self.norm = norm
+        self.n_iter = int(n_iter)
     
     def forward(self,
-                input: torch.tensor,
+                input: torch.Tensor,
                 alpha: Optional[float] = 1.0):
         """
         Proximal operator
@@ -311,8 +323,88 @@ class TV(nn.Module):
         output : torch.tensor
             proximal output
         """
+        if input.shape[-len(self.im_size):] != self.im_size:
+            raise ValueError(f'Input shape {input.shape} does not match im_size {self.im_size}')
 
-        return input # TODO
+        weight = float(alpha) * float(self.lamda)
+        if weight == 0.0:
+            return input
+
+        # Normalize axes to positive indices for slicing logic.
+        axes = tuple([a if a >= 0 else input.dim() + a for a in self.axes])
+        ndim = len(axes)
+        if ndim == 0:
+            return input
+
+        # Step size for Chambolle's algorithm generalized from 2D (1/8) to ndim (1/(4*ndim)).
+        step = 1.0 / (4.0 * float(ndim))
+
+        def _grad(u: torch.Tensor):
+            # Forward differences with Neumann boundary (gradient=0 at boundary).
+            grads = []
+            for ax in axes:
+                g = torch.zeros_like(u)
+                slc0 = [slice(None)] * u.dim()
+                slc1 = [slice(None)] * u.dim()
+                slc0[ax] = slice(0, -1)
+                slc1[ax] = slice(1, None)
+                g[tuple(slc0)] = u[tuple(slc1)] - u[tuple(slc0)]
+                grads.append(g)
+            return grads
+
+        def _div(p_list):
+            # Divergence: adjoint of forward-diff gradient under Neumann BC.
+            out = torch.zeros_like(p_list[0])
+            for p, ax in zip(p_list, axes):
+                # out += p - p shifted back, with boundary handling
+                out = out + p
+                slc0 = [slice(None)] * out.dim()
+                slc1 = [slice(None)] * out.dim()
+                slc0[ax] = slice(1, None)
+                slc1[ax] = slice(0, -1)
+                out[tuple(slc0)] = out[tuple(slc0)] - p[tuple(slc1)]
+            return out
+
+        def _prox_real(f: torch.Tensor) -> torch.Tensor:
+            # Chambolle (dual) iterations:
+            # p^{k+1} = proj_{P}(p^k + step * grad(div(p^k) - f/weight))
+            # u = f - weight * div(p)
+            p = [torch.zeros_like(f) for _ in range(ndim)]
+            f_over_w = f / weight
+
+            for _ in range(self.n_iter):
+                div_p = _div(p)
+                g = div_p - f_over_w
+                grad_g = _grad(g)
+
+                for i in range(ndim):
+                    p[i].add_(grad_g[i], alpha=step)
+
+                if self.norm == 'l1':
+                    # Anisotropic TV: |p_i| <= 1 component-wise
+                    for i in range(ndim):
+                        p[i].clamp_(min=-1.0, max=1.0)
+                else:
+                    # Isotropic TV: sqrt(sum_i p_i^2) <= 1 element-wise
+                    denom = torch.zeros_like(f)
+                    for i in range(ndim):
+                        denom.add_(p[i] * p[i])
+                    denom = torch.sqrt(denom)
+                    denom = torch.clamp(denom, min=1.0)
+                    for i in range(ndim):
+                        p[i].div_(denom)
+
+            return f - weight * _div(p)
+
+        # Complex support: apply prox to real and imag parts separately.
+        # This corresponds to TV(Re(x)) + TV(Im(x)) regularization.
+        with torch.no_grad():
+            if torch.is_complex(input):
+                out_re = _prox_real(input.real)
+                out_im = _prox_real(input.imag)
+                return (out_re + 1j * out_im).type_as(input)
+            else:
+                return _prox_real(input).type_as(input)
 
 
 class LocallyLowRank(nn.Module):

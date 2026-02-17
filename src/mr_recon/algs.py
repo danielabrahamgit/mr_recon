@@ -719,7 +719,8 @@ def FISTA(AHA: nn.Module,
     ptols = []
     if return_xs:
         xs = []
-    for k in tqdm(range(0, num_iters), 'FISTA Iterations', disable=not verbose):
+    pbar = tqdm(range(0, num_iters), 'FISTA Iterations', disable=not verbose)
+    for k in pbar:
 
         x_old = x.clone()
         x     = z.clone()
@@ -731,14 +732,20 @@ def FISTA(AHA: nn.Module,
         else:
             step  = k/(k + 3)
             z     = x + step * (x - x_old)
+        
         ptol = 100 * torch.norm(x_old - x)/torch.norm(x)
-        ptols.append(ptol.item())
+        if return_ptols:
+            this_ptol = ptol.item()
+            if verbose:
+                pbar.set_postfix_str(f"PTOL: {this_ptol:.2e}")
+            ptols.append(this_ptol)
         if ptol < ptol_exit:
             if verbose:
                 print(f'Tolerance reached after {k+1} iterations, exiting FISTA')
             break
         if return_xs:
             xs.append(x.clone())
+    pbar.close()
     
     if return_ptols:
         return ptols, x
