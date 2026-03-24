@@ -16,7 +16,7 @@ from mr_recon.fourier import (
     NUFFT
 )
 from einops import rearrange, einsum
-from typing import Optional
+from typing import Optional, Tuple
 from tqdm import tqdm
 
 @dataclass
@@ -518,6 +518,8 @@ class encoding_matrix(linop):
                  dcf: Optional[torch.Tensor] = None,
                  temporal_batch_size: Optional[int] = None,
                  bparams: Optional[batching_params] = batching_params(),
+                 bh: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # Additional spatial-temporal as (B2, *spatial), (B2, *temporal)
+                 bh_phase_only: Optional[bool] = False, # removes mag part of weighting
                  verbose: Optional[bool] = False):
         im_size = mps.shape[1:]
         trj_size = alphas.shape[1:]
@@ -533,6 +535,22 @@ class encoding_matrix(linop):
         # Default params
         if dcf is None:
             dcf = torch.ones(trj_size, dtype=real_dtype, device=torch_dev)
+
+        # additional spatial-temporal functions
+        self.b = None
+        self.h = None
+        self.B2 = None
+        self.bh_phase_only = bh_phase_only
+        if bh is not None:
+            b, h = bh
+            B2 = b.shape[0]
+            assert h.shape[0] == B2, f"bh must have same number of bases (B), but got {h.shape[0]} and {B}"
+            assert b.shape[1:] == im_size, f"b must have same spatial dimensions as im_size, but got {b.shape[1:]} and {im_size}"
+            assert h.shape[1:] == trj_size, f"h must have same temporal dimensions as trj_size, but got {h.shape[1:]} and {trj_size}"
+            # flatten
+            self.b = b.reshape((B2, -1))
+            self.h = h.reshape((B2, -1))
+            self.B2 = B2
 
         self.bparams = bparams
         self.alphas_flt = alphas.reshape((B, -1))
@@ -566,6 +584,14 @@ class encoding_matrix(linop):
 
                 # Apply encoding matrix
                 enc_mx = torch.exp(-2j * torch.pi * (phis_batch.T @ alphas_batch)) # R tbs
+
+                # additional weighting
+                if self.B2 is not None:
+                    weighting = (self.b.T @ self.h[:, t1:t2]) # R tbs
+                    if self.bh_phase_only:
+                        weighting = torch.exp(1j * weighting.angle())
+                    enc_mx *= weighting
+
                 ksp[c1:c2, t1:t2] += (Sx @ enc_mx)
                 
         return ksp.reshape(self.oshape) / (R ** 0.5) # mimick orthogonal FFT
@@ -593,6 +619,14 @@ class encoding_matrix(linop):
 
                 # Apply adjoint encoding matrix
                 enc_mx = torch.exp(2j * torch.pi * (alphas_batch.T @ phis_batch)) # tbs R
+
+                # additional weighting
+                if self.B2 is not None:
+                    weighting = (self.h[:, t1:t2].T @ self.b) # tbs R
+                    if self.bh_phase_only:
+                        weighting = torch.exp(1j * weighting.angle())
+                    enc_mx *= weighting.conj()
+
                 coil_imgs = (ksp_flt[c1:c2, t1:t2] * self.dcf_flt[t1:t2]) @ enc_mx # cbs R
                 
                 # Apply adjoint coils
