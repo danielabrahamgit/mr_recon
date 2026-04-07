@@ -102,6 +102,13 @@ def csm_from_espirit(ksp_cal: torch.Tensor,
     bs_kern, bs_aha, bs_fft, batch_aha, batch_fft = _espirit_batch_sizes(
         kernel_batch_size, img_ndim, cpu_last_part, Nc
     )
+    if im_size[0] > 500 and im_size[1] > 500 and Nc > 32:
+        # large image size can't batch.
+        bs_kern = 1
+        bs_aha = 1
+        bs_fft = 1
+        batch_aha = True
+        batch_fft = True
 
     # Get calibration matrix.: [Nc] + num_blks + [kernel_width] * img_ndim
     mat = array_to_blocks(

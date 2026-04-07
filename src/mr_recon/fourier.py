@@ -5,12 +5,32 @@ import torch.nn as nn
 import numpy as np
 import sigpy as sp
 import torch.fft as fft_torch
-import cufinufft
+
+CUFI_NUFFT_AVAILABLE = False
+try:
+    import cufinufft
+    CUFI_NUFFT_AVAILABLE = True
+except ModuleNotFoundError:
+    pass
+
+TORCHKB_NUFFT_AVAILABLE = False
+try:
+    from torchkbnufft import KbNufft, KbNufftAdjoint
+    TORCHKB_NUFFT_AVAILABLE = True
+except ModuleNotFoundError:
+    pass
+
+TRITON_NUFFT_AVAILABLE = False
+try:
+    from mr_recon.triton_interp.interp import interpolate, interpolate_adjoint
+    from mr_recon.triton_interp.ungrid import ungrid, ungrid_torch
+    TRITON_NUFFT_AVAILABLE = True
+except ModuleNotFoundError:
+    pass
 
 
 from typing import Optional
 from tqdm import tqdm
-from torchkbnufft import KbNufft, KbNufftAdjoint
 from einops import einsum, rearrange
 from scipy.special import jv
 from cupyx.scipy.ndimage import map_coordinates
@@ -18,8 +38,6 @@ from math import ceil, floor
 from mr_recon.dtypes import complex_dtype, np_complex_dtype, real_dtype
 from mr_recon.pad import PadLast
 from mr_recon.algs import svd_power_method_tall, eigen_decomp_operator
-from mr_recon.triton_interp.interp import interpolate, interpolate_adjoint
-from mr_recon.triton_interp.ungrid import ungrid, ungrid_torch
 from mr_recon.indexing import (
     multi_grid,
     multi_index
@@ -364,6 +382,10 @@ class triton_nufft(NUFFT):
                  width: Optional[int] = 6,
                  beta: Optional[float] = None,
                  apodize: Optional[bool] = True):
+        
+        if not TRITON_NUFFT_AVAILABLE:
+            raise ModuleNotFoundError("triton is not installed. Please install it with `pip install triton`")
+
         super().__init__(im_size)
         self.oversamp = oversamp
         self.width = width
@@ -1039,6 +1061,10 @@ class torchkb_nufft(NUFFT):
                  torch_dev: Optional[torch.device] = torch.device('cpu'),
                  oversamp: Optional[float] = 2.0,
                  numpoints: Optional[int] = 6):
+        
+        if not TORCHKB_NUFFT_AVAILABLE:
+            raise ModuleNotFoundError("torchkbnufft is not installed. Please install it with `pip install torchkbnufft`")
+
         super().__init__(im_size)
         
         im_size_os = tuple([round(i * oversamp) for i in im_size])
@@ -1138,6 +1164,9 @@ class cufi_nufft(NUFFT):
         eps : float, optional
             The epsilon value for the cufi-nufft library, default is 1e-4.
         """
+        if not CUFI_NUFFT_AVAILABLE:
+            raise ModuleNotFoundError("cufinufft is not installed. Please install it with `pip install cufinufft`")
+
         super().__init__(im_size)
         self.eps = eps
         

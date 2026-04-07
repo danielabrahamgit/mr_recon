@@ -10,9 +10,7 @@ from mr_recon.utils import batch_iterator, gen_grd, np_to_torch, torch_to_np
 from mr_recon.pad import PadLast
 from mr_recon.spatial import resize
 from mr_recon.fourier import (
-    gridded_nufft,
     sigpy_nufft,
-    torchkb_nufft,
     NUFFT
 )
 from einops import rearrange, einsum
@@ -1656,7 +1654,7 @@ class subspace_linop(linop):
 
         # Default params
         if nufft is None:
-            nufft = torchkb_nufft(im_size, torch_dev.index)
+            nufft = sigpy_nufft(im_size, torch_dev.index)
         if dcf is None:
             dcf = torch.ones(trj.shape[:-1], dtype=real_dtype, device=torch_dev)
         else:
