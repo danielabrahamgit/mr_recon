@@ -59,4 +59,4 @@ class PadLast(nn.Module):
         """Crop the last n dimensions of y"""
         assert tuple(y.shape[-self.im_dim:]) == self.pad_im_size
         slc = [slice(None)] * (y.ndim - self.im_dim) + self.crop_slice
-        return y[slc]
+        return y[tuple(slc)]
